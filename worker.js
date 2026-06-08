@@ -337,6 +337,10 @@ CREATE TABLE IF NOT EXISTS wa_mensajes (
   usuario_enviador_id INTEGER, leido INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS app_config (
+  clave TEXT PRIMARY KEY, valor TEXT,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   usuario_id INTEGER, accion TEXT, modulo TEXT, registro_id INTEGER,
@@ -1540,6 +1544,91 @@ async function waEnviar(request, env, payload, id) {
   return ok({ id: msgId, estado, enviado: !!r.ok, motivo: r.motivo || null });
 }
 
+// ============================================================================
+//  CONFIGURACIÓN (datos de empresa, IVA por defecto) + REPORTES
+// ============================================================================
+async function getConfig(env) {
+  const r = await env.DB.prepare("SELECT clave,valor FROM app_config").all();
+  const map = {};
+  for (const row of (r.results || [])) map[row.clave] = row.valor;
+  return {
+    nombre: map.nombre || EMPRESA.nombre || "ASLAN",
+    direccion: map.direccion || EMPRESA.direccion || "",
+    rfc: map.rfc || EMPRESA.rfc || "",
+    telefono: map.telefono || EMPRESA.telefono || "",
+    whatsapp: map.whatsapp || EMPRESA.whatsapp || "",
+    email: map.email || EMPRESA.email || "",
+    iva: map.iva != null ? Number(map.iva) : 16,
+  };
+}
+async function handleConfig(request, env, payload, method) {
+  if (method === "GET") {
+    const cfg = await getConfig(env);
+    cfg.sistema = { whatsapp: !!(env.WA_TOKEN && env.WA_PHONE_ID), fotos_r2: !!env.FILES, verify_token: !!env.WA_VERIFY_TOKEN };
+    return ok(cfg);
+  }
+  if (!hasRole(payload, "admin")) return fail("Solo administración puede cambiar la configuración.", 403);
+  const b = await request.json().catch(() => ({}));
+  const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva"];
+  for (const k of campos) {
+    if (k in b && b[k] !== undefined && b[k] !== null) {
+      const v = (k === "iva") ? String(Number(b[k]) || 0) : String(b[k]);
+      await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(k, v).run();
+    }
+  }
+  await audit(env, payload.sub, "config_update", "config", null, Object.keys(b), request);
+  const cfg = await getConfig(env);
+  cfg.sistema = { whatsapp: !!(env.WA_TOKEN && env.WA_PHONE_ID), fotos_r2: !!env.FILES, verify_token: !!env.WA_VERIFY_TOKEN };
+  return ok(cfg);
+}
+function rangoFecha(prefix, desde, hasta) {
+  const cond = [prefix + "deleted_at IS NULL"]; const args = [];
+  if (desde) { cond.push("date(" + prefix + "created_at) >= ?"); args.push(desde); }
+  if (hasta) { cond.push("date(" + prefix + "created_at) <= ?"); args.push(hasta); }
+  return { where: cond.join(" AND "), args };
+}
+async function handleReportes(request, env, payload, url) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  const desde = url.searchParams.get("desde") || null;
+  const hasta = url.searchParams.get("hasta") || null;
+  const fC = rangoFecha("", desde, hasta);
+  const fCJ = rangoFecha("c.", desde, hasta);
+
+  const porEstado = (await env.DB.prepare("SELECT estado, COUNT(*) AS n, COALESCE(SUM(total),0) AS monto FROM cotizaciones WHERE " + fC.where + " GROUP BY estado ORDER BY monto DESC").bind(...fC.args).all()).results || [];
+  const tot = await env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(total),0) AS monto FROM cotizaciones WHERE " + fC.where).bind(...fC.args).first();
+  const acep = await env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(total),0) AS monto FROM cotizaciones WHERE " + fC.where + " AND estado IN ('aceptada','convertida')").bind(...fC.args).first();
+  const topClientes = (await env.DB.prepare("SELECT COALESCE(cl.nombre,'—') AS cliente, cl.empresa AS empresa, COUNT(*) AS n, COALESCE(SUM(c.total),0) AS monto FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE " + fCJ.where + " GROUP BY c.cliente_id ORDER BY monto DESC LIMIT 10").bind(...fCJ.args).all()).results || [];
+
+  const nombreEtapa = {}; for (const e of ETAPAS) nombreEtapa[e.clave] = e.nombre;
+  const proyEtapa = ((await env.DB.prepare("SELECT etapa_portal AS etapa, COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL GROUP BY etapa_portal ORDER BY n DESC").all()).results || []).map((r) => ({ nombre: nombreEtapa[r.etapa] || r.etapa || "—", n: r.n }));
+  const proyTot = await env.DB.prepare("SELECT COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL").first();
+
+  const invCat = (await env.DB.prepare("SELECT COALESCE(categoria,'Otros') AS categoria, COUNT(*) AS n, COALESCE(SUM(stock_actual*precio_venta),0) AS valor, SUM(CASE WHEN stock_actual<=stock_minimo THEN 1 ELSE 0 END) AS bajo FROM productos WHERE deleted_at IS NULL GROUP BY categoria ORDER BY valor DESC").all()).results || [];
+  const invTot = await env.DB.prepare("SELECT COALESCE(SUM(stock_actual*precio_venta),0) AS valor, COUNT(*) AS n, SUM(CASE WHEN stock_actual<=stock_minimo THEN 1 ELSE 0 END) AS bajo FROM productos WHERE deleted_at IS NULL").first();
+  const alertas = (await env.DB.prepare("SELECT sku, nombre, stock_actual, stock_minimo, unidad FROM productos WHERE deleted_at IS NULL AND stock_actual<=stock_minimo ORDER BY (stock_minimo-stock_actual) DESC, id ASC LIMIT 50").all()).results || [];
+
+  const condA = ["g.tipo='entrada'"]; const argsA = [];
+  if (desde) { condA.push("date(g.created_at) >= ?"); argsA.push(desde); }
+  if (hasta) { condA.push("date(g.created_at) <= ?"); argsA.push(hasta); }
+  const asistEmp = (await env.DB.prepare("SELECT COALESCE(u.nombre,'—') AS empleado, COUNT(*) AS entradas FROM gps_checkins g LEFT JOIN usuarios u ON u.id=g.usuario_id WHERE " + condA.join(" AND ") + " GROUP BY g.usuario_id ORDER BY entradas DESC LIMIT 50").bind(...argsA).all()).results || [];
+
+  return ok({
+    rango: { desde, hasta },
+    resumen: {
+      cotizaciones: tot ? tot.n : 0, monto_total: tot ? tot.monto : 0,
+      aceptadas: acep ? acep.n : 0, monto_aceptado: acep ? acep.monto : 0,
+      proyectos: proyTot ? proyTot.n : 0,
+      inventario_valor: invTot ? invTot.valor : 0, inventario_items: invTot ? invTot.n : 0, inventario_bajo: invTot ? invTot.bajo : 0,
+    },
+    cotizaciones_por_estado: porEstado,
+    top_clientes: topClientes,
+    proyectos_por_etapa: proyEtapa,
+    inventario_por_categoria: invCat,
+    alertas_stock: alertas,
+    asistencia_por_empleado: asistEmp,
+  });
+}
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -1620,6 +1709,10 @@ async function handleRequest(request, env) {
     if (m && method === "GET") return await waVerConversacion(env, payload, m[1]);
     m = path.match(/^\/api\/whatsapp\/conversaciones\/(\d+)\/enviar$/);
     if (m && method === "POST") return await waEnviar(request, env, payload, m[1]);
+
+    // ----- Configuración y Reportes -----
+    if (path === "/api/config") return await handleConfig(request, env, payload, method);
+    if (path === "/api/reportes" && method === "GET") return await handleReportes(request, env, payload, url);
 
     m = path.match(/^\/api\/admin\/proyectos\/(\d+)\/fotos$/);
     if (m && method === "GET") return await listarFotosProyecto(env, payload, m[1]);
@@ -1746,12 +1839,12 @@ function renderApp() {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ASLAN · Panel</title>${FONTS}<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script><style>${baseStyles(false)}
 .layout{display:flex;min-height:100vh}
-.side{width:240px;background:#111;border-right:1px solid var(--bd);padding:1.2rem .8rem;flex-shrink:0}
+.side{width:240px;background:#111;border-right:1px solid var(--bd);padding:1.2rem .8rem;flex-shrink:0;position:sticky;top:0;height:100vh;align-self:flex-start;display:flex;flex-direction:column;overflow-y:auto}
 .side h1{color:var(--gold);font-size:1.8rem;letter-spacing:.3em;text-align:center;margin-bottom:1.4rem}
 .nav a{display:flex;align-items:center;gap:.6rem;padding:.6rem .8rem;border-radius:6px;color:var(--txt);font-size:.9rem;margin-bottom:.2rem;cursor:pointer}
 .nav a:hover{background:rgba(139,109,63,.12)}
 .nav a.active{background:var(--gold);color:#fff}
-.side .user{position:absolute;bottom:1rem;font-size:.8rem;color:var(--txt2)}
+.side .user{margin-top:auto;padding-top:1rem;border-top:1px solid var(--bd);font-size:.8rem;color:var(--txt2)}
 .main{flex:1;padding:1.6rem;overflow:auto}
 .hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem}
 .hd h2{font-size:2rem;color:var(--gold)}
@@ -1850,6 +1943,8 @@ async function go(id){
   if(id==='proyectos')return viewProyectos(c);
   if(id==='empleados')return viewEmpleados(c);
   if(id==='whatsapp')return viewWhatsApp(c);
+  if(id==='reportes')return viewReportes(c);
+  if(id==='config')return viewConfig(c);
   c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem">Módulo en construcción</h3><p class="muted" style="margin-top:.5rem">Esta sección («'+t[id]+'») se está integrando sobre esta misma base. Ya está el backbone, la auth por rol y el esquema de datos completo.</p></div>';
 }
 
@@ -1908,6 +2003,106 @@ async function crearWaConv(){
   var d=await api('/api/whatsapp/conversaciones',{method:'POST',body:JSON.stringify({numero:val('waNum'),nombre:val('waNom')})});
   if(d&&d.ok){closeModal();abrirWaConv(d.data.id);}else if(d){toast(d.error||'Número inválido');}
 }
+// ----- REPORTES -----
+var REP_DATA=null,REP_DESDE=null,REP_HASTA=null;
+function fechaISO(d){var m=(d.getMonth()+1),day=d.getDate();return d.getFullYear()+'-'+(m<10?'0':'')+m+'-'+(day<10?'0':'')+day;}
+function kpiCard(label,v){return '<div class="card kpi"><div class="n">'+v+'</div><div class="l">'+label+'</div></div>';}
+function tablaReporte(titulo,cols,filas){
+  var h='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">'+titulo+'</h3>';
+  if(!filas.length){h+='<p class="muted" style="font-size:.85rem">Sin datos en el periodo.</p></div>';return h;}
+  h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse"><thead><tr>';
+  cols.forEach(function(cn){h+='<th style="text-align:left;padding:.45rem;border-bottom:1px solid var(--bd);color:var(--gold2);font-size:.78rem;text-transform:uppercase;letter-spacing:.03em">'+cn+'</th>';});
+  h+='</tr></thead><tbody>';
+  filas.forEach(function(f){h+='<tr>';f.forEach(function(cell){h+='<td style="padding:.45rem;border-bottom:1px solid var(--bd);font-size:.86rem">'+escAttr(String(cell))+'</td>';});h+='</tr>';});
+  h+='</tbody></table></div></div>';
+  return h;
+}
+function aplicarReporte(){REP_DESDE=val('repDesde');REP_HASTA=val('repHasta');viewReportes(document.getElementById('content'));}
+async function viewReportes(c){
+  document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="exportarReporteCSV()">Exportar CSV</button>';
+  var hoy=new Date();var d1=REP_DESDE||(hoy.getFullYear()+'-01-01');var d2=REP_HASTA||fechaISO(hoy);
+  var d=await api('/api/reportes?desde='+d1+'&hasta='+d2);
+  if(!d||!d.ok){c.innerHTML='<div class="card">'+(d?d.error:'Error')+'</div>';return;}
+  REP_DATA=d.data;var r=d.data.resumen;
+  var h='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.1rem;margin-bottom:.5rem">Periodo</h3><div class="g2" style="max-width:520px"><div><label>Desde</label><input id="repDesde" type="date" value="'+d1+'"></div><div><label>Hasta</label><input id="repHasta" type="date" value="'+d2+'"></div></div><div style="height:.6rem"></div><button class="btn" onclick="aplicarReporte()">Aplicar</button></div>';
+  h+='<div class="kpis">';
+  h+=kpiCard('Cotizaciones',r.cotizaciones);
+  h+=kpiCard('Monto cotizado',money(r.monto_total));
+  h+=kpiCard('Aceptadas',r.aceptadas);
+  h+=kpiCard('Monto aceptado',money(r.monto_aceptado));
+  h+=kpiCard('Valor de inventario',money(r.inventario_valor));
+  h+=kpiCard('Bajo stock',r.inventario_bajo);
+  h+='</div>';
+  h+=tablaReporte('Cotizaciones por estado',['Estado','Cantidad','Monto'],d.data.cotizaciones_por_estado.map(function(x){return [x.estado,x.n,money(x.monto)];}));
+  h+=tablaReporte('Clientes con mayor monto cotizado',['Cliente','Empresa','Cotizaciones','Monto'],d.data.top_clientes.map(function(x){return [x.cliente,(x.empresa||'—'),x.n,money(x.monto)];}));
+  h+=tablaReporte('Proyectos por etapa',['Etapa','Proyectos'],d.data.proyectos_por_etapa.map(function(x){return [x.nombre,x.n];}));
+  h+=tablaReporte('Inventario por categoría',['Categoría','Items','Valor','Bajo stock'],d.data.inventario_por_categoria.map(function(x){return [x.categoria,x.n,money(x.valor),x.bajo];}));
+  h+=tablaReporte('Materiales bajo stock',['SKU','Material','Stock','Mínimo'],d.data.alertas_stock.map(function(x){return [x.sku,x.nombre,x.stock_actual+' '+(x.unidad||''),x.stock_minimo];}));
+  h+=tablaReporte('Asistencia · entradas por empleado',['Empleado','Entradas'],d.data.asistencia_por_empleado.map(function(x){return [x.empleado,x.entradas];}));
+  c.innerHTML=h;
+}
+function exportarReporteCSV(){
+  if(!REP_DATA){toast('Aún no hay datos');return;}
+  var nl=String.fromCharCode(10),bom=String.fromCharCode(0xFEFF);
+  function q(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
+  function sec(titulo,cols,filas){var L=[titulo,cols.map(q).join(',')];filas.forEach(function(f){L.push(f.map(q).join(','));});L.push('');return L;}
+  var lines=[];
+  lines=lines.concat(sec('Cotizaciones por estado',['Estado','Cantidad','Monto'],REP_DATA.cotizaciones_por_estado.map(function(x){return [x.estado,x.n,x.monto];})));
+  lines=lines.concat(sec('Clientes con mayor monto',['Cliente','Empresa','Cotizaciones','Monto'],REP_DATA.top_clientes.map(function(x){return [x.cliente,(x.empresa||''),x.n,x.monto];})));
+  lines=lines.concat(sec('Proyectos por etapa',['Etapa','Proyectos'],REP_DATA.proyectos_por_etapa.map(function(x){return [x.nombre,x.n];})));
+  lines=lines.concat(sec('Inventario por categoria',['Categoria','Items','Valor','BajoStock'],REP_DATA.inventario_por_categoria.map(function(x){return [x.categoria,x.n,x.valor,x.bajo];})));
+  lines=lines.concat(sec('Materiales bajo stock',['SKU','Material','Stock','Minimo'],REP_DATA.alertas_stock.map(function(x){return [x.sku,x.nombre,x.stock_actual,x.stock_minimo];})));
+  lines=lines.concat(sec('Asistencia por empleado',['Empleado','Entradas'],REP_DATA.asistencia_por_empleado.map(function(x){return [x.empleado,x.entradas];})));
+  var blob=new Blob([bom+lines.join(nl)],{type:'text/csv;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_aslan.csv';a.click();
+}
+
+// ----- CONFIGURACIÓN -----
+function estadoLinea(label,okb){var col=okb?'var(--ok)':'var(--txt2)';var txt=okb?'Configurado':'Sin configurar';return '<div style="display:flex;justify-content:space-between;align-items:center;padding:.45rem 0;border-bottom:1px solid var(--bd)"><span style="font-size:.9rem">'+label+'</span><span style="color:'+col+';font-size:.82rem"><svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor" style="margin-right:.3rem"><circle cx="12" cy="12" r="6"/></svg>'+txt+'</span></div>';}
+function tarjetaPassword(){
+  return '<div class="card"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Mi cuenta · cambiar contraseña</h3><div class="g2"><div><label>Contraseña actual</label><input id="pwActual" type="password"></div><div><label>Nueva contraseña</label><input id="pwNueva" type="password"></div></div><label>Repite la nueva contraseña</label><input id="pwRep" type="password"><div style="height:.6rem"></div><button class="btn" onclick="cambiarMiPassword()">Cambiar contraseña</button></div>';
+}
+async function viewConfig(c){
+  if(USER.rol!=='admin'){c.innerHTML='<div class="card muted" style="margin-bottom:1rem">Solo administración puede editar la configuración general. Aquí puedes cambiar tu contraseña.</div>'+tarjetaPassword();return;}
+  var d=await api('/api/config');var cfg=(d&&d.ok)?d.data:{};CFG=cfg;
+  var sis=cfg.sistema||{};
+  var h='';
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Datos de la empresa</h3>';
+  h+='<p class="muted" style="font-size:.82rem;margin-bottom:.5rem">Aparecen en el encabezado de las cotizaciones en PDF.</p>';
+  h+='<div class="g2"><div><label>Nombre</label><input id="cfgNombre" value="'+escAttr(cfg.nombre||'')+'"></div><div><label>RFC</label><input id="cfgRfc" value="'+escAttr(cfg.rfc||'')+'"></div></div>';
+  h+='<label>Dirección</label><input id="cfgDir" value="'+escAttr(cfg.direccion||'')+'">';
+  h+='<div class="g2"><div><label>Teléfono</label><input id="cfgTel" value="'+escAttr(cfg.telefono||'')+'"></div><div><label>WhatsApp (solo dígitos)</label><input id="cfgWa" value="'+escAttr(cfg.whatsapp||'')+'"></div></div>';
+  h+='<label>Correo</label><input id="cfgEmail" value="'+escAttr(cfg.email||'')+'">';
+  h+='<div style="height:.7rem"></div><button class="btn" onclick="guardarConfigEmpresa()">Guardar datos</button></div>';
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Parámetros</h3>';
+  h+='<div style="max-width:240px"><label>IVA por defecto (%)</label><input id="cfgIva" type="number" step="0.01" value="'+(cfg.iva!=null?cfg.iva:16)+'"></div>';
+  h+='<p class="muted" style="font-size:.8rem;margin-top:.4rem">Se aplica al crear una nueva cotización.</p>';
+  h+='<div style="height:.6rem"></div><button class="btn" onclick="guardarConfigIva()">Guardar parámetros</button></div>';
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Estado del sistema</h3>';
+  h+=estadoLinea('WhatsApp (envío real por Meta)',!!sis.whatsapp);
+  h+=estadoLinea('Almacenamiento de fotos (R2)',!!sis.fotos_r2);
+  h+=estadoLinea('Token de verificación del webhook',!!sis.verify_token);
+  h+='<p class="muted" style="font-size:.78rem;margin-top:.5rem">Lo «sin configurar» se activa definiendo las variables del Worker en Cloudflare (WA_TOKEN, WA_PHONE_ID, WA_VERIFY_TOKEN) y el binding R2 FILES.</p></div>';
+  h+=tarjetaPassword();
+  c.innerHTML=h;
+}
+async function guardarConfigEmpresa(){
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({nombre:val('cfgNombre'),rfc:val('cfgRfc'),direccion:val('cfgDir'),telefono:val('cfgTel'),whatsapp:val('cfgWa'),email:val('cfgEmail')})});
+  if(d&&d.ok){CFG=d.data;toast('Datos guardados');}else if(d){toast(d.error||'No se pudo guardar');}
+}
+async function guardarConfigIva(){
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({iva:val('cfgIva')})});
+  if(d&&d.ok){CFG=d.data;toast('Parámetros guardados');}else if(d){toast(d.error||'No se pudo guardar');}
+}
+async function cambiarMiPassword(){
+  var a=val('pwActual'),n=val('pwNueva'),r=val('pwRep');
+  if(!n||n.length<6){toast('La nueva contraseña debe tener al menos 6 caracteres');return;}
+  if(n!==r){toast('Las contraseñas no coinciden');return;}
+  var d=await api('/api/auth/change-password',{method:'POST',body:JSON.stringify({actual:a,nueva:n})});
+  if(d&&d.ok){toast('Contraseña actualizada');var ids=['pwActual','pwNueva','pwRep'];ids.forEach(function(x){var el=document.getElementById(x);if(el)el.value='';});}
+  else if(d){toast(d.error||'No se pudo cambiar');}
+}
+
 var EMP_MAP=null;
 function recargarEmpleados(){go('empleados');}
 function fmtFechaHora(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleString('es-MX',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}catch(e){return s;}}
@@ -2419,7 +2614,7 @@ async function nuevaCotizacion(){
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
   h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
   h+='<button class="btn sec" style="margin-top:.6rem" onclick="agregarFila()">+ Agregar línea</button>';
-  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="0" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="16" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="15"></div></div>';
+  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="0" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+((CFG&&CFG.iva!=null)?CFG.iva:16)+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="15"></div></div>';
   h+='<div style="text-align:right;margin-top:1rem"><div>Subtotal: <strong id="cotSub">$0.00</strong></div><div>IVA: <strong id="cotIvaM">$0.00</strong></div><div style="font-size:1.3rem;color:var(--gold);margin-top:.3rem">TOTAL: <strong id="cotTotal">$0.00</strong></div></div>';
   h+='<label style="margin-top:1rem">Notas</label><textarea id="cotNotas" rows="2" placeholder="Ej: Suministro y corte de cubiertas."></textarea>';
   h+='<label>Condiciones</label><textarea id="cotCond" rows="2">Precios en MXN. Sujeto a disponibilidad de material. Tiempo de entrega a confirmar.</textarea>';
@@ -2488,11 +2683,11 @@ async function pdfCotizacion(id){
   if(!window.jspdf||!window.jspdf.jsPDF){toast('Generador de PDF no cargó, reintenta');return;}
   var c=d.data;var gold=[139,109,63];
   var doc=new window.jspdf.jsPDF();
-  doc.setFontSize(26);doc.setTextColor(gold[0],gold[1],gold[2]);doc.text('ASLAN',14,20);
+  doc.setFontSize(26);doc.setTextColor(gold[0],gold[1],gold[2]);doc.text((CFG&&CFG.nombre?CFG.nombre:'ASLAN'),14,20);
   doc.setFontSize(8);doc.setTextColor(90);
-  doc.text(${JSON.stringify(EMPRESA.direccion)},14,26);
-  doc.text('RFC: '+${JSON.stringify(EMPRESA.rfc)}+'    Tel: '+${JSON.stringify(EMPRESA.telefono)},14,30);
-  doc.text(${JSON.stringify(EMPRESA.email)},14,34);
+  doc.text((CFG&&CFG.direccion?CFG.direccion:${JSON.stringify(EMPRESA.direccion)}),14,26);
+  doc.text('RFC: '+(CFG&&CFG.rfc?CFG.rfc:${JSON.stringify(EMPRESA.rfc)})+'    Tel: '+(CFG&&CFG.telefono?CFG.telefono:${JSON.stringify(EMPRESA.telefono)}),14,30);
+  doc.text((CFG&&CFG.email?CFG.email:${JSON.stringify(EMPRESA.email)}),14,34);
   doc.setFontSize(16);doc.setTextColor(40);doc.text('COTIZACIÓN',196,18,{align:'right'});
   doc.setFontSize(9);
   doc.text('Folio: '+(c.folio||''),196,25,{align:'right'});
@@ -2517,6 +2712,9 @@ async function pdfCotizacion(id){
   doc.save((c.folio||'cotizacion')+'.pdf');
 }
 
+var CFG=null;
+async function cargarCFG(){try{var d=await api('/api/config');if(d&&d.ok)CFG=d.data;}catch(e){}}
+cargarCFG();
 renderNav();
 if(USER.debe_cambiar){toast('Recuerda cambiar tu contraseña en Configuración');}
 go('dashboard');
