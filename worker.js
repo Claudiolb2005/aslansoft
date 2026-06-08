@@ -36,14 +36,14 @@ const ROLES = ["admin", "gerente", "empleado", "cliente"];
 
 // Las 8 etapas del proceso ASLAN (visibles en el portal del cliente)
 const ETAPAS = [
-  { clave: "cotizacion_aceptada", nombre: "Cotización Aceptada", icono: "📋", desc: "El proyecto fue confirmado" },
-  { clave: "material_confirmado", nombre: "Material en Almacén", icono: "🎯", desc: "Tu material está en nuestro almacén" },
-  { clave: "pendiente_aprobacion", nombre: "Losa Lista para Aprobar", icono: "👁️", desc: "Requiere tu aprobación" },
-  { clave: "en_corte", nombre: "En Proceso de Corte", icono: "⚙️", desc: "Tu mármol está siendo procesado" },
-  { clave: "control_calidad", nombre: "Control de Calidad", icono: "🔍", desc: "Revisión y acabados finales" },
-  { clave: "listo_entrega", nombre: "Listo para Entrega", icono: "📦", desc: "Tu pedido está listo" },
-  { clave: "en_camino", nombre: "En Camino", icono: "🚛", desc: "Tu pedido está en ruta" },
-  { clave: "entregado", nombre: "Entregado", icono: "✅", desc: "Proyecto completado" },
+  { clave: "cotizacion_aceptada", nombre: "Cotización Aceptada", icono: "<path d='M6 2h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'/><path d='M14 2v6h6'/><path d='M9 15l2 2 4-4'/>", desc: "El proyecto fue confirmado" },
+  { clave: "material_confirmado", nombre: "Material en Almacén", icono: "<path d='M21 8l-9 4-9-4 9-4 9 4z'/><path d='M3 8v8l9 4 9-4V8'/><path d='M12 12v8'/>", desc: "Tu material está en nuestro almacén" },
+  { clave: "pendiente_aprobacion", nombre: "Losa Lista para Aprobar", icono: "<path d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z'/><circle cx='12' cy='12' r='3'/>", desc: "Requiere tu aprobación" },
+  { clave: "en_corte", nombre: "En Proceso de Corte", icono: "<circle cx='12' cy='12' r='3.2'/><path d='M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1'/>", desc: "Tu mármol está siendo procesado" },
+  { clave: "control_calidad", nombre: "Control de Calidad", icono: "<circle cx='11' cy='11' r='7'/><path d='M21 21l-4.3-4.3'/>", desc: "Revisión y acabados finales" },
+  { clave: "listo_entrega", nombre: "Listo para Entrega", icono: "<path d='M21 8l-9 4-9-4 9-4 9 4z'/><path d='M3 8v8l9 4 9-4V8'/><path d='M9 12l2 2 4-4'/>", desc: "Tu pedido está listo" },
+  { clave: "en_camino", nombre: "En Camino", icono: "<path d='M3 6h11v9H3z'/><path d='M14 9h4l3 3v3h-7z'/><circle cx='7' cy='18' r='1.6'/><circle cx='17' cy='18' r='1.6'/>", desc: "Tu pedido está en ruta" },
+  { clave: "entregado", nombre: "Entregado", icono: "<circle cx='12' cy='12' r='9'/><path d='M8.5 12.5l2.5 2.5 5-5'/>", desc: "Proyecto completado" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -530,6 +530,21 @@ async function runSetup(env, request) {
     }
   }
 
+  // Geocerca por defecto (taller ASLAN, Benito Juárez CDMX) + check-in demo
+  const gcN = await env.DB.prepare("SELECT COUNT(*) AS n FROM geofencing_config").first();
+  if (!gcN || gcN.n === 0) {
+    await env.DB.prepare("INSERT INTO geofencing_config (nombre,lat_centro,lon_centro,radio_metros,activo) VALUES (?,?,?,?,1)")
+      .bind("Taller ASLAN — Luis Carracci 50", 19.37241, -99.16830, 150).run();
+  }
+  const empU = await env.DB.prepare("SELECT id FROM usuarios WHERE email=?").bind("empleado@aslan.com").first();
+  if (empU) {
+    await env.DB.prepare("INSERT OR IGNORE INTO empleados_perfil (usuario_id,consentimiento_gps) VALUES (?,1)").bind(empU.id).run();
+    const ckN = await env.DB.prepare("SELECT COUNT(*) AS n FROM gps_checkins WHERE usuario_id=?").bind(empU.id).first();
+    if (!ckN || ckN.n === 0) {
+      await env.DB.prepare("INSERT INTO gps_checkins (usuario_id,tipo,lat,lon,precision_metros) VALUES (?,?,?,?,?)").bind(empU.id, "entrada", 19.37250, -99.16840, 12).run();
+    }
+  }
+
   return ok({ mensaje: "Sistema inicializado correctamente.", usuarios_demo: usuarios.map(u => ({ email: u[1], rol: u[3] })) });
 }
 
@@ -591,7 +606,7 @@ async function dashboardStats(env) {
   const cotizMes = await q("SELECT COUNT(*) AS n FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','start of month')");
   const proyectos = await q("SELECT COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL AND estado NOT IN ('cerrado','entregado')");
   const stockCritico = await q("SELECT COUNT(*) AS n FROM productos WHERE deleted_at IS NULL AND stock_actual <= stock_minimo");
-  const empleadosHoy = await q("SELECT COUNT(DISTINCT usuario_id) AS n FROM gps_checkins WHERE tipo='checkin' AND created_at >= date('now')");
+  const empleadosHoy = await q("SELECT COUNT(DISTINCT usuario_id) AS n FROM gps_checkins WHERE tipo='entrada' AND created_at >= date('now')");
   const pipeline = (await env.DB.prepare("SELECT COALESCE(SUM(total),0) AS n FROM cotizaciones WHERE estado IN ('enviada','borrador','aceptada') AND deleted_at IS NULL").first()).n;
   const porCategoria = await env.DB.prepare("SELECT categoria, COUNT(*) AS n FROM productos WHERE deleted_at IS NULL GROUP BY categoria").all();
   const recientes = await env.DB.prepare(
@@ -601,6 +616,36 @@ async function dashboardStats(env) {
     kpis: { clientes, cotizMes, proyectos, stockCritico, empleadosHoy, pipeline },
     porCategoria: porCategoria.results || [],
     recientes: recientes.results || [],
+  });
+}
+
+async function dashboardCharts(env) {
+  const cotiz = await env.DB.prepare(
+    "SELECT strftime('%Y-%m', created_at) AS mes, COUNT(*) AS n, COALESCE(SUM(total),0) AS monto" +
+    " FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','-6 months') GROUP BY mes ORDER BY mes ASC"
+  ).all();
+  const proyEtapa = await env.DB.prepare(
+    "SELECT etapa_portal AS etapa, COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL GROUP BY etapa_portal"
+  ).all();
+  const nombreEtapa = {};
+  for (const e of ETAPAS) nombreEtapa[e.clave] = e.nombre;
+  const proyectos_por_etapa = (proyEtapa.results || []).map((r) => ({ etapa: r.etapa, nombre: nombreEtapa[r.etapa] || r.etapa, n: r.n }));
+  const cliEtapa = await env.DB.prepare(
+    "SELECT COALESCE(etapa,'sin etapa') AS etapa, COUNT(*) AS n FROM clientes WHERE deleted_at IS NULL GROUP BY etapa ORDER BY n DESC"
+  ).all();
+  const invCat = await env.DB.prepare(
+    "SELECT COALESCE(categoria,'Otros') AS categoria, COALESCE(SUM(stock_actual*precio_venta),0) AS valor, COUNT(*) AS n" +
+    " FROM productos WHERE deleted_at IS NULL GROUP BY categoria ORDER BY valor DESC"
+  ).all();
+  const asistencia = await env.DB.prepare(
+    "SELECT date(created_at) AS dia, COUNT(*) AS n FROM gps_checkins WHERE tipo='entrada' AND created_at >= date('now','-7 days') GROUP BY dia ORDER BY dia ASC"
+  ).all();
+  return ok({
+    cotiz_por_mes: cotiz.results || [],
+    proyectos_por_etapa,
+    clientes_por_etapa: cliEtapa.results || [],
+    inventario_por_categoria: invCat.results || [],
+    asistencia_7d: asistencia.results || [],
   });
 }
 
@@ -1138,6 +1183,184 @@ function cliente_wa_num() { return ""; } // el número del cliente se resuelve e
 // ============================================================================
 //  ROUTER PRINCIPAL
 // ============================================================================
+// ============================================================================
+//  EMPLEADOS · CHECK-IN GPS · GEOCERCA
+// ============================================================================
+function distanciaMetros(lat1, lon1, lat2, lon2) {
+  const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.sqrt(a)));
+}
+function passwordTemporal() {
+  const cs = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const a = crypto.getRandomValues(new Uint8Array(8));
+  let s = "";
+  for (const x of a) s += cs[x % cs.length];
+  return "Aslan-" + s;
+}
+async function geocercaActiva(env) {
+  return await env.DB.prepare("SELECT * FROM geofencing_config ORDER BY activo DESC, id ASC LIMIT 1").first();
+}
+
+async function handleEmpleados(request, env, payload, method, id) {
+  if (method === "GET" && !id) {
+    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+    const r = await env.DB.prepare(
+      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,ep.consentimiento_gps," +
+      " (SELECT g.created_at FROM gps_checkins g WHERE g.usuario_id=u.id ORDER BY g.created_at DESC, g.id DESC LIMIT 1) AS ultimo_checkin," +
+      " (SELECT g.tipo FROM gps_checkins g WHERE g.usuario_id=u.id ORDER BY g.created_at DESC, g.id DESC LIMIT 1) AS ultimo_tipo" +
+      " FROM usuarios u LEFT JOIN empleados_perfil ep ON ep.usuario_id=u.id" +
+      " WHERE u.rol IN ('empleado','gerente','admin') AND u.deleted_at IS NULL" +
+      " ORDER BY u.nombre, u.id"
+    ).all();
+    return ok(r.results || []);
+  }
+  if (method === "GET" && id) {
+    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+    const e = await env.DB.prepare(
+      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,u.ultimo_acceso," +
+      " ep.curp,ep.rfc,ep.fecha_nacimiento,ep.fecha_ingreso,ep.salario,ep.tipo_contrato,ep.consentimiento_gps" +
+      " FROM usuarios u LEFT JOIN empleados_perfil ep ON ep.usuario_id=u.id WHERE u.id=? AND u.deleted_at IS NULL"
+    ).bind(id).first();
+    if (!e) return fail("Empleado no encontrado.", 404);
+    const ch = await env.DB.prepare(
+      "SELECT id,tipo,lat,lon,precision_metros,created_at FROM gps_checkins WHERE usuario_id=? ORDER BY created_at DESC, id DESC LIMIT 30"
+    ).bind(id).all();
+    return ok({ empleado: e, checkins: ch.results || [] });
+  }
+  if (method === "POST") {
+    if (!hasRole(payload, "admin")) return fail("Solo admin da de alta empleados.", 403);
+    const b = await request.json().catch(() => ({}));
+    if (!b.nombre || !b.email) return fail("Nombre y correo son obligatorios.");
+    const existe = await env.DB.prepare("SELECT id FROM usuarios WHERE email=?").bind(b.email).first();
+    if (existe) return fail("Ya existe un usuario con ese correo.");
+    const rol = (b.rol === "gerente" || b.rol === "empleado") ? b.rol : "empleado";
+    const pw = passwordTemporal();
+    const ph = await hashPassword(pw);
+    const res = await env.DB.prepare(
+      "INSERT INTO usuarios (nombre,email,password_hash,rol,cargo,area,telefono,password_debe_cambiar) VALUES (?,?,?,?,?,?,?,1)"
+    ).bind(b.nombre, b.email, ph, rol, b.cargo || null, b.area || null, b.telefono || null).run();
+    const uid = res.meta.last_row_id;
+    await env.DB.prepare(
+      "INSERT INTO empleados_perfil (usuario_id,curp,rfc,fecha_ingreso,salario,tipo_contrato,consentimiento_gps) VALUES (?,?,?,?,?,?,?)"
+    ).bind(uid, b.curp || null, b.rfc || null, b.fecha_ingreso || null, (b.salario != null && b.salario !== "") ? Number(b.salario) : null, b.tipo_contrato || null, b.consentimiento_gps ? 1 : 0).run();
+    await audit(env, payload.sub, "crear", "empleados", uid, { email: b.email, rol }, request);
+    return ok({ id: uid, email: b.email, password_temporal: pw });
+  }
+  if (method === "PUT" && id) {
+    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    const b = await request.json().catch(() => ({}));
+    const camposU = ["nombre", "cargo", "area", "telefono", "activo", "rol"];
+    const setsU = [], valsU = [];
+    for (const c of camposU) if (c in b) { setsU.push(c + "=?"); valsU.push(c === "activo" ? (b[c] ? 1 : 0) : b[c]); }
+    if (setsU.length) { valsU.push(id); await env.DB.prepare("UPDATE usuarios SET " + setsU.join(",") + ", updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(...valsU).run(); }
+    const camposP = ["curp", "rfc", "fecha_nacimiento", "fecha_ingreso", "salario", "tipo_contrato", "consentimiento_gps"];
+    const setsP = [], valsP = [];
+    for (const c of camposP) if (c in b) { setsP.push(c + "=?"); valsP.push(c === "consentimiento_gps" ? (b[c] ? 1 : 0) : (c === "salario" ? (Number(b[c]) || 0) : b[c])); }
+    if (setsP.length) {
+      await env.DB.prepare("INSERT OR IGNORE INTO empleados_perfil (usuario_id) VALUES (?)").bind(id).run();
+      valsP.push(id);
+      await env.DB.prepare("UPDATE empleados_perfil SET " + setsP.join(",") + ", updated_at=CURRENT_TIMESTAMP WHERE usuario_id=?").bind(...valsP).run();
+    }
+    if (!setsU.length && !setsP.length) return fail("Nada que actualizar.");
+    await audit(env, payload.sub, "editar", "empleados", id, b, request);
+    return ok({ id });
+  }
+  if (method === "DELETE" && id) {
+    if (!hasRole(payload, "admin")) return fail("Solo admin.", 403);
+    if (String(payload.sub) === String(id)) return fail("No puedes desactivar tu propia cuenta.");
+    await env.DB.prepare("UPDATE usuarios SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
+    await audit(env, payload.sub, "eliminar", "empleados", id, null, request);
+    return ok({ id });
+  }
+  return fail("Método no soportado.", 405);
+}
+
+async function registrarCheckin(request, env, payload) {
+  const b = await request.json().catch(() => ({}));
+  const tipo = (b.tipo === "salida") ? "salida" : "entrada";
+  const lat = Number(b.lat), lon = Number(b.lon);
+  if (!isFinite(lat) || !isFinite(lon)) return fail("Ubicación inválida.");
+  const prec = (b.precision != null && isFinite(Number(b.precision))) ? Number(b.precision) : null;
+  const res = await env.DB.prepare(
+    "INSERT INTO gps_checkins (usuario_id,tipo,lat,lon,precision_metros) VALUES (?,?,?,?,?)"
+  ).bind(payload.sub, tipo, lat, lon, prec).run();
+  let dentro = null, distancia = null, geo = null;
+  const g = await geocercaActiva(env);
+  if (g) {
+    distancia = distanciaMetros(lat, lon, g.lat_centro, g.lon_centro);
+    dentro = distancia <= g.radio_metros;
+    geo = { nombre: g.nombre, radio: g.radio_metros };
+    if (!dentro) {
+      await env.DB.prepare("INSERT INTO geofencing_alertas (usuario_id,lat,lon,distancia_metros) VALUES (?,?,?,?)").bind(payload.sub, lat, lon, distancia).run();
+    }
+  }
+  await audit(env, payload.sub, tipo, "gps_checkins", res.meta.last_row_id, { lat, lon, dentro }, request);
+  return ok({ id: res.meta.last_row_id, tipo, dentro, distancia, geocerca: geo });
+}
+
+async function checkinEstado(env, payload) {
+  const u = await env.DB.prepare("SELECT tipo,created_at FROM gps_checkins WHERE usuario_id=? ORDER BY created_at DESC, id DESC LIMIT 1").bind(payload.sub).first();
+  const g = await geocercaActiva(env);
+  return ok({
+    ultimo_tipo: u ? u.tipo : null,
+    ultimo_checkin: u ? u.created_at : null,
+    geocerca: g ? { nombre: g.nombre, lat: g.lat_centro, lon: g.lon_centro, radio: g.radio_metros } : null
+  });
+}
+
+async function checkinsRecientes(env, payload) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  const r = await env.DB.prepare(
+    "SELECT g.id,g.usuario_id,g.tipo,g.lat,g.lon,g.precision_metros,g.created_at,u.nombre" +
+    " FROM gps_checkins g LEFT JOIN usuarios u ON u.id=g.usuario_id" +
+    " ORDER BY g.created_at DESC, g.id DESC LIMIT 100"
+  ).all();
+  return ok(r.results || []);
+}
+
+async function handleGeofencing(request, env, payload, method) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  if (method === "GET") {
+    const g = await geocercaActiva(env);
+    return ok(g || null);
+  }
+  if (method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    const lat = Number(b.lat_centro), lon = Number(b.lon_centro), radio = Number(b.radio_metros);
+    if (!isFinite(lat) || !isFinite(lon) || !isFinite(radio) || radio <= 0) return fail("Datos de geocerca inválidos.");
+    const ex = await env.DB.prepare("SELECT id FROM geofencing_config ORDER BY id ASC LIMIT 1").first();
+    if (ex) {
+      await env.DB.prepare("UPDATE geofencing_config SET nombre=?, lat_centro=?, lon_centro=?, radio_metros=?, activo=1, updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(b.nombre || "Sitio ASLAN", lat, lon, radio, ex.id).run();
+      await audit(env, payload.sub, "editar", "geofencing", ex.id, { radio }, request);
+      return ok({ id: ex.id });
+    }
+    const res = await env.DB.prepare("INSERT INTO geofencing_config (nombre,lat_centro,lon_centro,radio_metros,activo) VALUES (?,?,?,?,1)")
+      .bind(b.nombre || "Sitio ASLAN", lat, lon, radio).run();
+    await audit(env, payload.sub, "crear", "geofencing", res.meta.last_row_id, { radio }, request);
+    return ok({ id: res.meta.last_row_id });
+  }
+  return fail("Método no soportado.", 405);
+}
+
+async function alertasGeofencing(env, payload) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  const r = await env.DB.prepare(
+    "SELECT a.id,a.usuario_id,a.lat,a.lon,a.distancia_metros,a.revisada,a.created_at,u.nombre" +
+    " FROM geofencing_alertas a LEFT JOIN usuarios u ON u.id=a.usuario_id" +
+    " ORDER BY a.revisada ASC, a.created_at DESC, a.id DESC LIMIT 50"
+  ).all();
+  return ok(r.results || []);
+}
+
+async function revisarAlerta(request, env, payload, id) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  await env.DB.prepare("UPDATE geofencing_alertas SET revisada=1 WHERE id=?").bind(id).run();
+  return ok({ id });
+}
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -1178,6 +1401,7 @@ async function handleRequest(request, env) {
     if (path === "/api/me") return ok({ id: payload.sub, nombre: payload.nombre, rol: payload.rol });
     if (path === "/api/auth/change-password" && method === "POST") return await handleChangePassword(request, env, payload);
     if (path === "/api/dashboard/stats") return await dashboardStats(env);
+    if (path === "/api/dashboard/charts") return await dashboardCharts(env);
 
     let m;
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
@@ -1197,6 +1421,17 @@ async function handleRequest(request, env) {
     if (m) return await handleProveedores(request, env, payload, method, m[1]);
     m = path.match(/^\/api\/proyectos(?:\/(\d+))?$/);
     if (m) return await handleProyectos(request, env, payload, method, m[1]);
+
+    // ----- Empleados · Check-in GPS · Geocerca -----
+    if (path === "/api/checkin" && method === "POST") return await registrarCheckin(request, env, payload);
+    if (path === "/api/checkin/estado" && method === "GET") return await checkinEstado(env, payload);
+    if (path === "/api/checkins" && method === "GET") return await checkinsRecientes(env, payload);
+    m = path.match(/^\/api\/geofencing\/alertas\/(\d+)\/revisar$/);
+    if (m && method === "POST") return await revisarAlerta(request, env, payload, m[1]);
+    if (path === "/api/geofencing/alertas" && method === "GET") return await alertasGeofencing(env, payload);
+    if (path === "/api/geofencing") return await handleGeofencing(request, env, payload, method);
+    m = path.match(/^\/api\/empleados(?:\/(\d+))?$/);
+    if (m) return await handleEmpleados(request, env, payload, method, m[1]);
 
     // ----- Gestión del PORTAL desde el sistema interno (admin/gerente) -----
     const mAdmin = path.match(/^\/api\/admin\/proyectos\/(\d+)\/portal(?:\/(\w+))?$/);
@@ -1251,6 +1486,11 @@ th{text-align:left;color:var(--gold2);font-weight:600;padding:.6rem;border-botto
 td{padding:.55rem .6rem;border-bottom:1px solid rgba(255,255,255,.05)}
 tr:hover td{background:rgba(139,109,63,.06)}
 .toast{position:fixed;top:1rem;right:1rem;background:var(--card);border:1px solid var(--gold);padding:.8rem 1.1rem;border-radius:6px;z-index:9999;box-shadow:0 6px 30px rgba(0,0,0,.6)}
+svg{vertical-align:middle;flex-shrink:0}
+input[type=number]{-moz-appearance:textfield;appearance:textfield}
+input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
+@media(max-width:768px){.g2{grid-template-columns:1fr}.btn{min-height:44px;padding:.8rem 1.1rem}}
 `;
 }
 
@@ -1308,11 +1548,11 @@ async function entrar(){
 // ============================================================================
 function renderApp() {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ASLAN · Panel</title>${FONTS}<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script><style>${baseStyles(false)}
+<title>ASLAN · Panel</title>${FONTS}<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script><style>${baseStyles(false)}
 .layout{display:flex;min-height:100vh}
 .side{width:240px;background:#111;border-right:1px solid var(--bd);padding:1.2rem .8rem;flex-shrink:0}
 .side h1{color:var(--gold);font-size:1.8rem;letter-spacing:.3em;text-align:center;margin-bottom:1.4rem}
-.nav a{display:block;padding:.6rem .8rem;border-radius:6px;color:var(--txt);font-size:.9rem;margin-bottom:.2rem;cursor:pointer}
+.nav a{display:flex;align-items:center;gap:.6rem;padding:.6rem .8rem;border-radius:6px;color:var(--txt);font-size:.9rem;margin-bottom:.2rem;cursor:pointer}
 .nav a:hover{background:rgba(139,109,63,.12)}
 .nav a.active{background:var(--gold);color:#fff}
 .side .user{position:absolute;bottom:1rem;font-size:.8rem;color:var(--txt2)}
@@ -1323,6 +1563,7 @@ function renderApp() {
 .kpi .n{font-size:2.2rem;color:var(--gold);font-family:'Cormorant Garamond',serif;font-weight:700}
 .kpi .l{font-size:.78rem;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em}
 .grid{display:grid;gap:1rem}
+.charts-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-bottom:1.4rem}
 @media(max-width:768px){.side{position:fixed;left:-260px;transition:.2s;z-index:50;height:100%}.side.open{left:0}.main{padding:1rem}.menu-btn{display:block!important}}
 .menu-btn{display:none;background:none;border:1px solid var(--bd);color:var(--gold);padding:.4rem .7rem;border-radius:4px;font-size:1.2rem;cursor:pointer}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:99;padding:1rem}
@@ -1330,6 +1571,7 @@ function renderApp() {
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:420px;width:100%;max-height:90vh;overflow:auto}
 td[contenteditable]{cursor:text;border-bottom:1px dashed rgba(139,109,63,.4)}
 td[contenteditable]:focus{outline:1px solid var(--gold);background:rgba(139,109,63,.08)}
+@media(max-width:768px){.hd h2{font-size:1.5rem}.kpi .n{font-size:1.8rem}.kpis{grid-template-columns:1fr 1fr}.card{overflow-x:auto}.modal{padding:0;align-items:flex-end}.modal .inner{max-width:none;width:100%;border-radius:14px 14px 0 0;max-height:92vh}.side.open{box-shadow:0 0 40px rgba(0,0,0,.6)}}
 </style></head><body>
 <div class="layout">
 <aside class="side" id="side">
@@ -1338,7 +1580,7 @@ td[contenteditable]:focus{outline:1px solid var(--gold);background:rgba(139,109,
 <div class="user" id="userBox"></div>
 </aside>
 <main class="main">
-<div class="hd"><button class="menu-btn" onclick="document.getElementById('side').classList.toggle('open')">☰</button><h2 id="titulo">Dashboard</h2><div id="acciones"></div></div>
+<div class="hd"><button class="menu-btn" onclick="document.getElementById('side').classList.toggle('open')"><svg viewBox='0 0 24 24' width='22' height='22' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round'><line x1='3' y1='6' x2='21' y2='6'/><line x1='3' y1='12' x2='21' y2='12'/><line x1='3' y1='18' x2='21' y2='18'/></svg></button><h2 id="titulo">Dashboard</h2><div id="acciones"></div></div>
 <div id="content">Cargando…</div>
 </main></div>
 <div class="modal" id="modal"><div class="inner" id="modalInner"></div></div>
@@ -1352,26 +1594,38 @@ else if(USER.rol==='cliente'){location.href='/portal/dashboard';} // el cliente 
 function H(){return {'Content-Type':'application/json','Authorization':'Bearer '+TOKEN};}
 async function api(p,opt){opt=opt||{};opt.headers=H();var r=await fetch(p,opt);if(r.status===401){localStorage.clear();location.href='/login';return null;}return await r.json();}
 function money(n){return '$'+Number(n||0).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function ic(p,s){s=s||18;return "<svg viewBox='0 0 24 24' width='"+s+"' height='"+s+"' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'>"+p+"</svg>";}
+var ICONS={
+  dashboard:"<rect x='3' y='3' width='7' height='9' rx='1'/><rect x='14' y='3' width='7' height='5' rx='1'/><rect x='14' y='12' width='7' height='9' rx='1'/><rect x='3' y='16' width='7' height='5' rx='1'/>",
+  clientes:"<path d='M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/><path d='M23 21v-2a4 4 0 0 0-3-3.87'/><path d='M16 3.1a4 4 0 0 1 0 7.75'/>",
+  cotizaciones:"<path d='M6 2h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'/><path d='M14 2v6h6'/><path d='M9 13h6M9 17h4'/>",
+  inventario:"<path d='M21 8l-9 4-9-4 9-4 9 4z'/><path d='M3 8v8l9 4 9-4V8'/><path d='M12 12v8'/>",
+  proyectos:"<path d='M12 2l9 5-9 5-9-5 9-5z'/><path d='M3 12l9 5 9-5'/><path d='M3 17l9 5 9-5'/>",
+  empleados:"<circle cx='12' cy='8' r='4'/><path d='M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1'/>",
+  whatsapp:"<path d='M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-4-1L3 21l1.5-5.5a8.5 8.5 0 1 1 16.5-4z'/>",
+  reportes:"<path d='M3 17l6-6 4 4 7-7'/><path d='M17 8h4v4'/>",
+  config:"<circle cx='12' cy='12' r='3.2'/><path d='M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1'/>"
+};
 function toast(t){var d=document.createElement('div');d.className='toast';d.textContent=t;document.body.appendChild(d);setTimeout(function(){d.remove();},2600);}
 
 var MENU=[
-  {id:'dashboard',label:'📊 Dashboard',roles:['admin','gerente','empleado']},
-  {id:'clientes',label:'👥 Clientes / CRM',roles:['admin','gerente','empleado']},
-  {id:'cotizaciones',label:'🧾 Cotizaciones',roles:['admin','gerente','empleado']},
-  {id:'inventario',label:'📦 Inventario',roles:['admin','gerente','empleado']},
-  {id:'proyectos',label:'🏗️ Proyectos',roles:['admin','gerente','empleado']},
-  {id:'empleados',label:'👷 Empleados',roles:['admin','gerente']},
-  {id:'whatsapp',label:'💬 WhatsApp',roles:['admin','gerente','empleado']},
-  {id:'reportes',label:'📈 Reportes',roles:['admin','gerente']},
-  {id:'config',label:'⚙️ Configuración',roles:['admin']}
+  {id:'dashboard',label:'Dashboard',roles:['admin','gerente','empleado']},
+  {id:'clientes',label:'Clientes / CRM',roles:['admin','gerente','empleado']},
+  {id:'cotizaciones',label:'Cotizaciones',roles:['admin','gerente','empleado']},
+  {id:'inventario',label:'Inventario',roles:['admin','gerente','empleado']},
+  {id:'proyectos',label:'Proyectos',roles:['admin','gerente','empleado']},
+  {id:'empleados',label:'Empleados',roles:['admin','gerente']},
+  {id:'whatsapp',label:'WhatsApp',roles:['admin','gerente','empleado']},
+  {id:'reportes',label:'Reportes',roles:['admin','gerente']},
+  {id:'config',label:'Configuración',roles:['admin']}
 ];
 function renderNav(){
   var nav=document.getElementById('nav');nav.innerHTML='';
   MENU.filter(function(m){return m.roles.indexOf(USER.rol)>=0;}).forEach(function(m){
-    var a=document.createElement('a');a.textContent=m.label;a.dataset.id=m.id;
+    var a=document.createElement('a');a.innerHTML=ic(ICONS[m.id]||'')+'<span>'+m.label+'</span>';a.dataset.id=m.id;
     a.onclick=function(){go(m.id);};nav.appendChild(a);
   });
-  document.getElementById('userBox').innerHTML=USER.nombre+'<br><span style="color:var(--gold)">'+USER.rol+'</span> · <a onclick="logout()" style="cursor:pointer">salir</a>';
+  document.getElementById('userBox').innerHTML=USER.nombre+'<br><span style="color:var(--gold)">'+USER.rol+'</span> · <a onclick="logout()" style="cursor:pointer">salir</a><br><a href="/check-in" style="color:var(--gold2);font-size:.8rem">Registrar entrada / salida</a>';
 }
 function logout(){localStorage.clear();location.href='/login';}
 function setActive(id){var as=document.querySelectorAll('.nav a');as.forEach(function(a){a.classList.toggle('active',a.dataset.id===id);});}
@@ -1387,20 +1641,185 @@ async function go(id){
   if(id==='cotizaciones')return viewCotizaciones(c);
   if(id==='inventario')return viewInventario(c);
   if(id==='proyectos')return viewProyectos(c);
+  if(id==='empleados')return viewEmpleados(c);
   c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem">Módulo en construcción</h3><p class="muted" style="margin-top:.5rem">Esta sección («'+t[id]+'») se está integrando sobre esta misma base. Ya está el backbone, la auth por rol y el esquema de datos completo.</p></div>';
 }
 
+var EMP_MAP=null;
+function recargarEmpleados(){go('empleados');}
+function fmtFechaHora(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleString('es-MX',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}catch(e){return s;}}
+function empEstadoBadge(tipo,checkin){
+  if(!checkin)return '<span class="pill" style="background:rgba(255,255,255,.06);color:var(--txt2)">Sin registro</span>';
+  var dt=new Date(checkin.replace(' ','T')+'Z'),hoy=new Date();
+  var mismoDia=(dt.getFullYear()===hoy.getFullYear()&&dt.getMonth()===hoy.getMonth()&&dt.getDate()===hoy.getDate());
+  if(!mismoDia)return '<span class="pill" style="background:rgba(255,255,255,.06);color:var(--txt2)">Sin registro hoy</span>';
+  if(tipo==='entrada')return '<span class="pill" style="background:rgba(76,175,80,.18);color:var(--ok)">En sitio</span>';
+  return '<span class="pill" style="background:rgba(255,255,255,.08);color:var(--txt2)">Salió</span>';
+}
+async function viewEmpleados(c){
+  var puede=(USER.rol==='admin'||USER.rol==='gerente');
+  if(!puede){
+    c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Mi asistencia</h3><p class="muted">La gestión de empleados es para administración o gerencia. Para registrar tu entrada o salida usa la pantalla de check-in.</p><p style="margin-top:.8rem"><a class="btn" href="/check-in">Abrir check-in</a></p></div>';
+    return;
+  }
+  var acc='';
+  if(USER.rol==='admin')acc+='<button class="btn" onclick="nuevoEmpleado()">+ Nuevo empleado</button> ';
+  acc+='<button class="btn sec" onclick="configGeocerca()">Configurar geocerca</button> <a class="btn sec" href="/check-in" target="_blank">Abrir check-in</a>';
+  document.getElementById('acciones').innerHTML=acc;
+  var d=await api('/api/empleados');if(!d||!d.ok)return;
+  var cksR=await api('/api/checkins'),cks=(cksR&&cksR.ok)?cksR.data:[];
+  var alR=await api('/api/geofencing/alertas'),alertas=(alR&&alR.ok)?alR.data:[];
+  var geoR=await api('/api/geofencing'),geo=(geoR&&geoR.ok)?geoR.data:null;
+  var h='';
+  h+='<div class="card" style="padding:.6rem;margin-bottom:1rem"><div id="empMap" style="height:340px;border-radius:8px;overflow:hidden;background:#111"></div>';
+  h+='<p class="muted" style="font-size:.74rem;margin-top:.45rem">Verde = entrada · Rojo = salida · Círculo dorado = geocerca'+(geo?(' («'+(geo.nombre||'Sitio')+'», radio '+geo.radio_metros+' m)'):' — sin configurar, usa «Configurar geocerca»')+'</p></div>';
+  var pend=alertas.filter(function(a){return !a.revisada;});
+  if(alertas.length){
+    h+='<div class="card" style="margin-bottom:1rem"><h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Alertas de geocerca'+(pend.length?(' · '+pend.length+' sin revisar'):'')+'</h3>';
+    alertas.slice(0,12).forEach(function(a){
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:.6rem;border-bottom:1px solid var(--bd);padding:.45rem 0"><div><strong>'+(a.nombre||('Usuario '+a.usuario_id))+'</strong><br><span class="muted" style="font-size:.78rem">'+fmtFechaHora(a.created_at)+' · '+a.distancia_metros+' m fuera del centro</span></div>'+(a.revisada?'<span class="pill" style="background:rgba(255,255,255,.06);color:var(--txt2)">Revisada</span>':'<button class="btn sec" style="padding:.25rem .6rem" onclick="revisarAlertaUI('+a.id+')">Revisar</button>')+'</div>';
+    });
+    h+='</div>';
+  }
+  h+='<div class="card" style="overflow-x:auto"><table><thead><tr><th>Empleado</th><th>Rol / Cargo</th><th>Estado hoy</th><th>Último registro</th><th>GPS</th><th>Acciones</th></tr></thead><tbody>';
+  d.data.forEach(function(e){
+    h+='<tr><td><strong>'+e.nombre+'</strong><br><span class="muted" style="font-size:.76rem">'+(e.email||'')+'</span></td>'+
+      '<td>'+e.rol+(e.cargo?('<br><span class="muted" style="font-size:.76rem">'+e.cargo+'</span>'):'')+'</td>'+
+      '<td>'+empEstadoBadge(e.ultimo_tipo,e.ultimo_checkin)+'</td>'+
+      '<td class="muted" style="white-space:nowrap;font-size:.82rem">'+fmtFechaHora(e.ultimo_checkin)+'</td>'+
+      '<td>'+(e.consentimiento_gps?'<span style="font-size:.78rem;color:var(--ok)">Sí</span>':'<span class="muted" style="font-size:.78rem">No</span>')+'</td>'+
+      '<td style="white-space:nowrap"><button class="btn sec" style="padding:.25rem .55rem" onclick="editarEmpleado('+e.id+')">Editar</button></td></tr>';
+  });
+  if(!d.data.length)h+='<tr><td colspan="6" class="muted">Sin empleados.</td></tr>';
+  h+='</tbody></table></div>';
+  c.innerHTML=h;
+  setTimeout(function(){initEmpMap(cks,geo);},40);
+}
+function initEmpMap(cks,geo){
+  if(typeof L==='undefined')return;
+  if(EMP_MAP){try{EMP_MAP.remove();}catch(e){}EMP_MAP=null;}
+  var center=[19.37241,-99.16830];
+  if(geo&&isFinite(geo.lat_centro)&&isFinite(geo.lon_centro))center=[geo.lat_centro,geo.lon_centro];
+  else if(cks.length&&isFinite(cks[0].lat))center=[cks[0].lat,cks[0].lon];
+  EMP_MAP=L.map('empMap').setView(center,15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(EMP_MAP);
+  if(geo&&isFinite(geo.lat_centro))L.circle([geo.lat_centro,geo.lon_centro],{radius:geo.radio_metros,color:'#8B6D3F',weight:1.5,fillColor:'#8B6D3F',fillOpacity:.12}).addTo(EMP_MAP);
+  cks.forEach(function(ck){
+    if(!isFinite(ck.lat)||!isFinite(ck.lon))return;
+    var col=(ck.tipo==='entrada')?'#4CAF50':'#E53935';
+    L.circleMarker([ck.lat,ck.lon],{radius:7,color:col,weight:1.5,fillColor:col,fillOpacity:.85}).addTo(EMP_MAP).bindPopup('<strong>'+(ck.nombre||('Usuario '+ck.usuario_id))+'</strong><br>'+(ck.tipo==='entrada'?'Entrada':'Salida')+'<br>'+fmtFechaHora(ck.created_at));
+  });
+  setTimeout(function(){try{EMP_MAP.invalidateSize();}catch(e){}},60);
+}
+function nuevoEmpleado(){
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.6rem">Nuevo empleado</h3>'+
+    '<label>Nombre completo</label><input id="neNom">'+
+    '<label>Correo</label><input id="neMail" type="email" placeholder="nombre@marmolesaslan.com">'+
+    '<label>Rol</label><select id="neRol"><option value="empleado">Empleado</option><option value="gerente">Gerente</option></select>'+
+    '<div class="g2"><div><label>Cargo</label><input id="neCargo"></div><div><label>Área</label><input id="neArea"></div></div>'+
+    '<label>Teléfono</label><input id="neTel">'+
+    '<label style="text-transform:none;display:flex;align-items:center;gap:.5rem;margin-top:.7rem"><input type="checkbox" id="neGps" style="width:auto"> El empleado dio consentimiento de ubicación GPS</label>'+
+    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarEmpleado()">Crear acceso</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+}
+async function guardarEmpleado(){
+  var b={nombre:val('neNom'),email:val('neMail'),rol:val('neRol'),cargo:val('neCargo'),area:val('neArea'),telefono:val('neTel'),consentimiento_gps:document.getElementById('neGps').checked};
+  if(!b.nombre||!b.email){toast('Falta nombre o correo');return;}
+  var d=await api('/api/empleados',{method:'POST',body:JSON.stringify(b)});
+  if(!d)return;
+  if(!d.ok){toast(d.error||'No se pudo crear');return;}
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Acceso creado</h3><p>Comparte estos datos con el empleado. Deberá cambiar la contraseña en su primer ingreso.</p><p style="margin-top:.6rem">Correo: <strong>'+escAttr(b.email)+'</strong></p><p>Contraseña temporal: <strong style="color:var(--gold)">'+escAttr(d.data.password_temporal)+'</strong></p><div style="margin-top:.9rem"><button class="btn" onclick="closeModal();recargarEmpleados()">Listo</button></div>');
+}
+async function configGeocerca(){
+  var d=await api('/api/geofencing'),g=(d&&d.ok)?d.data:null;
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Geocerca del sitio</h3>'+
+    '<p class="muted" style="font-size:.82rem;margin-bottom:.3rem">Define el centro y el radio del sitio de trabajo. Los registros fuera de esta zona generan una alerta.</p>'+
+    '<label>Nombre del sitio</label><input id="gcNom" value="'+escAttr(g&&g.nombre?g.nombre:'')+'">'+
+    '<div class="g2"><div><label>Latitud</label><input id="gcLat" type="number" step="0.000001" value="'+(g&&isFinite(g.lat_centro)?g.lat_centro:'')+'"></div><div><label>Longitud</label><input id="gcLon" type="number" step="0.000001" value="'+(g&&isFinite(g.lon_centro)?g.lon_centro:'')+'"></div></div>'+
+    '<label>Radio (metros)</label><input id="gcRad" type="number" value="'+(g&&isFinite(g.radio_metros)?g.radio_metros:150)+'">'+
+    '<button class="btn sec block" style="margin-top:.5rem" onclick="ubicarmeGeocerca()">Usar mi ubicación actual</button>'+
+    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarGeocerca()">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+}
+function ubicarmeGeocerca(){
+  if(!navigator.geolocation){toast('Sin GPS disponible');return;}
+  toast('Obteniendo ubicación…');
+  navigator.geolocation.getCurrentPosition(function(pos){
+    document.getElementById('gcLat').value=pos.coords.latitude.toFixed(6);
+    document.getElementById('gcLon').value=pos.coords.longitude.toFixed(6);
+    toast('Ubicación tomada');
+  },function(){toast('No se pudo ubicar');},{enableHighAccuracy:true,timeout:10000});
+}
+async function guardarGeocerca(){
+  var b={nombre:val('gcNom')||'Sitio ASLAN',lat_centro:parseFloat(val('gcLat')),lon_centro:parseFloat(val('gcLon')),radio_metros:parseFloat(val('gcRad'))};
+  if(!isFinite(b.lat_centro)||!isFinite(b.lon_centro)||!isFinite(b.radio_metros)){toast('Completa latitud, longitud y radio');return;}
+  var d=await api('/api/geofencing',{method:'POST',body:JSON.stringify(b)});
+  if(d&&d.ok){closeModal();toast('Geocerca guardada');go('empleados');}else if(d){toast(d.error||'Error');}
+}
+async function editarEmpleado(id){
+  var d=await api('/api/empleados/'+id);if(!d||!d.ok){toast('No se pudo cargar');return;}
+  var e=d.data.empleado;
+  function v(x){return (x===null||x===undefined)?'':x;}
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">'+escAttr(e.nombre)+'</h3>'+
+    '<div class="g2"><div><label>Cargo</label><input id="edCargo" value="'+escAttr(v(e.cargo))+'"></div><div><label>Área</label><input id="edArea" value="'+escAttr(v(e.area))+'"></div></div>'+
+    '<label>Teléfono</label><input id="edTel" value="'+escAttr(v(e.telefono))+'">'+
+    '<div class="g2"><div><label>Rol</label><select id="edRol"><option value="empleado"'+(e.rol==='empleado'?' selected':'')+'>Empleado</option><option value="gerente"'+(e.rol==='gerente'?' selected':'')+'>Gerente</option><option value="admin"'+(e.rol==='admin'?' selected':'')+'>Admin</option></select></div><div><label>Estado</label><select id="edAct"><option value="1"'+(e.activo?' selected':'')+'>Activo</option><option value="0"'+(!e.activo?' selected':'')+'>Inactivo</option></select></div></div>'+
+    '<div class="g2"><div><label>CURP</label><input id="edCurp" value="'+escAttr(v(e.curp))+'"></div><div><label>RFC</label><input id="edRfc" value="'+escAttr(v(e.rfc))+'"></div></div>'+
+    '<div class="g2"><div><label>Fecha de ingreso</label><input id="edIng" type="date" value="'+escAttr(v(e.fecha_ingreso))+'"></div><div><label>Tipo de contrato</label><input id="edCon" value="'+escAttr(v(e.tipo_contrato))+'"></div></div>'+
+    '<label>Salario mensual</label><input id="edSal" type="number" value="'+(e.salario!=null?e.salario:'')+'">'+
+    '<label style="text-transform:none;display:flex;align-items:center;gap:.5rem;margin-top:.7rem"><input type="checkbox" id="edGps" style="width:auto"'+(e.consentimiento_gps?' checked':'')+'> Consentimiento de ubicación GPS</label>'+
+    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarEmpleadoEdit('+id+')">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+}
+async function guardarEmpleadoEdit(id){
+  var b={cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),rol:val('edRol'),activo:val('edAct')==='1',curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
+  var sal=val('edSal');if(sal!=='')b.salario=parseFloat(sal);
+  var d=await api('/api/empleados/'+id,{method:'PUT',body:JSON.stringify(b)});
+  if(d&&d.ok){closeModal();toast('Guardado');go('empleados');}else if(d){toast(d.error||'Error');}
+}
+async function revisarAlertaUI(id){
+  var d=await api('/api/geofencing/alertas/'+id+'/revisar',{method:'POST'});
+  if(d&&d.ok){toast('Alerta revisada');go('empleados');}
+}
+var DASH_CHARTS=[];
+function dashPaleta(){return ['#8B6D3F','#A07D4A','#C49A6C','#6E5630','#B98C4F','#D8B98C','#7D6B4A','#9A7B4F'];}
+function mesCorto(ym){try{var p=ym.split('-');var d=new Date(parseInt(p[0]),parseInt(p[1])-1,1);return d.toLocaleDateString('es-MX',{month:'short'})+' '+p[0].slice(2);}catch(e){return ym;}}
+function diaCorto(s){try{var d=new Date(s+'T00:00:00');return d.toLocaleDateString('es-MX',{day:'2-digit',month:'short'});}catch(e){return s;}}
+function ultimosMeses(n){var a=[],d=new Date();for(var i=n-1;i>=0;i--){var x=new Date(d.getFullYear(),d.getMonth()-i,1);a.push(x.getFullYear()+'-'+('0'+(x.getMonth()+1)).slice(-2));}return a;}
+function ultimosDias(n){var a=[],d=new Date();for(var i=n-1;i>=0;i--){var x=new Date(d.getFullYear(),d.getMonth(),d.getDate()-i);a.push(x.getFullYear()+'-'+('0'+(x.getMonth()+1)).slice(-2)+'-'+('0'+x.getDate()).slice(-2));}return a;}
+function abreviaMonto(v){return '$'+(v>=1000?((v/1000).toFixed(v>=10000?0:1)+'k'):v);}
+function destruirCharts(){DASH_CHARTS.forEach(function(ch){try{ch.destroy();}catch(e){}});DASH_CHARTS=[];}
+function mkChart(id,cfg){var el=document.getElementById(id);if(!el||typeof Chart==='undefined')return;try{DASH_CHARTS.push(new Chart(el,cfg));}catch(e){}}
+function chartCard(titulo,id){return '<div class="card"><h3 style="color:var(--gold);font-size:1.05rem;margin-bottom:.6rem">'+titulo+'</h3><div style="position:relative;height:240px"><canvas id="'+id+'"></canvas></div></div>';}
+function initDashCharts(cd){
+  if(typeof Chart==='undefined')return;
+  Chart.defaults.color='#999';Chart.defaults.borderColor='rgba(255,255,255,.07)';
+  try{Chart.defaults.font.family="Montserrat, system-ui, sans-serif";}catch(e){}
+  var pal=dashPaleta();
+  var meses=ultimosMeses(6),mapC={};(cd.cotiz_por_mes||[]).forEach(function(r){mapC[r.mes]=r.monto;});
+  mkChart('chCotiz',{type:'bar',data:{labels:meses.map(mesCorto),datasets:[{label:'Monto cotizado',data:meses.map(function(m){return mapC[m]||0;}),backgroundColor:'#8B6D3F',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){return money(ctx.parsed.y);}}}},scales:{y:{ticks:{callback:function(v){return abreviaMonto(v);}}}}}});
+  var pe=cd.proyectos_por_etapa||[];
+  mkChart('chProy',{type:'doughnut',data:{labels:pe.map(function(r){return r.nombre;}),datasets:[{data:pe.map(function(r){return r.n;}),backgroundColor:pal,borderColor:'#1a1a1a',borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{boxWidth:12,font:{size:11}}}}}});
+  var ce=cd.clientes_por_etapa||[];
+  mkChart('chCli',{type:'bar',data:{labels:ce.map(function(r){var s=r.etapa||'';return s.charAt(0).toUpperCase()+s.slice(1);}),datasets:[{label:'Clientes',data:ce.map(function(r){return r.n;}),backgroundColor:'#A07D4A',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{precision:0}}}}});
+  var ic=cd.inventario_por_categoria||[];
+  mkChart('chInv',{type:'bar',data:{labels:ic.map(function(r){return r.categoria;}),datasets:[{label:'Valor',data:ic.map(function(r){return r.valor;}),backgroundColor:'#C49A6C',borderRadius:4}]},options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){return money(ctx.parsed.x);}}}},scales:{x:{ticks:{callback:function(v){return abreviaMonto(v);}}}}}});
+  var dias=ultimosDias(7),mapA={};(cd.asistencia_7d||[]).forEach(function(r){mapA[r.dia]=r.n;});
+  mkChart('chAsis',{type:'line',data:{labels:dias.map(diaCorto),datasets:[{label:'Entradas',data:dias.map(function(x){return mapA[x]||0;}),borderColor:'#8B6D3F',backgroundColor:'rgba(139,109,63,.18)',fill:true,tension:.3,pointBackgroundColor:'#A07D4A'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{precision:0}}}}});
+}
 async function viewDashboard(c){
   var d=await api('/api/dashboard/stats');if(!d||!d.ok)return;
+  var cdR=await api('/api/dashboard/charts');var cd=(cdR&&cdR.ok)?cdR.data:{};
   var k=d.data.kpis;
   var kpis=[['Clientes activos',k.clientes],['Cotizaciones (mes)',k.cotizMes],['Proyectos en curso',k.proyectos],['Empleados hoy',k.empleadosHoy],['Pipeline',money(k.pipeline)],['Stock crítico',k.stockCritico]];
   var h='<div class="kpis">';
   kpis.forEach(function(x){h+='<div class="card kpi"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>';});
-  h+='</div><div class="card"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Cotizaciones recientes</h3><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th></tr></thead><tbody>';
+  h+='</div>';
+  h+='<div class="charts-grid">'+chartCard('Monto cotizado por mes','chCotiz')+chartCard('Proyectos por etapa','chProy')+chartCard('Pipeline de clientes','chCli')+chartCard('Valor de inventario por categoría','chInv')+chartCard('Asistencia · entradas (7 días)','chAsis')+'</div>';
+  h+='<div class="card" style="overflow-x:auto"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Cotizaciones recientes</h3><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th></tr></thead><tbody>';
   (d.data.recientes||[]).forEach(function(r){h+='<tr><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoPill(r.estado)+'</td></tr>';});
   if(!d.data.recientes.length)h+='<tr><td colspan="4" class="muted">Sin cotizaciones aún.</td></tr>';
   h+='</tbody></table></div>';
+  destruirCharts();
   c.innerHTML=h;
+  setTimeout(function(){initDashCharts(cd);},40);
 }
 function estadoPill(e){
   var map={aceptada:'var(--ok)',enviada:'var(--gold)',borrador:'#666',rechazada:'var(--err)',expirada:'#888'};
@@ -1472,7 +1891,7 @@ async function nuevoProducto(){
     '<label>Nombre</label><input id="npNom">'+
     '<label>Categoría</label><select id="npCat">'+catOpts+'</select>'+
     '<label>Acabado</label><select id="npAcab">'+ac+'</select>'+
-    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem"><div><label>Stock inicial</label><input id="npStock" type="number" value="0"></div><div><label>Stock mínimo</label><input id="npMin" type="number" value="0"></div><div><label>Unidad</label><input id="npUni" value="m2"></div><div><label>Ubicación</label><input id="npUbi"></div><div><label>Precio costo</label><input id="npCosto" type="number" value="0"></div><div><label>Precio venta</label><input id="npVenta" type="number" value="0"></div></div>'+
+    '<div class="g2"><div><label>Stock inicial</label><input id="npStock" type="number" value="0"></div><div><label>Stock mínimo</label><input id="npMin" type="number" value="0"></div><div><label>Unidad</label><input id="npUni" value="m2"></div><div><label>Ubicación</label><input id="npUbi"></div><div><label>Precio costo</label><input id="npCosto" type="number" value="0"></div><div><label>Precio venta</label><input id="npVenta" type="number" value="0"></div></div>'+
     '<label>Dimensiones</label><input id="npDim" placeholder="300x180x2 cm">'+
     '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarProducto()">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
 }
@@ -1545,7 +1964,7 @@ async function viewAlertas(){
     var color=p.stock_actual<=0?'var(--err)':'var(--warn)';
     h+='<tr><td class="muted">'+(p.sku||'—')+'</td><td>'+p.nombre+'</td><td style="color:'+color+';font-weight:600">'+p.stock_actual+' '+p.unidad+'</td><td class="muted">'+p.stock_minimo+'</td><td><button class="btn sec" style="padding:.25rem .55rem" onclick="movUI('+p.id+')">Registrar entrada</button></td></tr>';
   });
-  if(!bajos.length)h+='<tr><td colspan="5" class="muted">Todo el inventario está por encima del mínimo. ✓</td></tr>';
+  if(!bajos.length)h+='<tr><td colspan="5" class="muted">Todo el inventario está por encima del mínimo.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 async function viewProveedores(){
@@ -1607,7 +2026,7 @@ async function abrirProyecto(id){
   // Acceso al portal
   h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">Acceso al portal</h3>';
   h+='<div style="display:flex;gap:.6rem;flex-wrap:wrap;align-items:center">';
-  h+='<button class="btn '+(p.portal_activo?'':'sec')+'" onclick="togglePortal('+id+','+(p.portal_activo?0:1)+')">'+(p.portal_activo?'● Portal ACTIVO — desactivar':'○ Portal inactivo — activar')+'</button>';
+  h+='<button class="btn '+(p.portal_activo?'':'sec')+'" onclick="togglePortal('+id+','+(p.portal_activo?0:1)+')">'+(p.portal_activo?'<svg viewBox="0 0 24 24" width="12" height="12" style="margin-right:.4rem" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>Portal ACTIVO — desactivar':'<svg viewBox="0 0 24 24" width="12" height="12" style="margin-right:.4rem" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="6"/></svg>Portal inactivo — activar')+'</button>';
   h+='<button class="btn sec" onclick="invitarPortal('+id+')">Invitar cliente por correo/WhatsApp</button></div>';
   h+='<div id="inviteRes" style="margin-top:.7rem"></div>';
   if(acc&&acc.ultimo_acceso)h+='<p class="muted" style="font-size:.78rem;margin-top:.5rem">Último acceso del cliente: '+acc.ultimo_acceso+'</p>';
@@ -1615,7 +2034,7 @@ async function abrirProyecto(id){
 
   // Etapa visible
   var opts='';
-  d.data.etapas.forEach(function(e){opts+='<option value="'+e.clave+'"'+(p.etapa_portal===e.clave?' selected':'')+'>'+e.icono+' '+e.nombre+'</option>';});
+  d.data.etapas.forEach(function(e){opts+='<option value="'+e.clave+'"'+(p.etapa_portal===e.clave?' selected':'')+'>'+e.nombre+'</option>';});
   h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">Etapa visible para el cliente</h3>';
   h+='<label>Etapa</label><select id="etapaSel">'+opts+'</select>';
   h+='<label>Nota para el cliente (opcional)</label><textarea id="etapaNota" rows="2" placeholder="Ej: Comenzamos el corte de tus cubiertas."></textarea>';
@@ -1624,7 +2043,7 @@ async function abrirProyecto(id){
 
   // Avance del corte
   h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">Progreso del corte</h3>';
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem">';
+  h+='<div class="g2">';
   h+='<div><label>Avance %</label><input id="avPct" type="number" value="'+(p.avance_pct||0)+'"></div>';
   h+='<div><label>Fecha entrega estimada</label><input id="avFecha" type="date" value="'+(p.fecha_entrega_estimada||'')+'"></div>';
   h+='<div><label>m² procesados</label><input id="avProc" type="number" step="0.1" value="'+(p.m2_procesados||0)+'"></div>';
@@ -1665,7 +2084,7 @@ async function invitarPortal(id){
   var msg=d.data.mensaje_whatsapp||'';
   var h='<div style="background:#111;border:1px solid var(--bd);border-radius:6px;padding:.7rem;font-size:.85rem">';
   if(d.data.ya_existia){h+='<p style="color:var(--ok)">El cliente ya tiene acceso. Acceso por: <strong>'+d.data.url+'</strong> · Usuario: '+d.data.email+'</p>';}
-  else{h+='<p style="color:var(--ok)">✓ Acceso creado.</p><p>Acceso: <strong>'+d.data.url+'</strong></p><p>Usuario: '+d.data.email+'</p><p>Contraseña temporal: <strong style="color:var(--gold)">'+d.data.password_temporal+'</strong></p>';}
+  else{h+='<p style="color:var(--ok)">Acceso creado.</p><p>Acceso: <strong>'+d.data.url+'</strong></p><p>Usuario: '+d.data.email+'</p><p>Contraseña temporal: <strong style="color:var(--gold)">'+d.data.password_temporal+'</strong></p>';}
   h+='<div style="display:flex;gap:.5rem;margin-top:.5rem"><button class="btn sec" onclick="navigator.clipboard.writeText('+JSON.stringify(msg)+');toast(\\'Mensaje copiado\\')">Copiar mensaje para el cliente</button></div></div>';
   box.innerHTML=h;
 }
@@ -1677,7 +2096,7 @@ async function viewCotizaciones(c){
   var d=await api('/api/cotizaciones');if(!d||!d.ok)return;
   var h='<div class="card"><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Acciones</th></tr></thead><tbody>';
   d.data.forEach(function(r){
-    var conv=(r.estado==='aceptada')?' <button class="btn" style="padding:.3rem .6rem" onclick="convertirCot('+r.id+')">→ Proyecto</button>':'';
+    var conv=(r.estado==='aceptada')?' <button class="btn" style="padding:.3rem .6rem" onclick="convertirCot('+r.id+')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Proyecto</button>':'';
     h+='<tr><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td>'+
        '<td style="white-space:nowrap"><button class="btn sec" style="padding:.3rem .6rem" onclick="pdfCotizacion('+r.id+')">PDF</button>'+conv+'</td></tr>';
   });
@@ -1706,7 +2125,7 @@ async function nuevaCotizacion(){
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
   h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
   h+='<button class="btn sec" style="margin-top:.6rem" onclick="agregarFila()">+ Agregar línea</button>';
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="0" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="16" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="15"></div></div>';
+  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="0" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="16" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="15"></div></div>';
   h+='<div style="text-align:right;margin-top:1rem"><div>Subtotal: <strong id="cotSub">$0.00</strong></div><div>IVA: <strong id="cotIvaM">$0.00</strong></div><div style="font-size:1.3rem;color:var(--gold);margin-top:.3rem">TOTAL: <strong id="cotTotal">$0.00</strong></div></div>';
   h+='<label style="margin-top:1rem">Notas</label><textarea id="cotNotas" rows="2" placeholder="Ej: Suministro y corte de cubiertas."></textarea>';
   h+='<label>Condiciones</label><textarea id="cotCond" rows="2">Precios en MXN. Sujeto a disponibilidad de material. Tiempo de entrega a confirmar.</textarea>';
@@ -1815,28 +2234,73 @@ go('dashboard');
 // ============================================================================
 function renderCheckin() {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ASLAN · Check-in</title>${FONTS}<style>${baseStyles(false)}
-.wrap{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:1.5rem;text-align:center}
-.big{width:200px;height:200px;border-radius:50%;font-size:1.4rem;font-weight:700;border:none;color:#fff;cursor:pointer;box-shadow:0 8px 40px rgba(0,0,0,.5)}
+<title>ASLAN · Check-in</title>${FONTS}<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script><style>${baseStyles(false)}
+.wrap{max-width:460px;margin:0 auto;padding:1.4rem 1.1rem;text-align:center}
+.clock{font-size:2.6rem;font-family:'Cormorant Garamond',serif;color:var(--gold);margin:.3rem 0 .2rem}
+.big{width:172px;height:172px;border-radius:50%;font-size:1.02rem;font-weight:700;border:none;color:#fff;cursor:pointer;box-shadow:0 8px 40px rgba(0,0,0,.5);letter-spacing:.04em;padding:0 1rem;transition:.15s}
+.big:disabled{opacity:.6;cursor:default}
 .in{background:var(--ok)} .out{background:var(--err)}
-.clock{font-size:3rem;font-family:'Cormorant Garamond',serif;color:var(--gold);margin:1rem 0}
+#map{height:230px;border-radius:10px;overflow:hidden;margin:1.1rem 0;border:1px solid var(--bd);background:#111}
+.zona{font-size:.86rem;padding:.45rem .8rem;border-radius:6px;display:inline-block;margin-top:.5rem}
 </style></head><body>
 <div class="wrap">
-<h1 style="color:var(--gold);letter-spacing:.3em">ASLAN</h1>
+<h1 style="color:var(--gold);letter-spacing:.3em;font-size:1.8rem">ASLAN</h1>
+<p class="muted" id="quien" style="font-size:.85rem;min-height:1rem"></p>
 <div class="clock" id="clock">--:--</div>
-<button class="big in" id="btn" onclick="accion()">CHECK-IN</button>
-<p class="muted" id="estado" style="margin-top:1.4rem">Pulsa para registrar tu entrada</p>
+<button class="big in" id="btn" onclick="accion()">REGISTRAR ENTRADA</button>
+<div id="map"></div>
+<p class="muted" id="estado">Pulsa para registrar tu ubicación</p>
+<p style="margin-top:1rem"><a onclick="logout()" class="muted" style="cursor:pointer;font-size:.8rem">Cerrar sesión</a></p>
 </div>
 <script>
 var TOKEN=localStorage.getItem('aslan_token');
-if(!TOKEN)location.href='/login';
-setInterval(function(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});},1000);
-function accion(){
-  document.getElementById('estado').textContent='Obteniendo ubicación…';
-  navigator.geolocation.getCurrentPosition(function(pos){
-    document.getElementById('estado').textContent='Ubicación registrada · '+pos.coords.latitude.toFixed(4)+', '+pos.coords.longitude.toFixed(4)+' (demo — envío al API en la siguiente capa)';
-  },function(){document.getElementById('estado').textContent='No se pudo obtener tu ubicación. Activa el GPS.';});
+var USER=JSON.parse(localStorage.getItem('aslan_user')||'null');
+if(!TOKEN){location.href='/login';}
+else if(USER&&USER.rol==='cliente'){location.href='/portal/dashboard';}
+function H(){return {'Content-Type':'application/json','Authorization':'Bearer '+TOKEN};}
+async function api(p,opt){opt=opt||{};opt.headers=H();var r=await fetch(p,opt);if(r.status===401){localStorage.clear();location.href='/login';return null;}return await r.json();}
+function logout(){localStorage.clear();location.href='/login';}
+var SIG='entrada',GEO=null,MAP=null,MARK=null;
+function reloj(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});}
+reloj();setInterval(reloj,1000);
+if(USER)document.getElementById('quien').textContent=USER.nombre;
+function setBtn(){var b=document.getElementById('btn');if(SIG==='salida'){b.textContent='REGISTRAR SALIDA';b.className='big out';}else{b.textContent='REGISTRAR ENTRADA';b.className='big in';}}
+function initMap(lat,lon){
+  if(typeof L==='undefined')return;
+  if(!MAP){
+    MAP=L.map('map').setView([lat,lon],16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(MAP);
+    if(GEO&&isFinite(GEO.lat))L.circle([GEO.lat,GEO.lon],{radius:GEO.radio,color:'#8B6D3F',weight:1.5,fillColor:'#8B6D3F',fillOpacity:.12}).addTo(MAP);
+  }else{MAP.setView([lat,lon],16);}
+  if(MARK)MARK.setLatLng([lat,lon]);else MARK=L.circleMarker([lat,lon],{radius:8,color:'#8B6D3F',weight:2,fillColor:'#A07D4A',fillOpacity:.9}).addTo(MAP);
+  setTimeout(function(){try{MAP.invalidateSize();}catch(e){}},60);
 }
+async function cargarEstado(){
+  var d=await api('/api/checkin/estado');if(!d||!d.ok)return;
+  SIG=(d.data.ultimo_tipo==='entrada')?'salida':'entrada';
+  GEO=d.data.geocerca;setBtn();
+  if(GEO&&isFinite(GEO.lat))initMap(GEO.lat,GEO.lon);
+}
+function accion(){
+  var b=document.getElementById('btn');b.disabled=true;
+  var est=document.getElementById('estado');est.textContent='Obteniendo tu ubicación…';
+  if(!navigator.geolocation){est.textContent='Tu dispositivo no permite ubicación.';b.disabled=false;return;}
+  navigator.geolocation.getCurrentPosition(async function(pos){
+    var lat=pos.coords.latitude,lon=pos.coords.longitude,prec=pos.coords.accuracy;
+    initMap(lat,lon);
+    var d=await api('/api/checkin',{method:'POST',body:JSON.stringify({tipo:SIG,lat:lat,lon:lon,precision:prec})});
+    b.disabled=false;
+    if(!d)return;
+    if(!d.ok){est.textContent=d.error||'No se pudo registrar.';return;}
+    var hora=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});
+    var msg=(d.data.tipo==='entrada'?'Entrada':'Salida')+' registrada a las '+hora+'.';
+    if(d.data.dentro===true)est.innerHTML=msg+'<br><span class="zona" style="background:rgba(76,175,80,.15);color:var(--ok)">Dentro de la zona ('+d.data.distancia+' m del centro)</span>';
+    else if(d.data.dentro===false)est.innerHTML=msg+'<br><span class="zona" style="background:rgba(229,57,53,.15);color:var(--err)">Fuera de la zona ('+d.data.distancia+' m del centro) — se notificó a tu supervisor</span>';
+    else est.textContent=msg;
+    SIG=(SIG==='entrada')?'salida':'entrada';setBtn();
+  },function(){est.textContent='No se pudo obtener tu ubicación. Activa el GPS y permite el acceso.';b.disabled=false;},{enableHighAccuracy:true,timeout:10000,maximumAge:0});
+}
+cargarEstado();
 </script></body></html>`;
 }
 
@@ -1877,6 +2341,7 @@ function renderPortalApp() {
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:99;padding:1rem}
 .modal.open{display:flex}
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:380px;width:100%}
+@media(max-width:768px){.nav{padding:.8rem 1rem}.nav h1{font-size:1.4rem;letter-spacing:.2em}.nav .right{gap:.6rem;font-size:.8rem}.container{padding:1rem}.serif-title{font-size:1.6rem}.modal{padding:0;align-items:flex-end}.modal .inner{max-width:none;width:100%;border-radius:14px 14px 0 0;max-height:92vh}.msg{max-width:86%}}
 </style></head><body>
 <div class="nav"><h1>ASLAN</h1><div class="right"><span id="nombreCli" class="muted"></span><div class="avatar" id="avatar">·</div><a onclick="logout()" style="cursor:pointer">salir</a></div></div>
 <div class="container" id="app">Cargando…</div>
@@ -1898,6 +2363,7 @@ else if(USER.rol!=='cliente'){location.href='/dashboard';} // el equipo va al si
 function H(){return {'Content-Type':'application/json','Authorization':'Bearer '+TOKEN};}
 async function api(p,opt){opt=opt||{};opt.headers=H();var r=await fetch(p,opt);if(r.status===401){localStorage.clear();location.href='/login';return null;}return await r.json();}
 function logout(){localStorage.clear();location.href='/login';}
+function ic(p,s){s=s||18;return "<svg viewBox='0 0 24 24' width='"+s+"' height='"+s+"' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'>"+p+"</svg>";}
 function fecha(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleDateString('es-MX',{day:'2-digit',month:'short',year:'numeric'});}catch(e){return s;}}
 function dias(s){if(!s)return 0;var d=Math.floor((Date.now()-new Date(s.replace(' ','T')).getTime())/86400000);return d>0?d:0;}
 var ETAPAS=[];
@@ -1920,7 +2386,7 @@ async function dashboard(){
   d.data.activos.forEach(function(p){
     var et=ETAPAS.find(function(e){return e.clave===p.etapa_portal;})||{nombre:'—',icono:''};
     h+='<div class="proj-card" onclick="location.href=\\'/portal/proyecto/'+p.id+'\\'">'+
-       '<div style="display:flex;justify-content:space-between;align-items:start"><div><strong>'+(p.folio||'')+'</strong><br><span class="muted" style="font-size:.85rem">'+(p.descripcion||'')+'</span></div><span class="etapa-pill">'+et.icono+' '+et.nombre+'</span></div>'+
+       '<div style="display:flex;justify-content:space-between;align-items:start"><div><strong>'+(p.folio||'')+'</strong><br><span class="muted" style="font-size:.85rem">'+(p.descripcion||'')+'</span></div><span class="etapa-pill">'+ic(et.icono,15)+' '+et.nombre+'</span></div>'+
        '<div class="bar"><i style="width:'+(p.avance_pct||0)+'%"></i></div>'+
        '<div style="display:flex;justify-content:space-between;font-size:.78rem" class="muted"><span>'+(p.material_principal||'')+'</span><span>'+(p.avance_pct||0)+'% · entrega '+fecha(p.fecha_entrega_estimada)+'</span></div>'+
        '</div>';
@@ -1947,7 +2413,7 @@ async function detalle(id){
   h+='<div class="card"><div class="tracker">';
   ETAPAS.forEach(function(e,i){
     var cls=i<idxActual?'done':(i===idxActual?'current':'');
-    h+='<div class="step '+cls+'"><div class="dot">'+e.icono+'</div><div class="nm">'+e.nombre+'</div></div>';
+    h+='<div class="step '+cls+'"><div class="dot">'+ic(e.icono,22)+'</div><div class="nm">'+e.nombre+'</div></div>';
   });
   h+='</div></div>';
   // Progreso de corte
@@ -1965,10 +2431,10 @@ async function detalle(id){
       h+='<div style="border-bottom:1px solid var(--bd);padding:.6rem 0"><p>'+(l.descripcion_losa||'')+'</p>';
       if(l.estado==='pendiente'){
         h+='<p class="muted" style="font-size:.85rem;margin:.4rem 0">Revisa y aprueba para que comencemos el corte.</p>'+
-           '<div style="display:flex;gap:.5rem;flex-wrap:wrap"><button class="btn ok" onclick="aprobar('+id+','+l.id+',true)">✓ Aprobar este material</button>'+
+           '<div style="display:flex;gap:.5rem;flex-wrap:wrap"><button class="btn ok" onclick="aprobar('+id+','+l.id+',true)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.35rem"><path d="M5 12l4 4 10-10"/></svg>Aprobar este material</button>'+
            '<button class="btn sec" onclick="aprobar('+id+','+l.id+',false)">Solicitar revisión</button></div>';
       }else if(l.estado==='aprobado'){
-        h+='<p style="color:var(--ok);font-size:.88rem;margin-top:.3rem">✓ Material aprobado'+(l.respondido_en?' el '+fecha(l.respondido_en):'')+'</p>';
+        h+='<p style="color:var(--ok);font-size:.88rem;margin-top:.3rem"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12l4 4 10-10"/></svg>Material aprobado'+(l.respondido_en?' el '+fecha(l.respondido_en):'')+'</p>';
       }else{
         h+='<p style="color:var(--warn);font-size:.88rem;margin-top:.3rem">Revisión solicitada — el equipo ASLAN se pondrá en contacto.</p>';
       }
@@ -1978,9 +2444,9 @@ async function detalle(id){
   }
   // Documentos
   h+='<div class="card" style="margin-top:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Documentos</h3>'+
-     '<div style="display:flex;justify-content:space-between;padding:.4rem 0;border-bottom:1px solid var(--bd)"><span>📄 Cotización</span><span class="muted">Disponible</span></div>'+
-     '<div style="display:flex;justify-content:space-between;padding:.4rem 0;border-bottom:1px solid var(--bd)"><span>📋 Orden de trabajo</span><span class="muted">Disponible</span></div>'+
-     '<div style="display:flex;justify-content:space-between;padding:.4rem 0"><span>🧾 Remisión</span><span class="muted">Próximamente</span></div>'+
+     '<div style="display:flex;justify-content:space-between;padding:.4rem 0;border-bottom:1px solid var(--bd)"><span><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" style="margin-right:.4rem;color:var(--gold2)"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>Cotización</span><span class="muted">Disponible</span></div>'+
+     '<div style="display:flex;justify-content:space-between;padding:.4rem 0;border-bottom:1px solid var(--bd)"><span><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" style="margin-right:.4rem;color:var(--gold2)"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>Orden de trabajo</span><span class="muted">Disponible</span></div>'+
+     '<div style="display:flex;justify-content:space-between;padding:.4rem 0"><span><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" style="margin-right:.4rem;color:var(--gold2)"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>Remisión</span><span class="muted">Próximamente</span></div>'+
      '<p class="muted" style="font-size:.78rem;margin-top:.5rem">La descarga en PDF se habilita en la siguiente capa.</p></div>';
   // Chat
   h+='<div class="card" style="margin-top:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Chat con el equipo ASLAN</h3><div class="chat" id="chat">';
