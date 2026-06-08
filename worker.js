@@ -1008,9 +1008,14 @@ async function portalProyectoDetalle(env, payload, id) {
   const fotos = await env.DB.prepare("SELECT tipo, url_r2, descripcion FROM portal_fotos_proyecto WHERE proyecto_id=? ORDER BY orden").bind(id).all();
   const losas = await env.DB.prepare("SELECT * FROM portal_aprobaciones_losa WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(id).all();
   const mensajes = await env.DB.prepare("SELECT direction, mensaje, created_at FROM portal_mensajes WHERE proyecto_id=? ORDER BY created_at ASC, id ASC").bind(id).all();
+  const secretFc = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+  const fcli = await env.DB.prepare("SELECT id,etapa,descripcion,created_at FROM proyecto_fotos WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(id).all();
+  const fotos_proyecto = [];
+  for (const f of (fcli.results || [])) fotos_proyecto.push({ id: f.id, etapa: f.etapa, descripcion: f.descripcion, created_at: f.created_at, url: await fotoUrl(f.id, secretFc) });
   return ok({
     proyecto: p, etapas: ETAPAS, historial: historial.results || [],
     fotos: fotos.results || [], losas: losas.results || [], mensajes: mensajes.results || [],
+    fotos_proyecto,
     asesor: await portalAsesor(env, clienteId),
   });
 }
@@ -1072,9 +1077,13 @@ async function handleAdminPortal(request, env, payload, id, accion, method) {
     const losas = await env.DB.prepare("SELECT * FROM portal_aprobaciones_losa WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(id).all();
     const mensajes = await env.DB.prepare("SELECT direction,mensaje,created_at FROM portal_mensajes WHERE proyecto_id=? ORDER BY created_at ASC, id ASC").bind(id).all();
     const historial = await env.DB.prepare("SELECT etapa_clave,etapa_nombre,nota,created_at FROM proyecto_etapas_historial WHERE proyecto_id=? ORDER BY created_at DESC, id DESC LIMIT 20").bind(id).all();
+    const secretF = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+    const fr = await env.DB.prepare("SELECT id,etapa,descripcion,created_at FROM proyecto_fotos WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(id).all();
+    const fotos = [];
+    for (const f of (fr.results || [])) fotos.push({ id: f.id, etapa: f.etapa, descripcion: f.descripcion, created_at: f.created_at, url: await fotoUrl(f.id, secretF) });
     return ok({
       proyecto: proy, etapas: ETAPAS, cliente, acceso,
-      losas: losas.results || [], mensajes: mensajes.results || [], historial: historial.results || [],
+      losas: losas.results || [], mensajes: mensajes.results || [], historial: historial.results || [], fotos,
     });
   }
 
@@ -1361,6 +1370,176 @@ async function revisarAlerta(request, env, payload, id) {
   return ok({ id });
 }
 
+// ============================================================================
+//  FOTOS DE PROYECTO POR ETAPA  (R2: binding FILES)
+// ============================================================================
+async function fotoUrl(fotoId, secret) {
+  const tk = await createJWT({ t: "foto", fid: fotoId }, secret, 12);
+  return "/media/foto/" + fotoId + "?k=" + tk;
+}
+async function listarFotosProyecto(env, payload, proyectoId) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  const r = await env.DB.prepare("SELECT id,etapa,descripcion,created_at FROM proyecto_fotos WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(proyectoId).all();
+  const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+  const out = [];
+  for (const f of (r.results || [])) out.push({ id: f.id, etapa: f.etapa, descripcion: f.descripcion, created_at: f.created_at, url: await fotoUrl(f.id, secret) });
+  return ok(out);
+}
+async function subirFotoProyecto(request, env, payload, proyectoId) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  if (!env.FILES) return fail("Almacenamiento de fotos no configurado (falta el binding R2 'FILES').", 500);
+  const proy = await env.DB.prepare("SELECT id FROM proyectos WHERE id=? AND deleted_at IS NULL").bind(proyectoId).first();
+  if (!proy) return fail("Proyecto no encontrado.", 404);
+  const b = await request.json().catch(() => ({}));
+  if (!b.data) return fail("Falta la imagen.");
+  let b64 = String(b.data), ct = b.contentType || "image/jpeg";
+  const m = /^data:([^;]+);base64,(.*)$/s.exec(b64);
+  if (m) { ct = m[1]; b64 = m[2]; }
+  let bytes;
+  try { bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)); } catch (e) { return fail("Imagen inválida."); }
+  if (bytes.length > 8 * 1024 * 1024) return fail("La imagen supera 8 MB.");
+  const ext = ct.includes("png") ? "png" : (ct.includes("webp") ? "webp" : "jpg");
+  const key = "proyectos/" + proyectoId + "/" + (b.etapa || "general") + "/" + crypto.randomUUID() + "." + ext;
+  await env.FILES.put(key, bytes, { httpMetadata: { contentType: ct } });
+  const res = await env.DB.prepare("INSERT INTO proyecto_fotos (proyecto_id,url_r2,etapa,descripcion) VALUES (?,?,?,?)").bind(proyectoId, key, b.etapa || null, b.descripcion || null).run();
+  await audit(env, payload.sub, "subir_foto", "proyecto_fotos", res.meta.last_row_id, { etapa: b.etapa || null }, request);
+  return ok({ id: res.meta.last_row_id });
+}
+async function borrarFotoProyecto(request, env, payload, proyectoId, fotoId) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  const f = await env.DB.prepare("SELECT url_r2 FROM proyecto_fotos WHERE id=? AND proyecto_id=?").bind(fotoId, proyectoId).first();
+  if (!f) return fail("Foto no encontrada.", 404);
+  if (env.FILES && f.url_r2) { try { await env.FILES.delete(f.url_r2); } catch (e) { /* noop */ } }
+  await env.DB.prepare("DELETE FROM proyecto_fotos WHERE id=?").bind(fotoId).run();
+  await audit(env, payload.sub, "borrar_foto", "proyecto_fotos", fotoId, null, request);
+  return ok({ id: fotoId });
+}
+async function serveFoto(request, env, path, url) {
+  const m = /^\/media\/foto\/(\d+)$/.exec(path);
+  if (!m) return new Response("No encontrado", { status: 404 });
+  const id = m[1];
+  const k = url.searchParams.get("k");
+  const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+  const pl = k ? await verifyJWT(k, secret) : null;
+  if (!pl || pl.t !== "foto" || String(pl.fid) !== String(id)) return new Response("No autorizado", { status: 401 });
+  const f = await env.DB.prepare("SELECT url_r2 FROM proyecto_fotos WHERE id=?").bind(id).first();
+  if (!f || !f.url_r2) return new Response("No encontrado", { status: 404 });
+  if (!env.FILES) return new Response("Almacenamiento no configurado", { status: 500 });
+  const obj = await env.FILES.get(f.url_r2);
+  if (!obj) return new Response("No encontrado", { status: 404 });
+  const headers = new Headers();
+  headers.set("content-type", (obj.httpMetadata && obj.httpMetadata.contentType) || "image/jpeg");
+  headers.set("cache-control", "private, max-age=3600");
+  return new Response(obj.body, { headers });
+}
+
+// ============================================================================
+//  WHATSAPP  (Meta WhatsApp Cloud API · webhook + bandeja + envío)
+//  Variables del Worker: WA_TOKEN, WA_PHONE_ID, WA_VERIFY_TOKEN
+// ============================================================================
+async function waUpsertConversacion(env, numero, nombre) {
+  const c = await env.DB.prepare("SELECT id FROM wa_conversaciones WHERE numero_wa=?").bind(numero).first();
+  if (c) return c.id;
+  let clienteId = null;
+  try {
+    const cl = await env.DB.prepare("SELECT id FROM clientes WHERE telefono=? AND deleted_at IS NULL LIMIT 1").bind(numero).first();
+    if (cl) clienteId = cl.id;
+  } catch (e) { /* noop */ }
+  const res = await env.DB.prepare("INSERT INTO wa_conversaciones (numero_wa,cliente_id,ultimo_mensaje_en,no_leidos) VALUES (?,?,CURRENT_TIMESTAMP,0)").bind(numero, clienteId).run();
+  return res.meta.last_row_id;
+}
+async function whatsappWebhook(request, env, url) {
+  if (request.method === "GET") {
+    const mode = url.searchParams.get("hub.mode");
+    const token = url.searchParams.get("hub.verify_token");
+    const challenge = url.searchParams.get("hub.challenge");
+    const verify = env.WA_VERIFY_TOKEN || "aslan-verify";
+    if (mode === "subscribe" && token === verify) return new Response(challenge || "", { status: 200, headers: { "content-type": "text/plain" } });
+    return new Response("Forbidden", { status: 403 });
+  }
+  if (request.method === "POST") {
+    let body = {};
+    try { body = await request.json(); } catch (e) { return new Response("EVENT_RECEIVED", { status: 200 }); }
+    try {
+      for (const en of (body.entry || [])) {
+        for (const ch of (en.changes || [])) {
+          const value = ch.value || {};
+          const contactos = value.contacts || [];
+          const nombre = (contactos[0] && contactos[0].profile && contactos[0].profile.name) || null;
+          for (const msg of (value.messages || [])) {
+            const numero = msg.from;
+            if (!numero) continue;
+            const convId = await waUpsertConversacion(env, numero, nombre);
+            const tipo = msg.type || "text";
+            const contenido = (tipo === "text") ? ((msg.text && msg.text.body) || "") : ("[" + tipo + "]");
+            await env.DB.prepare("INSERT INTO wa_mensajes (conversacion_id,direction,tipo,contenido,wa_message_id,leido) VALUES (?,?,?,?,?,0)").bind(convId, "in", tipo, contenido, msg.id || null).run();
+            await env.DB.prepare("UPDATE wa_conversaciones SET ultimo_mensaje_en=CURRENT_TIMESTAMP, no_leidos=no_leidos+1, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(convId).run();
+          }
+        }
+      }
+    } catch (e) { /* Meta siempre espera 200 */ }
+    return new Response("EVENT_RECEIVED", { status: 200 });
+  }
+  return new Response("Método no soportado", { status: 405 });
+}
+async function waEnviarMeta(env, telefono, texto) {
+  const token = env.WA_TOKEN, phoneId = env.WA_PHONE_ID;
+  if (!token || !phoneId) return { ok: false, motivo: "no_config" };
+  try {
+    const r = await fetch("https://graph.facebook.com/v21.0/" + phoneId + "/messages", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_product: "whatsapp", to: telefono, type: "text", text: { body: texto } }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.messages && d.messages[0]) return { ok: true, wamid: d.messages[0].id };
+    return { ok: false, motivo: "meta_error" };
+  } catch (e) { return { ok: false, motivo: "fetch_error" }; }
+}
+async function waEstado(env, payload) {
+  return ok({ configurado: !!(env.WA_TOKEN && env.WA_PHONE_ID), verify_token: !!env.WA_VERIFY_TOKEN });
+}
+async function waListarConversaciones(env, payload) {
+  const r = await env.DB.prepare(
+    "SELECT w.id,w.numero_wa,w.no_leidos,w.ultimo_mensaje_en,cl.nombre AS cliente," +
+    " (SELECT m.contenido FROM wa_mensajes m WHERE m.conversacion_id=w.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS ultimo," +
+    " (SELECT m.direction FROM wa_mensajes m WHERE m.conversacion_id=w.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS ultimo_dir" +
+    " FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id" +
+    " ORDER BY w.ultimo_mensaje_en DESC, w.id DESC LIMIT 100"
+  ).all();
+  return ok(r.results || []);
+}
+async function waVerConversacion(env, payload, id) {
+  const conv = await env.DB.prepare("SELECT w.id,w.numero_wa,w.cliente_id,cl.nombre AS cliente FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id WHERE w.id=?").bind(id).first();
+  if (!conv) return fail("Conversación no encontrada.", 404);
+  const msgs = await env.DB.prepare("SELECT id,direction,tipo,contenido,wa_message_id,created_at FROM wa_mensajes WHERE conversacion_id=? ORDER BY created_at ASC, id ASC LIMIT 300").bind(id).all();
+  await env.DB.prepare("UPDATE wa_conversaciones SET no_leidos=0 WHERE id=?").bind(id).run();
+  return ok({ conversacion: conv, mensajes: msgs.results || [] });
+}
+async function waNuevaConversacion(request, env, payload) {
+  const b = await request.json().catch(() => ({}));
+  const numero = (b.numero || "").replace(/[^0-9]/g, "");
+  if (numero.length < 10) return fail("Número inválido (incluye la lada, solo dígitos).");
+  const id = await waUpsertConversacion(env, numero, b.nombre || null);
+  return ok({ id, numero_wa: numero });
+}
+async function waEnviar(request, env, payload, id) {
+  const conv = await env.DB.prepare("SELECT id,numero_wa FROM wa_conversaciones WHERE id=?").bind(id).first();
+  if (!conv) return fail("Conversación no encontrada.", 404);
+  const b = await request.json().catch(() => ({}));
+  const texto = (b.mensaje || "").trim();
+  if (!texto) return fail("Mensaje vacío.");
+  const res = await env.DB.prepare("INSERT INTO wa_mensajes (conversacion_id,direction,tipo,contenido,usuario_enviador_id,leido) VALUES (?,?,?,?,?,1)").bind(id, "out", "text", texto, payload.sub).run();
+  const msgId = res.meta.last_row_id;
+  await env.DB.prepare("UPDATE wa_conversaciones SET ultimo_mensaje_en=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
+  const r = await waEnviarMeta(env, conv.numero_wa, texto);
+  let estado = "pendiente";
+  if (r.ok) { estado = "enviado"; await env.DB.prepare("UPDATE wa_mensajes SET wa_message_id=? WHERE id=?").bind(r.wamid || null, msgId).run(); }
+  else if (r.motivo === "meta_error" || r.motivo === "fetch_error") estado = "error";
+  await audit(env, payload.sub, "wa_enviar", "whatsapp", id, { estado }, request);
+  return ok({ id: msgId, estado, enviado: !!r.ok, motivo: r.motivo || null });
+}
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -1433,6 +1612,21 @@ async function handleRequest(request, env) {
     m = path.match(/^\/api\/empleados(?:\/(\d+))?$/);
     if (m) return await handleEmpleados(request, env, payload, method, m[1]);
 
+    // ----- WhatsApp (bandeja interna) -----
+    if (path === "/api/whatsapp/estado" && method === "GET") return await waEstado(env, payload);
+    if (path === "/api/whatsapp/conversaciones" && method === "GET") return await waListarConversaciones(env, payload);
+    if (path === "/api/whatsapp/conversaciones" && method === "POST") return await waNuevaConversacion(request, env, payload);
+    m = path.match(/^\/api\/whatsapp\/conversaciones\/(\d+)$/);
+    if (m && method === "GET") return await waVerConversacion(env, payload, m[1]);
+    m = path.match(/^\/api\/whatsapp\/conversaciones\/(\d+)\/enviar$/);
+    if (m && method === "POST") return await waEnviar(request, env, payload, m[1]);
+
+    m = path.match(/^\/api\/admin\/proyectos\/(\d+)\/fotos$/);
+    if (m && method === "GET") return await listarFotosProyecto(env, payload, m[1]);
+    if (m && method === "POST") return await subirFotoProyecto(request, env, payload, m[1]);
+    m = path.match(/^\/api\/admin\/proyectos\/(\d+)\/fotos\/(\d+)$/);
+    if (m && method === "DELETE") return await borrarFotoProyecto(request, env, payload, m[1], m[2]);
+
     // ----- Gestión del PORTAL desde el sistema interno (admin/gerente) -----
     const mAdmin = path.match(/^\/api\/admin\/proyectos\/(\d+)\/portal(?:\/(\w+))?$/);
     if (mAdmin) return await handleAdminPortal(request, env, payload, mAdmin[1], mAdmin[2] || "", method);
@@ -1445,6 +1639,8 @@ async function handleRequest(request, env) {
   if (path === "/login" || path === "/portal" || path === "/portal/") return html(renderLogin());
   if (path.startsWith("/portal/")) return html(renderPortalApp());
   if (path === "/check-in" || path === "/checkin") return html(renderCheckin());
+  if (path.startsWith("/media/foto/")) return await serveFoto(request, env, path, url);
+  if (path === "/webhook/whatsapp") return await whatsappWebhook(request, env, url);
   // Cualquier otra ruta -> SPA interna (en cliente decide: login / dashboard / portal según rol)
   return html(renderApp());
 }
@@ -1564,6 +1760,17 @@ function renderApp() {
 .kpi .l{font-size:.78rem;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em}
 .grid{display:grid;gap:1rem}
 .charts-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-bottom:1.4rem}
+.wa{display:flex;gap:1rem}
+.wa-list{width:300px;flex-shrink:0;max-height:72vh;overflow:auto}
+.wa-thread{flex:1;display:flex;flex-direction:column;min-height:340px}
+.wa-msgs{flex:1;max-height:58vh;overflow:auto;padding:.3rem}
+.wa-conv{padding:.55rem .7rem;border:1px solid var(--bd);border-radius:8px;margin-bottom:.4rem;cursor:pointer}
+.wa-conv:hover{border-color:var(--gold)}
+.wa-conv.active{border-color:var(--gold);background:rgba(139,109,63,.12)}
+.wa-b{max-width:80%;padding:.5rem .8rem;border-radius:12px;margin:.3rem 0;font-size:.9rem;word-wrap:break-word}
+.wa-b.in{background:#222;border:1px solid var(--bd)}
+.wa-b.out{background:var(--gold);color:#fff;margin-left:auto}
+@media(max-width:768px){.wa{flex-direction:column}.wa-list{width:100%;max-height:40vh}}
 @media(max-width:768px){.side{position:fixed;left:-260px;transition:.2s;z-index:50;height:100%}.side.open{left:0}.main{padding:1rem}.menu-btn{display:block!important}}
 .menu-btn{display:none;background:none;border:1px solid var(--bd);color:var(--gold);padding:.4rem .7rem;border-radius:4px;font-size:1.2rem;cursor:pointer}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:99;padding:1rem}
@@ -1642,9 +1849,65 @@ async function go(id){
   if(id==='inventario')return viewInventario(c);
   if(id==='proyectos')return viewProyectos(c);
   if(id==='empleados')return viewEmpleados(c);
+  if(id==='whatsapp')return viewWhatsApp(c);
   c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem">Módulo en construcción</h3><p class="muted" style="margin-top:.5rem">Esta sección («'+t[id]+'») se está integrando sobre esta misma base. Ya está el backbone, la auth por rol y el esquema de datos completo.</p></div>';
 }
 
+var WA_ACTIVE=null;
+function recargarWa(){go('whatsapp');}
+async function viewWhatsApp(c){
+  document.getElementById('acciones').innerHTML='<button class="btn" onclick="waNueva()">+ Nueva conversación</button> <button class="btn sec" onclick="recargarWa()">Actualizar</button>';
+  var est=await api('/api/whatsapp/estado');
+  var conf=(est&&est.ok)?est.data.configurado:false;
+  var banner=conf?'':'<div class="card" style="border-color:var(--warn);margin-bottom:1rem"><p style="font-size:.85rem;line-height:1.5">WhatsApp en modo demo. Para enviar de verdad, define en tu Worker las variables <strong>WA_TOKEN</strong>, <strong>WA_PHONE_ID</strong> y <strong>WA_VERIFY_TOKEN</strong> (Cloudflare, en tu Worker, sección Settings, Variables). El webhook a registrar en Meta es <strong>/webhook/whatsapp</strong>. Mientras tanto, los mensajes entrantes se guardan y los salientes quedan como «pendientes».</p></div>';
+  c.innerHTML=banner+'<div class="wa"><div class="wa-list" id="waList">Cargando…</div><div class="wa-thread card" id="waThread"><p class="muted">Elige una conversación o crea una nueva.</p></div></div>';
+  cargarWaLista();
+}
+async function cargarWaLista(){
+  var d=await api('/api/whatsapp/conversaciones');var el=document.getElementById('waList');if(!el)return;
+  if(!d||!d.ok){el.innerHTML='<p class="muted">Error al cargar.</p>';return;}
+  if(!d.data.length){el.innerHTML='<p class="muted" style="font-size:.85rem">Sin conversaciones aún. Las que lleguen a tu número de WhatsApp aparecerán aquí.</p>';return;}
+  var h='';
+  d.data.forEach(function(w){
+    var nom=w.cliente||('+'+w.numero_wa);
+    var prev=(w.ultimo_dir==='out'?'Tú: ':'')+(w.ultimo||'');
+    if(prev.length>40)prev=prev.slice(0,40)+'…';
+    h+='<div class="wa-conv'+(WA_ACTIVE===w.id?' active':'')+'" onclick="abrirWaConv('+w.id+')"><div style="display:flex;justify-content:space-between;align-items:center;gap:.4rem"><strong style="font-size:.88rem">'+escAttr(nom)+'</strong>'+(w.no_leidos>0?('<span class="pill" style="background:var(--gold);color:#fff">'+w.no_leidos+'</span>'):'')+'</div><div class="muted" style="font-size:.77rem">'+escAttr(prev)+'</div></div>';
+  });
+  el.innerHTML=h;
+}
+async function abrirWaConv(id){
+  WA_ACTIVE=id;
+  var d=await api('/api/whatsapp/conversaciones/'+id);var el=document.getElementById('waThread');if(!el)return;
+  if(!d||!d.ok){el.innerHTML='<p class="muted">Error.</p>';return;}
+  var conv=d.data.conversacion, nom=conv.cliente||('+'+conv.numero_wa);
+  var h='<div style="border-bottom:1px solid var(--bd);padding-bottom:.5rem;margin-bottom:.5rem"><strong>'+escAttr(nom)+'</strong><br><span class="muted" style="font-size:.78rem">+'+escAttr(conv.numero_wa)+'</span></div><div class="wa-msgs" id="waMsgs">';
+  d.data.mensajes.forEach(function(m){
+    h+='<div class="wa-b '+(m.direction==='out'?'out':'in')+'">'+escAttr(m.contenido||'')+'<div style="font-size:.62rem;opacity:.7;margin-top:.2rem">'+fmtFechaHora(m.created_at)+'</div></div>';
+  });
+  if(!d.data.mensajes.length)h+='<p class="muted" style="font-size:.85rem">Sin mensajes.</p>';
+  h+='</div><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="waInput" placeholder="Escribe un mensaje…" onkeydown="if(event.keyCode===13)waEnviarMsg('+id+')"><button class="btn" onclick="waEnviarMsg('+id+')">Enviar</button></div>';
+  el.innerHTML=h;
+  var mm=document.getElementById('waMsgs');if(mm)mm.scrollTop=mm.scrollHeight;
+  cargarWaLista();
+}
+async function waEnviarMsg(id){
+  var inp=document.getElementById('waInput');var txt=inp?inp.value.trim():'';if(!txt)return;
+  inp.value='';
+  var d=await api('/api/whatsapp/conversaciones/'+id+'/enviar',{method:'POST',body:JSON.stringify({mensaje:txt})});
+  if(!d)return;
+  if(!d.ok){toast(d.error||'No se pudo enviar');return;}
+  if(d.data.estado==='pendiente')toast('Guardado (WhatsApp sin configurar)');
+  else if(d.data.estado==='error')toast('No se pudo entregar por Meta');
+  abrirWaConv(id);
+}
+function waNueva(){
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">Nueva conversación</h3><label>Número de WhatsApp (con lada, solo dígitos)</label><input id="waNum" placeholder="5215576098525"><label>Nombre (opcional)</label><input id="waNom"><div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="crearWaConv()">Crear</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+}
+async function crearWaConv(){
+  var d=await api('/api/whatsapp/conversaciones',{method:'POST',body:JSON.stringify({numero:val('waNum'),nombre:val('waNom')})});
+  if(d&&d.ok){closeModal();abrirWaConv(d.data.id);}else if(d){toast(d.error||'Número inválido');}
+}
 var EMP_MAP=null;
 function recargarEmpleados(){go('empleados');}
 function fmtFechaHora(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleString('es-MX',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}catch(e){return s;}}
@@ -2061,6 +2324,19 @@ async function abrirProyecto(id){
   h+='<label>URL de foto (opcional)</label><input id="losaFoto" placeholder="https://…">';
   h+='<div style="height:.7rem"></div><button class="btn sec" onclick="agregarLosa('+id+')">Agregar losa para aprobar</button></div>';
 
+  // Fotos por etapa
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">Fotos por etapa</h3>';
+  h+='<p class="muted" style="font-size:.8rem;margin-bottom:.4rem">Sube fotos del avance; el cliente las verá en su portal.</p>';
+  h+='<div class="g2"><div><label>Etapa</label><select id="fotoEtapa">'+opts+'</select></div><div><label>Descripción (opcional)</label><input id="fotoDesc"></div></div>';
+  h+='<label>Imagen</label><input id="fotoFile" type="file" accept="image/*">';
+  h+='<div style="height:.6rem"></div><button class="btn" onclick="subirFotoUI('+id+')">Subir foto</button>';
+  h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:.5rem;margin-top:.8rem">';
+  (d.data.fotos||[]).forEach(function(f){
+    h+='<div style="position:relative"><img src="'+f.url+'" loading="lazy" style="width:100%;height:90px;object-fit:cover;border-radius:6px;border:1px solid var(--bd)"><button class="btn err" style="position:absolute;top:.2rem;right:.2rem;padding:.15rem .3rem;line-height:1" onclick="borrarFotoUI('+id+','+f.id+')"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 6l12 12M18 6L6 18"/></svg></button>'+(f.etapa?('<div class="muted" style="font-size:.66rem;margin-top:.15rem">'+f.etapa+'</div>'):'')+'</div>';
+  });
+  if(!(d.data.fotos||[]).length)h+='<p class="muted" style="font-size:.8rem;grid-column:1/-1">Aún no hay fotos.</p>';
+  h+='</div></div>';
+
   // Chat
   h+='<div class="card"><h3 style="color:var(--gold);font-size:1.2rem;margin-bottom:.5rem">Chat con el cliente (portal)</h3><div style="max-height:240px;overflow:auto;padding:.3rem 0">';
   (d.data.mensajes||[]).forEach(function(m){
@@ -2076,6 +2352,24 @@ async function togglePortal(id,activo){var d=await api('/api/admin/proyectos/'+i
 async function guardarEtapa(id){var d=await api('/api/admin/proyectos/'+id+'/portal/etapa',{method:'PUT',body:JSON.stringify({etapa_clave:document.getElementById('etapaSel').value,nota:document.getElementById('etapaNota').value,avance_pct:document.getElementById('etapaAvance').value})});if(d&&d.ok){toast('Etapa actualizada — el cliente fue notificado');abrirProyecto(id);}else if(d){toast(d.error);}}
 async function guardarAvance(id){var d=await api('/api/admin/proyectos/'+id+'/portal/avance',{method:'PUT',body:JSON.stringify({avance_pct:document.getElementById('avPct').value,m2_procesados:document.getElementById('avProc').value,m2_totales:document.getElementById('avTot').value,fecha_entrega_estimada:document.getElementById('avFecha').value})});if(d&&d.ok){toast('Avance guardado');abrirProyecto(id);}}
 async function agregarLosa(id){var desc=document.getElementById('losaDesc').value;if(!desc){toast('Describe la losa');return;}var d=await api('/api/admin/proyectos/'+id+'/portal/losa',{method:'POST',body:JSON.stringify({descripcion_losa:desc,foto_url_losa:document.getElementById('losaFoto').value})});if(d&&d.ok){toast('Losa agregada para aprobación');abrirProyecto(id);}}
+async function subirFotoUI(id){
+  var inp=document.getElementById('fotoFile');
+  if(!inp||!inp.files||!inp.files[0]){toast('Elige una imagen');return;}
+  var file=inp.files[0];
+  if(file.size>8*1024*1024){toast('La imagen supera 8 MB');return;}
+  toast('Subiendo…');
+  var reader=new FileReader();
+  reader.onload=async function(){
+    var d=await api('/api/admin/proyectos/'+id+'/fotos',{method:'POST',body:JSON.stringify({data:reader.result,contentType:file.type,etapa:document.getElementById('fotoEtapa').value,descripcion:document.getElementById('fotoDesc').value})});
+    if(d&&d.ok){toast('Foto subida');abrirProyecto(id);}else if(d){toast(d.error||'No se pudo subir');}
+  };
+  reader.onerror=function(){toast('No se pudo leer la imagen');};
+  reader.readAsDataURL(file);
+}
+async function borrarFotoUI(id,fotoId){
+  var d=await api('/api/admin/proyectos/'+id+'/fotos/'+fotoId,{method:'DELETE'});
+  if(d&&d.ok){toast('Foto eliminada');abrirProyecto(id);}
+}
 async function responderPortal(id){var inp=document.getElementById('admMsg');if(!inp.value.trim())return;var d=await api('/api/admin/proyectos/'+id+'/portal/mensaje',{method:'POST',body:JSON.stringify({mensaje:inp.value})});if(d&&d.ok){inp.value='';abrirProyecto(id);}}
 async function invitarPortal(id){
   var d=await api('/api/admin/proyectos/'+id+'/portal/invitar',{method:'POST',body:JSON.stringify({})});
@@ -2441,6 +2735,16 @@ async function detalle(id){
       h+='</div>';
     });
     h+='</div>';
+  }
+  // Fotos del avance
+  if((d.data.fotos_proyecto||[]).length){
+    h+='<div class="card" style="margin-top:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Avance en fotos</h3>';
+    h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:.5rem">';
+    d.data.fotos_proyecto.forEach(function(f){
+      var et=ETAPAS.find(function(x){return x.clave===f.etapa;});
+      h+='<a href="'+f.url+'" target="_blank" style="display:block"><img src="'+f.url+'" loading="lazy" style="width:100%;height:100px;object-fit:cover;border-radius:8px;border:1px solid var(--bd)">'+(et?('<div class="muted" style="font-size:.68rem;margin-top:.2rem">'+et.nombre+'</div>'):'')+'</a>';
+    });
+    h+='</div></div>';
   }
   // Documentos
   h+='<div class="card" style="margin-top:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Documentos</h3>'+
