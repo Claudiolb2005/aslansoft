@@ -1,0 +1,30 @@
+name            = "aslansoft"
+main            = "worker.js"
+compatibility_date = "2024-01-15"
+
+# ─── D1 — Base de datos principal ─────────────────────────────────────────────
+[[d1_databases]]
+binding       = "DB"
+database_name = "aslan-db"
+database_id   = "005cf74e-fe68-4e7c-80c8-333197d56326"
+
+# ─── KV — Sesiones JWT ────────────────────────────────────────────────────────
+[[kv_namespaces]]
+binding = "SESSIONS"
+id      = "7fe08025d6444a07bc275c2a44b9c7a0"
+
+# ─── R2 — Archivos y fotos ────────────────────────────────────────────────────
+[[r2_buckets]]
+binding     = "FILES"
+bucket_name = "aslan-files"
+
+# ─── Variables públicas de empresa ────────────────────────────────────────────
+[vars]
+EMPRESA_NOMBRE    = "ASLAN"
+EMPRESA_DIRECCION = "Luis Carracci 50, Delegación Benito Juárez, CDMX"
+EMPRESA_EMAIL     = "contacto@marmolesaslan.com"
+EMPRESA_TELEFONO  = "+52 55 7609 8525"
+
+# ─── Secrets (NO van aquí — se configuran en Cloudflare Dashboard) ────────────
+# Workers & Pages → aslansoft → Settings → Variables and Secrets → Add
+#   JWT_SECRET  →  cadena aleatoria 40+ caracteres  →  tipo: Secret
