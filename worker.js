@@ -261,6 +261,19 @@ CREATE TABLE IF NOT EXISTS movimientos_inventario (
   referencia TEXT, motivo TEXT, usuario_id INTEGER, proveedor_id INTEGER,
   notas TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS cortes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  folio TEXT,
+  producto_id INTEGER, cotizacion_id INTEGER, proyecto_id INTEGER,
+  cliente_id INTEGER, empleado_id INTEGER,
+  cantidad REAL, unidad TEXT DEFAULT 'm2', medidas TEXT,
+  estado TEXT DEFAULT 'pendiente',
+  descuenta_inventario INTEGER DEFAULT 0, movimiento_id INTEGER,
+  notas TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  deleted_at DATETIME
+);
 CREATE TABLE IF NOT EXISTS proveedores (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nombre TEXT NOT NULL, pais TEXT, contacto TEXT, telefono TEXT, email TEXT,
@@ -471,6 +484,24 @@ async function migrarV3(env) {
     await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v3_crm','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run();
   } catch (e) {}
   MIGRADO_V3 = true;
+}
+
+let MIGRADO_V4 = false;
+async function migrarV4(env) {
+  if (MIGRADO_V4) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v4_cortes'").first();
+    if (f && f.valor === "ok") { MIGRADO_V4 = true; return; }
+  } catch (e) { return; }
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS cortes (id INTEGER PRIMARY KEY AUTOINCREMENT, folio TEXT, producto_id INTEGER, cotizacion_id INTEGER, proyecto_id INTEGER, cliente_id INTEGER, empleado_id INTEGER, cantidad REAL, unidad TEXT DEFAULT 'm2', medidas TEXT, estado TEXT DEFAULT 'pendiente', descuenta_inventario INTEGER DEFAULT 0, movimiento_id INTEGER, notas TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, deleted_at DATETIME)"
+    ).run();
+  } catch (e) {}
+  try {
+    await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v4_cortes','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run();
+  } catch (e) {}
+  MIGRADO_V4 = true;
 }
 
 
@@ -1000,6 +1031,118 @@ async function movimientosGlobal(env, url) {
 // ============================================================================
 //  API — PROVEEDORES
 // ============================================================================
+
+// ============================================================================
+//  CORTES — eslabón físico de la trazabilidad
+//  Inventario(material) → Corte → Cotización → Cliente → Asesor/Cortador
+// ============================================================================
+async function handleCortes(request, env, payload, method, id, url) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  const SEL = "SELECT c.*, p.nombre AS material, p.sku AS material_sku, p.unidad AS material_unidad, p.stock_actual AS material_stock," +
+    " co.folio AS cotizacion_folio, pr.folio AS proyecto_folio," +
+    " cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.asesor AS asesor," +
+    " ue.nombre AS cortador" +
+    " FROM cortes c" +
+    " LEFT JOIN productos p ON p.id=c.producto_id" +
+    " LEFT JOIN cotizaciones co ON co.id=c.cotizacion_id" +
+    " LEFT JOIN proyectos pr ON pr.id=c.proyecto_id" +
+    " LEFT JOIN clientes cl ON cl.id=c.cliente_id" +
+    " LEFT JOIN usuarios ue ON ue.id=c.empleado_id";
+
+  if (method === "GET" && id) {
+    const r = await env.DB.prepare(SEL + " WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
+    if (!r) return fail("Corte no encontrado.", 404);
+    return ok(r);
+  }
+  if (method === "GET") {
+    let sql = SEL + " WHERE c.deleted_at IS NULL";
+    const b = [];
+    const fc = url && url.searchParams.get("cotizacion");
+    const fp = url && url.searchParams.get("producto");
+    const fcl = url && url.searchParams.get("cliente");
+    if (fc) { sql += " AND c.cotizacion_id=?"; b.push(fc); }
+    if (fp) { sql += " AND c.producto_id=?"; b.push(fp); }
+    if (fcl) { sql += " AND c.cliente_id=?"; b.push(fcl); }
+    sql += " ORDER BY c.id DESC";
+    const r = await env.DB.prepare(sql).bind(...b).all();
+    return ok(r.results || []);
+  }
+  if (method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    if (!b.producto_id) return fail("Selecciona el material de inventario.");
+    const cant = Number(b.cantidad) || 0;
+    // Derivar el cliente desde la cotización o el proyecto (trazabilidad automática)
+    let clienteId = b.cliente_id || null;
+    if (!clienteId && b.cotizacion_id) {
+      const co = await env.DB.prepare("SELECT cliente_id FROM cotizaciones WHERE id=?").bind(b.cotizacion_id).first();
+      if (co) clienteId = co.cliente_id;
+    }
+    if (!clienteId && b.proyecto_id) {
+      const pr = await env.DB.prepare("SELECT cliente_id FROM proyectos WHERE id=?").bind(b.proyecto_id).first();
+      if (pr) clienteId = pr.cliente_id;
+    }
+    const folio = await siguienteFolio(env, "CORTE", "cortes");
+    // Descuento opcional de inventario (genera salida y enlaza el movimiento)
+    let movId = null;
+    if (b.descuenta_inventario && cant > 0) {
+      const prod = await env.DB.prepare("SELECT * FROM productos WHERE id=? AND deleted_at IS NULL").bind(b.producto_id).first();
+      if (prod) {
+        const nuevo = (Number(prod.stock_actual) || 0) - cant;
+        await env.DB.prepare("UPDATE productos SET stock_actual=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(nuevo, b.producto_id).run();
+        const mv = await env.DB.prepare(
+          "INSERT INTO movimientos_inventario (producto_id,tipo,cantidad,referencia,motivo,usuario_id,notas) VALUES (?,?,?,?,?,?,?)"
+        ).bind(b.producto_id, "salida", cant, folio, "Corte " + folio, b.empleado_id || payload.sub, b.medidas || null).run();
+        movId = mv.meta ? mv.meta.last_row_id : null;
+      }
+    }
+    const res = await env.DB.prepare(
+      "INSERT INTO cortes (folio,producto_id,cotizacion_id,proyecto_id,cliente_id,empleado_id,cantidad,unidad,medidas,estado,descuenta_inventario,movimiento_id,notas) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    ).bind(folio, b.producto_id, b.cotizacion_id || null, b.proyecto_id || null, clienteId, b.empleado_id || null,
+           cant, b.unidad || "m2", b.medidas || null, b.estado || "pendiente",
+           b.descuenta_inventario ? 1 : 0, movId, b.notas || null).run();
+    await audit(env, payload.sub, "crear", "cortes", res.meta.last_row_id, { folio }, request);
+    return ok({ id: res.meta.last_row_id, folio });
+  }
+  if (method === "PUT" && id) {
+    const b = await request.json().catch(() => ({}));
+    const campos = ["producto_id", "cotizacion_id", "proyecto_id", "cliente_id", "empleado_id", "cantidad", "unidad", "medidas", "estado", "notas"];
+    const sets = [], vals = [];
+    for (const k of campos) { if (k in b) { sets.push(k + "=?"); vals.push(b[k]); } }
+    if (!sets.length) return fail("Nada que actualizar.");
+    vals.push(id);
+    await env.DB.prepare("UPDATE cortes SET " + sets.join(",") + ", updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(...vals).run();
+    await audit(env, payload.sub, "editar", "cortes", id, b, request);
+    return ok({ id });
+  }
+  if (method === "DELETE" && id) {
+    await env.DB.prepare("UPDATE cortes SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
+    await audit(env, payload.sub, "eliminar", "cortes", id, {}, request);
+    return ok({ id });
+  }
+  return fail("Método no permitido.", 405);
+}
+
+async function trazabilidadGlobal(env, url) {
+  if (url && url.searchParams.get("scope")) { /* reservado para filtros futuros */ }
+  const r = await env.DB.prepare(
+    "SELECT c.id, c.folio, c.cantidad, c.unidad, c.medidas, c.estado, c.descuenta_inventario," +
+    " p.id AS producto_id, p.nombre AS material, p.sku AS material_sku," +
+    " co.id AS cotizacion_id, co.folio AS cotizacion_folio, co.total AS cotizacion_total," +
+    " pr.folio AS proyecto_folio," +
+    " cl.id AS cliente_id, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.asesor AS asesor," +
+    " ue.nombre AS cortador" +
+    " FROM cortes c" +
+    " LEFT JOIN productos p ON p.id=c.producto_id" +
+    " LEFT JOIN cotizaciones co ON co.id=c.cotizacion_id" +
+    " LEFT JOIN proyectos pr ON pr.id=c.proyecto_id" +
+    " LEFT JOIN clientes cl ON cl.id=c.cliente_id" +
+    " LEFT JOIN usuarios ue ON ue.id=c.empleado_id" +
+    " WHERE c.deleted_at IS NULL ORDER BY c.id DESC"
+  ).all();
+  const tot = await env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(cantidad),0) AS m2 FROM cortes WHERE deleted_at IS NULL").first();
+  const sinLink = await env.DB.prepare("SELECT COUNT(*) AS n FROM cortes WHERE deleted_at IS NULL AND cotizacion_id IS NULL").first();
+  return ok({ cadena: r.results || [], metricas: { cortes: (tot && tot.n) || 0, m2: (tot && tot.m2) || 0, sin_cotizacion: (sinLink && sinLink.n) || 0 } });
+}
 async function handleProveedores(request, env, payload, method, id) {
   if (method === "GET") {
     const r = await env.DB.prepare("SELECT * FROM proveedores ORDER BY nombre").all();
@@ -1720,6 +1863,7 @@ async function handleRequest(request, env) {
   if (method === "OPTIONS") return new Response(null, { headers: CORS });
 
   await migrarV3(env);
+  await migrarV4(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -1774,6 +1918,9 @@ async function handleRequest(request, env) {
     if (m) return await handleProveedores(request, env, payload, method, m[1]);
     m = path.match(/^\/api\/proyectos(?:\/(\d+))?$/);
     if (m) return await handleProyectos(request, env, payload, method, m[1]);
+    m = path.match(/^\/api\/cortes(?:\/(\d+))?$/);
+    if (m) return await handleCortes(request, env, payload, method, m[1], url);
+    if (path === "/api/trazabilidad" && method === "GET") return await trazabilidadGlobal(env, url);
 
     // ----- Empleados · Check-in GPS · Geocerca -----
     if (path === "/api/checkin" && method === "POST") return await registrarCheckin(request, env, payload);
@@ -1943,6 +2090,16 @@ function renderApp() {
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.4rem}
 .kpi .n{font-size:2.2rem;color:var(--gold);font-family:'Cormorant Garamond',serif;font-weight:700}
 .kpi .l{font-size:.78rem;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em}
+.kpi-click{cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}
+.kpi-click:hover{border-color:var(--gold);transform:translateY(-3px);box-shadow:0 10px 34px rgba(0,0,0,.45)}
+.tablero{display:flex;gap:.7rem;overflow-x:auto;padding:.3rem 0 .8rem}
+.tcol{flex:0 0 250px;min-width:250px;background:#181818;border:1px solid var(--bd);border-radius:10px;padding:.5rem;display:flex;flex-direction:column}
+.tcol h4{font-size:.74rem;letter-spacing:.04em;text-transform:uppercase;padding:.35rem .4rem;margin-bottom:.4rem;border-bottom:2px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
+.tcol .cnt{background:var(--gold);color:#1a1a1a;border-radius:99px;font-size:.66rem;padding:.04rem .42rem;font-weight:700}
+.tcard{background:#222;border:1px solid var(--bd);border-radius:8px;padding:.55rem;margin-bottom:.5rem}
+.tcard .nm{font-weight:600;font-size:.82rem;color:var(--txt)}
+.tcard .mt{font-size:.74rem;color:var(--txt2);margin:.15rem 0}
+.tcard select{font-size:.72rem;padding:.22rem .3rem;margin-top:.35rem}
 .grid{display:grid;gap:1rem}
 .charts-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;margin-bottom:1.4rem}
 .wa{display:flex;gap:1rem}
@@ -1993,6 +2150,8 @@ var ICONS={
   cotizaciones:"<path d='M6 2h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z'/><path d='M14 2v6h6'/><path d='M9 13h6M9 17h4'/>",
   inventario:"<path d='M21 8l-9 4-9-4 9-4 9 4z'/><path d='M3 8v8l9 4 9-4V8'/><path d='M12 12v8'/>",
   proyectos:"<path d='M12 2l9 5-9 5-9-5 9-5z'/><path d='M3 12l9 5 9-5'/><path d='M3 17l9 5 9-5'/>",
+  cortes:"<path d='M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z'/><path d='M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z'/><path d='M8.1 7.1L20 18M8.1 16.9L20 6'/>",
+  trazabilidad:"<circle cx='5' cy='6' r='2.4'/><circle cx='19' cy='6' r='2.4'/><circle cx='12' cy='18' r='2.4'/><path d='M7 7l4 9M17 7l-4 9'/>",
   empleados:"<circle cx='12' cy='8' r='4'/><path d='M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1'/>",
   whatsapp:"<path d='M21 11.5a8.4 8.4 0 0 1-8.5 8.5 8.5 8.5 0 0 1-4-1L3 21l1.5-5.5a8.5 8.5 0 1 1 16.5-4z'/>",
   reportes:"<path d='M3 17l6-6 4 4 7-7'/><path d='M17 8h4v4'/>",
@@ -2006,6 +2165,8 @@ var MENU=[
   {id:'cotizaciones',label:'Cotizaciones',roles:['admin','gerente','empleado']},
   {id:'inventario',label:'Inventario',roles:['admin','gerente','empleado']},
   {id:'proyectos',label:'Proyectos',roles:['admin','gerente','empleado']},
+  {id:'cortes',label:'Cortes',roles:['admin','gerente']},
+  {id:'trazabilidad',label:'Trazabilidad',roles:['admin','gerente']},
   {id:'empleados',label:'Empleados',roles:['admin','gerente']},
   {id:'whatsapp',label:'WhatsApp',roles:['admin','gerente','empleado']},
   {id:'reportes',label:'Reportes',roles:['admin','gerente']},
@@ -2025,7 +2186,7 @@ function setActive(id){var as=document.querySelectorAll('.nav a');as.forEach(fun
 async function go(id){
   setActive(id);document.getElementById('side').classList.remove('open');
   document.getElementById('acciones').innerHTML='';
-  var t={dashboard:'Dashboard',clientes:'Clientes / CRM',cotizaciones:'Cotizaciones',inventario:'Inventario',proyectos:'Proyectos',empleados:'Empleados',whatsapp:'WhatsApp',reportes:'Reportes',config:'Configuración'};
+  var t={dashboard:'Dashboard',clientes:'Clientes / CRM',cotizaciones:'Cotizaciones',inventario:'Inventario',proyectos:'Proyectos',cortes:'Cortes',trazabilidad:'Trazabilidad',empleados:'Empleados',whatsapp:'WhatsApp',reportes:'Reportes',config:'Configuración'};
   document.getElementById('titulo').textContent=t[id]||id;
   var c=document.getElementById('content');c.innerHTML='Cargando…';
   if(id==='dashboard')return viewDashboard(c);
@@ -2033,6 +2194,8 @@ async function go(id){
   if(id==='cotizaciones')return viewCotizaciones(c);
   if(id==='inventario')return viewInventario(c);
   if(id==='proyectos')return viewProyectos(c);
+  if(id==='cortes')return viewCortes(c);
+  if(id==='trazabilidad')return viewTrazabilidad(c);
   if(id==='empleados')return viewEmpleados(c);
   if(id==='whatsapp')return viewWhatsApp(c);
   if(id==='reportes')return viewReportes(c);
@@ -2040,6 +2203,102 @@ async function go(id){
   c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem">Módulo en construcción</h3><p class="muted" style="margin-top:.5rem">Esta sección («'+t[id]+'») se está integrando sobre esta misma base. Ya está el backbone, la auth por rol y el esquema de datos completo.</p></div>';
 }
 
+var CORTE_ESTADOS=['pendiente','en_proceso','terminado','entregado'];
+var CORTE_LISTAS={prod:[],cot:[],emp:[]};
+function irTraza(){go('trazabilidad');}
+function irCortes(){go('cortes');}
+function estadoCorteSel(id,val){
+  var o='';CORTE_ESTADOS.forEach(function(s){o+='<option value="'+s+'"'+(val===s?' selected':'')+'>'+s+'</option>';});
+  return '<select onchange="cambiarEstadoCorte('+id+',this.value)" style="font-size:.74rem;padding:.2rem .3rem">'+o+'</select>';
+}
+async function viewCortes(c){
+  document.getElementById('acciones').innerHTML='<button class="btn" onclick="nuevoCorte()">+ Nuevo corte</button> <button class="btn sec" onclick="irTraza()">Ver trazabilidad</button>';
+  var d=await api('/api/cortes');if(!d||!d.ok)return;
+  var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Cada corte liga un material de inventario con su cotización, cliente y cortador. Si marcas «descontar», genera la salida de inventario automáticamente.</p>';
+  var h=nota+'<div class="card" style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Folio</th><th>Material</th><th>Cantidad</th><th>Medidas</th><th>Cotización</th><th>Cliente</th><th>Asesor</th><th>Cortador</th><th>Estado</th><th>Inv.</th></tr></thead><tbody>';
+  d.data.forEach(function(r){
+    var inv=r.descuenta_inventario?'<span class="pill" style="background:var(--ok)">descontado</span>':'<span class="pill" style="background:#555">no</span>';
+    var cot=r.cotizacion_folio?('<span class="pill" style="background:var(--gold)">'+r.cotizacion_folio+'</span>'):'—';
+    h+='<tr><td>'+(r.folio||'—')+'</td><td>'+escAttr(r.material||'—')+(r.material_sku?(' <span class="muted">'+escAttr(r.material_sku)+'</span>'):'')+'</td><td style="white-space:nowrap">'+(r.cantidad||0)+' '+(r.unidad||'')+'</td><td>'+escAttr(r.medidas||'—')+'</td><td>'+cot+'</td><td>'+escAttr(r.cliente||'—')+'</td><td>'+escAttr(r.asesor||'—')+'</td><td>'+escAttr(r.cortador||'—')+'</td><td>'+estadoCorteSel(r.id,r.estado)+'</td><td>'+inv+'</td></tr>';
+  });
+  if(!d.data.length)h+='<tr><td colspan="10" class="muted">Sin cortes aún. Crea el primero con «+ Nuevo corte».</td></tr>';
+  h+='</tbody></table></div>';c.innerHTML=h;
+}
+async function nuevoCorte(){
+  var dp=await api('/api/productos');var dc=await api('/api/cotizaciones');var de=await api('/api/empleados');
+  CORTE_LISTAS.prod=(dp&&dp.ok)?dp.data:[];
+  CORTE_LISTAS.cot=(dc&&dc.ok)?dc.data:[];
+  CORTE_LISTAS.emp=(de&&de.ok)?de.data:[];
+  var oMat='<option value="">— Material de inventario —</option>';
+  CORTE_LISTAS.prod.forEach(function(p){oMat+='<option value="'+p.id+'">'+escAttr(p.nombre)+(p.sku?(' ('+escAttr(p.sku)+')'):'')+' · stock '+(p.stock_actual||0)+' '+(p.unidad||'')+'</option>';});
+  var oCot='<option value="">— Sin cotización —</option>';
+  CORTE_LISTAS.cot.forEach(function(co){oCot+='<option value="'+co.id+'">'+escAttr(co.folio||'')+(co.cliente?(' · '+escAttr(co.cliente)):'')+'</option>';});
+  var oEmp='<option value="">— Cortador —</option>';
+  CORTE_LISTAS.emp.forEach(function(e){oEmp+='<option value="'+e.id+'">'+escAttr(e.nombre)+(e.cargo?(' · '+escAttr(e.cargo)):'')+'</option>';});
+  var oEst='';CORTE_ESTADOS.forEach(function(s){oEst+='<option value="'+s+'">'+s+'</option>';});
+  var h='<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.8rem">Nuevo corte</h3>'+
+    '<label>Material</label><select id="coMat">'+oMat+'</select>'+
+    '<label>Cotización ligada (define el cliente)</label><select id="coCot">'+oCot+'</select>'+
+    '<label>Cortador</label><select id="coEmp">'+oEmp+'</select>'+
+    '<div style="display:flex;gap:.6rem"><div style="flex:1"><label>Cantidad (m²)</label><input id="coCant" type="text" inputmode="decimal" placeholder="0"></div>'+
+    '<div style="flex:1"><label>Medidas</label><input id="coMed" placeholder="120x60x2 cm"></div></div>'+
+    '<label>Estado</label><select id="coEst">'+oEst+'</select>'+
+    '<label style="display:flex;align-items:center;gap:.5rem;margin:.7rem 0;font-size:.86rem"><input type="checkbox" id="coInv" style="width:auto"> Descontar este material del inventario (genera salida)</label>'+
+    '<label>Notas</label><textarea id="coNotas" rows="2"></textarea>'+
+    '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarCorte()">Guardar corte</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>';
+  openModal(h);
+}
+async function guardarCorte(){
+  var prod=val('coMat');if(!prod){toast('Selecciona el material');return;}
+  var body={producto_id:Number(prod),
+    cotizacion_id:val('coCot')?Number(val('coCot')):null,
+    empleado_id:val('coEmp')?Number(val('coEmp')):null,
+    cantidad:parseFloat((val('coCant')||'0').replace(/[^0-9.-]/g,''))||0,
+    unidad:'m2',medidas:val('coMed'),estado:val('coEst'),
+    descuenta_inventario:document.getElementById('coInv').checked,
+    notas:val('coNotas')};
+  var d=await api('/api/cortes',{method:'POST',body:JSON.stringify(body)});
+  if(d&&d.ok){closeModal();toast('Corte '+d.data.folio+' creado');go('cortes');}else if(d){toast(d.error||'Error al guardar');}
+}
+async function cambiarEstadoCorte(id,valor){
+  var d=await api('/api/cortes/'+id,{method:'PUT',body:JSON.stringify({estado:valor})});
+  if(d&&d.ok){toast('Estado actualizado');}else if(d){toast(d.error||'Error');}
+}
+var TRAZA=[];
+async function viewTrazabilidad(c){
+  document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="irCortes()">Ir a Cortes</button>';
+  var d=await api('/api/trazabilidad');if(!d||!d.ok)return;
+  TRAZA=d.data.cadena||[];var mt=d.data.metricas||{};
+  var kp='<div class="kpis" style="margin-bottom:1rem">'+
+    '<div class="card kpi"><div class="n">'+(mt.cortes||0)+'</div><div class="l">Cortes registrados</div></div>'+
+    '<div class="card kpi"><div class="n">'+(mt.m2||0)+'</div><div class="l">m² cortados</div></div>'+
+    '<div class="card kpi"><div class="n">'+(mt.sin_cotizacion||0)+'</div><div class="l">Cortes sin cotización</div></div>'+
+    '</div>';
+  var intro='<p class="muted" style="font-size:.82rem;margin-bottom:.6rem">Cadena completa de trazabilidad: <strong>Material → Corte → Cotización → Cliente → Asesor → Cortador</strong>. Usa el buscador para rastrear cualquier eslabón.</p>'+
+    '<input id="trzq" placeholder="Buscar material, folio, cliente, asesor, cortador..." oninput="filtrarTraza()" style="width:100%;max-width:480px;margin-bottom:.7rem;padding:.5rem .7rem">';
+  document.getElementById('content').innerHTML=kp+intro+'<div id="trzBox"></div>';
+  pintarTraza(TRAZA);
+}
+function pintarTraza(rows){
+  var box=document.getElementById('trzBox');if(!box)return;
+  var h='<div class="card" style="overflow-x:auto"><table style="font-size:.8rem"><thead><tr><th>Material</th><th>→ Corte</th><th>Cant.</th><th>Cortador</th><th>→ Cotización</th><th>→ Cliente</th><th>→ Asesor</th><th>Proyecto</th><th>Estado</th></tr></thead><tbody>';
+  rows.forEach(function(r){
+    var arrow='<span style="color:var(--gold)">→</span> ';
+    var cot=r.cotizacion_folio?('<span class="pill" style="background:var(--gold)">'+r.cotizacion_folio+'</span>'):'—';
+    var proy=r.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+r.proyecto_folio+'</span>'):'—';
+    h+='<tr><td>'+escAttr(r.material||'—')+(r.material_sku?(' <span class="muted">'+escAttr(r.material_sku)+'</span>'):'')+'</td>'+
+       '<td>'+(r.folio||'—')+'</td><td style="white-space:nowrap">'+(r.cantidad||0)+' '+(r.unidad||'')+'</td>'+
+       '<td>'+escAttr(r.cortador||'—')+'</td><td>'+cot+'</td><td>'+escAttr(r.cliente||'—')+(r.cliente_empresa?(' <span class="muted">'+escAttr(r.cliente_empresa)+'</span>'):'')+'</td>'+
+       '<td>'+escAttr(r.asesor||'—')+'</td><td>'+proy+'</td><td>'+escAttr(r.estado||'—')+'</td></tr>';
+  });
+  if(!rows.length)h+='<tr><td colspan="9" class="muted">Sin cortes que mostrar. Registra cortes en el módulo Cortes para construir la cadena.</td></tr>';
+  h+='</tbody></table></div>';box.innerHTML=h;
+}
+function filtrarTraza(){
+  var e=document.getElementById('trzq');var q=(e?e.value:'').toLowerCase().trim();
+  if(!q){pintarTraza(TRAZA);return;}
+  pintarTraza(TRAZA.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>=0;}));
+}
 var WA_ACTIVE=null;
 function recargarWa(){go('whatsapp');}
 async function viewWhatsApp(c){
@@ -2358,9 +2617,9 @@ async function viewDashboard(c){
   var d=await api('/api/dashboard/stats');if(!d||!d.ok)return;
   var cdR=await api('/api/dashboard/charts');var cd=(cdR&&cdR.ok)?cdR.data:{};
   var k=d.data.kpis;
-  var kpis=[['Clientes activos',k.clientes],['Cotizaciones (mes)',k.cotizMes],['Proyectos en curso',k.proyectos],['Empleados hoy',k.empleadosHoy],['Pipeline',money(k.pipeline)],['Stock crítico',k.stockCritico]];
+  var kpis=[['Clientes activos',k.clientes,'clientes'],['Cotizaciones (mes)',k.cotizMes,'cotizaciones'],['Proyectos en curso',k.proyectos,'proyectos'],['Empleados hoy',k.empleadosHoy,'empleados'],['Pipeline',money(k.pipeline),'cotizaciones'],['Stock crítico',k.stockCritico,'inventario']];
   var h='<div class="kpis">';
-  kpis.forEach(function(x){h+='<div class="card kpi"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>';});
+  kpis.forEach(function(x){h+='<div class="card kpi kpi-click" data-mod="'+x[2]+'" onclick="go(this.dataset.mod)" title="Ir a '+x[0]+'"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>';});
   h+='</div>';
   h+='<div class="charts-grid">'+chartCard('Monto cotizado por mes','chCotiz')+chartCard('Proyectos por etapa','chProy')+chartCard('Pipeline de clientes','chCli')+chartCard('Valor de inventario por categoría','chInv')+chartCard('Asistencia · entradas (7 días)','chAsis')+'</div>';
   h+='<div class="card" style="overflow-x:auto"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Cotizaciones recientes</h3><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th></tr></thead><tbody>';
@@ -2383,11 +2642,34 @@ function crmCell(r,campo,val,num){
 function crmCellWide(r,campo,val){
   return '<td contenteditable="true" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onblur="guardarCeldaCRM(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
+var CRM_VISTA='tabla';
+var CRM_ESTATUS=['SIN RESPUESTA','SEGUIMIENTO','PRECIO','MATERIAL','OTRO'];
 async function viewClientes(c){
-  document.getElementById('acciones').innerHTML='<button class="btn" onclick="nuevoCliente()">+ Nuevo registro</button> <input id="crmq" placeholder="Buscar contacto, material, asesor..." oninput="filtrarCRM()" style="display:inline-block;width:auto;min-width:240px;margin:0 .4rem;padding:.45rem .7rem"> <button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>';
+  document.getElementById('acciones').innerHTML=
+    '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">📋 Tabla</button> '+
+    '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">📊 Tablero por estatus</button> '+
+    '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button> '+
+    '<input id="crmq" placeholder="Buscar contacto, material, asesor..." oninput="filtrarCRM()" style="display:inline-block;width:auto;min-width:220px;margin:0 .4rem;padding:.45rem .7rem"> '+
+    '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>';
   var d=await api('/api/clientes');if(!d||!d.ok)return;
   CRM_ROWS=d.data;
-  pintarCRM(CRM_ROWS);
+  renderCRM();
+}
+function setVistaCRM(v){
+  CRM_VISTA=v;
+  var bt=document.getElementById('cvTabla'),bb=document.getElementById('cvTablero');
+  if(bt)bt.className=(v==='tabla'?'btn':'btn sec');
+  if(bb)bb.className=(v==='tablero'?'btn':'btn sec');
+  renderCRM();
+}
+function filasCRMFiltradas(){
+  var e=document.getElementById('crmq');var q=(e?e.value:'').toLowerCase().trim();
+  if(!q)return CRM_ROWS;
+  return CRM_ROWS.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>=0;});
+}
+function renderCRM(){
+  var rows=filasCRMFiltradas();
+  if(CRM_VISTA==='tablero')pintarTableroCRM(rows);else pintarCRM(rows);
 }
 function pintarCRM(rows){
   var c=document.getElementById('content');
@@ -2421,11 +2703,45 @@ function pintarCRM(rows){
   if(!rows.length)h+='<tr><td colspan="20" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
-function filtrarCRM(){
-  var e=document.getElementById('crmq');var q=(e?e.value:'').toLowerCase().trim();
-  if(!q){pintarCRM(CRM_ROWS);return;}
-  var f=CRM_ROWS.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>=0;});
-  pintarCRM(f);
+function filtrarCRM(){ renderCRM(); }
+function tcardCRM(r){
+  var opts='<option value="">(Sin estatus)</option>';
+  CRM_ESTATUS.forEach(function(s){opts+='<option value="'+s+'"'+(((r.estatus_nota||'').trim().toUpperCase()===s)?' selected':'')+'>'+s+'</option>';});
+  var monto=(r.propuesta_antes_iva!=null)?money(r.propuesta_antes_iva):((r.facturado!=null)?money(r.facturado):'');
+  var sub=(r.empresa||r.material||'');
+  return '<div class="tcard">'+
+    '<div class="nm">'+escAttr(r.nombre||'—')+'</div>'+
+    (sub?'<div class="mt">'+escAttr(sub)+'</div>':'')+
+    '<div class="mt">'+(r.asesor?('Asesor: '+escAttr(r.asesor)):'Sin asesor')+(monto?(' · '+monto):'')+'</div>'+
+    '<select onchange="cambiarEstatusCRM('+r.id+',this.value)">'+opts+'</select> '+
+    '<button class="btn sec" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="verCotizacionesCliente('+r.id+')" title="Cotizaciones del cliente">📄 '+(r.num_cotizaciones||0)+'</button>'+
+    '</div>';
+}
+function pintarTableroCRM(rows){
+  var c=document.getElementById('content');
+  var cols=CRM_ESTATUS.concat(['(Sin estatus)']);
+  var color={'SIN RESPUESTA':'var(--err)','SEGUIMIENTO':'var(--gold)','PRECIO':'#5B8DEF','MATERIAL':'var(--ok)','OTRO':'#9C7BD6','(Sin estatus)':'#888'};
+  var grupos={};cols.forEach(function(k){grupos[k]=[];});
+  rows.forEach(function(r){var s=(r.estatus_nota||'').trim().toUpperCase();var key=(CRM_ESTATUS.indexOf(s)>=0)?s:'(Sin estatus)';grupos[key].push(r);});
+  var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Tablero por estatus: cambia el estatus en el menú de cada tarjeta y el cliente se reacomoda en su columna. Desliza horizontalmente para ver todas las columnas. Registros: '+rows.length+'.</p>';
+  var h=nota+'<div class="tablero">';
+  cols.forEach(function(k){
+    var lista=grupos[k];
+    h+='<div class="tcol"><h4 style="color:'+(color[k]||'var(--gold)')+'">'+k+'<span class="cnt">'+lista.length+'</span></h4>';
+    if(!lista.length)h+='<p class="muted" style="font-size:.74rem;padding:.3rem">—</p>';
+    lista.forEach(function(r){h+=tcardCRM(r);});
+    h+='</div>';
+  });
+  h+='</div>';c.innerHTML=h;
+}
+async function cambiarEstatusCRM(id,valor){
+  var d=await api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify({estatus_nota:valor})});
+  if(d&&d.ok){
+    var row=CRM_ROWS.find(function(x){return String(x.id)===String(id);});
+    if(row)row.estatus_nota=valor;
+    toast('Estatus actualizado');
+    renderCRM();
+  } else if(d){ toast(d.error||'Error al actualizar'); }
 }
 async function guardarCeldaCRM(el){
   var id=el.dataset.id, campo=el.dataset.campo, num=el.dataset.num==='1';
