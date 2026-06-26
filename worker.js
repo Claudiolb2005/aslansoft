@@ -2283,7 +2283,7 @@ function renderApp() {
 @media(max-width:768px){.wa{flex-direction:column}.wa-list{width:100%;max-height:40vh}}
 @media(max-width:768px){.side{position:fixed;left:-260px;transition:.2s;z-index:50;height:100%}.side.open{left:0}.main{padding:1rem}.menu-btn{display:block!important}}
 .menu-btn{display:none;background:none;border:1px solid var(--bd);color:var(--gold);padding:.4rem .7rem;border-radius:4px;font-size:1.2rem;cursor:pointer}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:99;padding:1rem}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:4000;padding:1rem}
 .modal.open{display:flex}
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:420px;width:100%;max-height:90vh;overflow:auto}
 td[contenteditable]{cursor:text;border-bottom:1px dashed rgba(139,109,63,.4)}
@@ -2706,22 +2706,58 @@ async function guardarEmpleado(){
   if(!d.ok){toast(d.error||'No se pudo crear');return;}
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Acceso creado</h3><p>Comparte estos datos con el empleado. Deberá cambiar la contraseña en su primer ingreso.</p><p style="margin-top:.6rem">Correo: <strong>'+escAttr(b.email)+'</strong></p><p>Contraseña temporal: <strong style="color:var(--gold)">'+escAttr(d.data.password_temporal)+'</strong></p><div style="margin-top:.9rem"><button class="btn" onclick="closeModal();recargarEmpleados()">Listo</button></div>');
 }
+var GC_MAP=null,GC_MARK=null,GC_CIRC=null,GC_TMP=null;
+function initGcMap(){
+  if(typeof L==='undefined')return;
+  if(GC_MAP){try{GC_MAP.remove();}catch(e){}GC_MAP=null;}
+  var t=GC_TMP||{lat:19.37241,lon:-99.16830,rad:150};
+  GC_MAP=L.map('gcMap').setView([t.lat,t.lon],15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(GC_MAP);
+  GC_MARK=L.marker([t.lat,t.lon]).addTo(GC_MAP);
+  GC_CIRC=L.circle([t.lat,t.lon],{radius:t.rad,color:'#8B6D3F',weight:1.5,fillColor:'#8B6D3F',fillOpacity:.12}).addTo(GC_MAP);
+  GC_MAP.on('click',function(ev){
+    var la=ev.latlng.lat,lo=ev.latlng.lng;
+    var eLa=document.getElementById('gcLat'),eLo=document.getElementById('gcLon');
+    if(eLa)eLa.value=la.toFixed(6);if(eLo)eLo.value=lo.toFixed(6);
+    gcDraw(la,lo);
+  });
+  setTimeout(function(){try{GC_MAP.invalidateSize();}catch(e){}},80);
+}
+function gcDraw(la,lo){
+  if(!GC_MAP)return;
+  var rad=parseFloat(val('gcRad'))||150;
+  if(GC_MARK)GC_MARK.setLatLng([la,lo]);
+  if(GC_CIRC){GC_CIRC.setLatLng([la,lo]);GC_CIRC.setRadius(rad);}
+  try{GC_MAP.panTo([la,lo]);}catch(e){}
+}
+function gcSync(){
+  var la=parseFloat(val('gcLat')),lo=parseFloat(val('gcLon'));
+  if(isFinite(la)&&isFinite(lo))gcDraw(la,lo);
+}
 async function configGeocerca(){
   var d=await api('/api/geofencing'),g=(d&&d.ok)?d.data:null;
-  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Geocerca del sitio</h3>'+
-    '<p class="muted" style="font-size:.82rem;margin-bottom:.3rem">Define el centro y el radio del sitio de trabajo. Los registros fuera de esta zona generan una alerta.</p>'+
+  var lat=(g&&isFinite(g.lat_centro))?g.lat_centro:19.37241;
+  var lon=(g&&isFinite(g.lon_centro))?g.lon_centro:-99.16830;
+  var rad=(g&&isFinite(g.radio_metros))?g.radio_metros:150;
+  GC_TMP={lat:lat,lon:lon,rad:rad};
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.3rem">Geocerca del sitio</h3>'+
+    '<p class="muted" style="font-size:.82rem;margin-bottom:.5rem">Toca el mapa para fijar el centro del sitio (o usa tu ubicación). El círculo dorado muestra el radio. Los registros fuera de la zona generan una alerta.</p>'+
     '<label>Nombre del sitio</label><input id="gcNom" value="'+escAttr(g&&g.nombre?g.nombre:'')+'">'+
-    '<div class="g2"><div><label>Latitud</label><input id="gcLat" type="number" step="0.000001" value="'+(g&&isFinite(g.lat_centro)?g.lat_centro:'')+'"></div><div><label>Longitud</label><input id="gcLon" type="number" step="0.000001" value="'+(g&&isFinite(g.lon_centro)?g.lon_centro:'')+'"></div></div>'+
-    '<label>Radio (metros)</label><input id="gcRad" type="number" value="'+(g&&isFinite(g.radio_metros)?g.radio_metros:150)+'">'+
+    '<div id="gcMap" style="height:240px;border-radius:8px;overflow:hidden;background:#111;margin:.5rem 0"></div>'+
+    '<div class="g2"><div><label>Latitud</label><input id="gcLat" type="number" step="0.000001" value="'+lat.toFixed(6)+'" oninput="gcSync()"></div><div><label>Longitud</label><input id="gcLon" type="number" step="0.000001" value="'+lon.toFixed(6)+'" oninput="gcSync()"></div></div>'+
+    '<label>Radio (metros)</label><input id="gcRad" type="number" value="'+rad+'" oninput="gcSync()">'+
     '<button class="btn sec block" style="margin-top:.5rem" onclick="ubicarmeGeocerca()">Usar mi ubicación actual</button>'+
     '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarGeocerca()">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+  setTimeout(initGcMap,160);
 }
 function ubicarmeGeocerca(){
   if(!navigator.geolocation){toast('Sin GPS disponible');return;}
   toast('Obteniendo ubicación…');
   navigator.geolocation.getCurrentPosition(function(pos){
-    document.getElementById('gcLat').value=pos.coords.latitude.toFixed(6);
-    document.getElementById('gcLon').value=pos.coords.longitude.toFixed(6);
+    var la=pos.coords.latitude,lo=pos.coords.longitude;
+    var eLa=document.getElementById('gcLat'),eLo=document.getElementById('gcLon');
+    if(eLa)eLa.value=la.toFixed(6);if(eLo)eLo.value=lo.toFixed(6);
+    gcDraw(la,lo);
     toast('Ubicación tomada');
   },function(){toast('No se pudo ubicar');},{enableHighAccuracy:true,timeout:10000});
 }
@@ -2946,23 +2982,49 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
-async function nuevoCliente(){
-  var nombre=prompt('Nombre del contacto:');if(!nombre)return;
-  var tel=prompt('Teléfono (opcional, ayuda a evitar duplicados):')||'';
-  crearCliente(nombre, tel, false);
+function nuevoCliente(){
+  var ases={};(CRM_ROWS||[]).forEach(function(r){var a=(r.asesor||'').trim();if(a)ases[a]=1;});
+  var aopt='<option value="">— Asesor —</option>';Object.keys(ases).sort().forEach(function(a){aopt+='<option>'+escAttr(a)+'</option>';});
+  var origenes=['WhatsApp','Llamada','Correo','Redes','Oficina','Recomendación','Otro'];
+  var oopt='<option value="">— Origen —</option>';origenes.forEach(function(o){oopt+='<option>'+o+'</option>';});
+  var eopt='<option value="">— Estatus —</option>';CRM_ESTATUS.forEach(function(s){eopt+='<option>'+escAttr(s)+'</option>';});
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Nuevo registro</h3>'+
+    '<p class="muted" style="font-size:.8rem;margin-bottom:.8rem">Solo el nombre es obligatorio. Lo demás lo puedes completar después en la ficha.</p>'+
+    '<label>Nombre del contacto *</label><input id="ncNom" placeholder="Nombre y apellido">'+
+    '<div class="g2"><div><label>Empresa</label><input id="ncEmp"></div><div><label>Teléfono</label><input id="ncTel" placeholder="55..."></div></div>'+
+    '<div class="g2"><div><label>Correo</label><input id="ncMail" type="email"></div><div><label>Asesor</label><select id="ncAse">'+aopt+'</select></div></div>'+
+    '<div class="g2"><div><label>Origen del lead</label><select id="ncOri">'+oopt+'</select></div><div><label>Estatus</label><select id="ncEst">'+eopt+'</select></div></div>'+
+    '<label>Material de interés</label><input id="ncMat">'+
+    '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
+    '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarNuevoCliente()">Crear registro</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+  setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();},80);
 }
-async function crearCliente(nombre, tel, force){
-  var hoy=new Date().toISOString().slice(0,10);
-  var body={nombre:nombre,etapa:'prospecto',fecha_lead:hoy,moneda:'MXN'};
-  if(tel)body.telefono=tel;
-  if(force)body.force=true;
-  var d=await api('/api/clientes',{method:'POST',body:JSON.stringify(body)});
+function guardarNuevoCliente(){
+  var nom=val('ncNom');if(!nom){toast('El nombre es obligatorio');return;}
+  var body={nombre:nom};
+  var emp=val('ncEmp');if(emp)body.empresa=emp;
+  var tel=val('ncTel');if(tel)body.telefono=tel;
+  var mail=val('ncMail');if(mail)body.email=mail;
+  var ase=val('ncAse');if(ase)body.asesor=ase;
+  var ori=val('ncOri');if(ori)body.origen=ori;
+  var est=val('ncEst');if(est)body.estatus_nota=est;
+  var mat=val('ncMat');if(mat)body.material=mat;
+  var prop=val('ncProp');if(prop!=='')body.propuesta_antes_iva=parseFloat(prop);
+  crearCliente(body, false);
+}
+async function crearCliente(body, force){
+  var payload={};for(var k in body)payload[k]=body[k];
+  if(!payload.etapa)payload.etapa='prospecto';
+  if(!payload.moneda)payload.moneda='MXN';
+  if(!payload.fecha_lead)payload.fecha_lead=new Date().toISOString().slice(0,10);
+  if(force)payload.force=true;
+  var d=await api('/api/clientes',{method:'POST',body:JSON.stringify(payload)});
   if(!d)return;
-  if(d.ok && d.data && d.data.duplicado){ PEND_CLIENTE={nombre:nombre,tel:tel}; mostrarDuplicadoAviso(d.data.existentes); return; }
+  if(d.ok && d.data && d.data.duplicado){ PEND_CLIENTE=payload; mostrarDuplicadoAviso(d.data.existentes); return; }
   if(d.ok){ if(typeof closeModal==='function')closeModal(); toast('Registro creado'); viewClientes(document.getElementById('content')); }
   else { toast(d.error||'Error'); }
 }
-function crearClienteForzado(){ if(PEND_CLIENTE)crearCliente(PEND_CLIENTE.nombre, PEND_CLIENTE.tel, true); }
+function crearClienteForzado(){ if(PEND_CLIENTE){ var p={};for(var k in PEND_CLIENTE)p[k]=PEND_CLIENTE[k]; delete p.force; crearCliente(p, true); } }
 function mostrarDuplicadoAviso(existentes){
   var h='<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.4rem">Posible duplicado</h3>'+
     '<p class="muted" style="font-size:.85rem;margin-bottom:.7rem">Ya hay registro(s) parecido(s). Abre el existente para no duplicar, o crea uno nuevo de todos modos.</p>'+
@@ -3781,7 +3843,7 @@ function renderPortalApp() {
 .msg.aslan{background:#222;border:1px solid var(--bd)}
 .msg.cliente{background:var(--gold);color:#fff;margin-left:auto}
 .back{cursor:pointer;color:var(--gold2);font-size:.85rem;margin-bottom:.6rem;display:inline-block}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:99;padding:1rem}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:4000;padding:1rem}
 .modal.open{display:flex}
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:380px;width:100%}
 @media(max-width:768px){.nav{padding:.8rem 1rem}.nav h1{font-size:1.4rem;letter-spacing:.2em}.nav .right{gap:.6rem;font-size:.8rem}.container{padding:1rem}.serif-title{font-size:1.6rem}.modal{padding:0;align-items:flex-end}.modal .inner{max-width:none;width:100%;border-radius:14px 14px 0 0;max-height:92vh}.msg{max-width:86%}}
