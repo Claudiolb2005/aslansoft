@@ -2111,6 +2111,7 @@ async function handleRequest(request, env) {
   if (path === "/login" || path === "/portal" || path === "/portal/") return html(renderLogin());
   if (path.startsWith("/portal/")) return html(renderPortalApp());
   if (path === "/check-in" || path === "/checkin") return html(renderCheckin());
+  if (path.startsWith("/m/")) return html(matRedirectPage());
   if (path.startsWith("/media/foto/")) return await serveFoto(request, env, path, url);
   if (path === "/webhook/whatsapp") return await whatsappWebhook(request, env, url);
   // Cualquier otra ruta -> SPA interna (en cliente decide: login / dashboard / portal según rol)
@@ -2353,6 +2354,7 @@ function logout(){localStorage.clear();location.href='/login';}
 function setActive(id){var as=document.querySelectorAll('.nav a');as.forEach(function(a){a.classList.toggle('active',a.dataset.id===id);});}
 
 async function go(id){
+  MAT_CTRL=null;
   setActive(id);document.getElementById('side').classList.remove('open');
   document.getElementById('acciones').innerHTML='';
   var t={dashboard:'Dashboard',clientes:'Clientes / CRM',cotizaciones:'Cotizaciones',inventario:'Inventario',proyectos:'Proyectos',cortes:'Cortes',trazabilidad:'Trazabilidad',empleados:'Empleados',whatsapp:'WhatsApp',reportes:'Reportes',config:'Configuración'};
@@ -3266,6 +3268,7 @@ function renderFicha(){
 
 var INV_PROD=[];
 var INV_PUEDE_EDITAR=false;
+var MAT_CTRL=null;
 async function viewInventario(c){
   INV_PUEDE_EDITAR=(USER.rol==='admin'||USER.rol==='gerente');
   var acc='';
@@ -3341,7 +3344,7 @@ function movUI(prodId){
 async function enviarMov(prodId){
   var b={tipo:val('mvTipo'),cantidad:val('mvCant'),motivo:val('mvMotivo'),referencia:val('mvRef'),notas:val('mvNotas')};
   var d=await api('/api/productos/'+prodId+'/movimiento',{method:'POST',body:JSON.stringify(b)});
-  if(d&&d.ok){closeModal();toast('Movimiento registrado · stock: '+d.data.stock_actual+(d.data.bajo_minimo?' (¡bajo mínimo!)':''));viewInventario(document.getElementById('content'));}else if(d){toast(d.error);}
+  if(d&&d.ok){closeModal();toast('Movimiento registrado · stock: '+d.data.stock_actual+(d.data.bajo_minimo?' (¡bajo mínimo!)':''));if(MAT_CTRL){abrirMaterialControl(MAT_CTRL);}else{viewInventario(document.getElementById('content'));}}else if(d){toast(d.error);}
 }
 async function historialProd(prodId){
   var d=await api('/api/productos/'+prodId+'/movimientos');if(!d||!d.ok)return;
@@ -3354,18 +3357,88 @@ async function historialProd(prodId){
 function qrProducto(prodId){
   var p=INV_PROD.find(function(x){return x.id===prodId;})||{};
   if(typeof qrcode==='undefined'){toast('Generador de QR no cargó, reintenta');return;}
-  var texto=(p.sku||'')+' · '+(p.nombre||'');
-  var qr=qrcode(0,'M');qr.addData(texto);qr.make();
-  var url=qr.createDataURL(6,8);
-  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">Etiqueta QR</h3>'+
-    '<div style="text-align:center"><img id="qrImg" src="'+url+'" style="background:#fff;padding:8px;border-radius:6px;max-width:220px"><p style="margin-top:.5rem"><strong>'+escAttr(p.sku||'')+'</strong></p><p class="muted" style="font-size:.85rem">'+escAttr(p.nombre||'')+'</p></div>'+
-    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="descargarQR('+JSON.stringify(p.sku||'qr')+')">Descargar PNG</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>');
+  var clave=p.sku?p.sku:String(p.id);
+  var url=location.origin+'/m/'+encodeURIComponent(clave);
+  var qr=qrcode(0,'M');qr.addData(url);qr.make();
+  var img=qr.createDataURL(6,8);
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Etiqueta del material</h3>'+
+    '<p class="muted" style="font-size:.82rem;margin-bottom:.7rem">Imprime y pega esta etiqueta en la losa o el rack. Al escanear el QR se abre el control de este material en el sistema: stock, ubicación, costo y movimientos.</p>'+
+    '<div id="qrLabel" style="text-align:center;background:#fff;padding:16px;border-radius:8px">'+
+      '<img id="qrImg" src="'+img+'" style="width:200px;height:200px;display:block;margin:0 auto">'+
+      '<div style="font-family:Georgia,serif;font-size:1.25rem;color:#1a1a1a;margin-top:.35rem;line-height:1.15">'+escAttr(p.nombre||'')+'</div>'+
+      '<div style="font-size:.85rem;color:#555;letter-spacing:.05em;margin-top:.1rem">'+escAttr(p.sku||'')+'</div>'+
+      '<div style="font-size:.68rem;color:#999;margin-top:.25rem;letter-spacing:.06em">ESCANEA PARA CONTROL DE INVENTARIO · ASLAN</div>'+
+    '</div>'+
+    '<p class="muted" style="font-size:.72rem;margin-top:.5rem;word-break:break-all">Abre: '+escAttr(url)+'</p>'+
+    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="descargarQR('+prodId+')">Descargar PNG</button><button class="btn sec" onclick="imprimirEtiqueta()">Imprimir</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>');
 }
-function descargarQR(sku){
+function descargarQR(prodId){
+  var p=INV_PROD.find(function(x){return x.id===prodId;})||{};
+  var sku=p.sku||String(prodId);
   var img=document.getElementById('qrImg');if(!img)return;
   var cv=document.createElement('canvas');cv.width=img.naturalWidth;cv.height=img.naturalHeight;
   cv.getContext('2d').drawImage(img,0,0);
   var a=document.createElement('a');a.href=cv.toDataURL('image/png');a.download='QR-'+sku+'.png';a.click();
+}
+function imprimirEtiqueta(){
+  var el=document.getElementById('qrLabel');if(!el)return;
+  var w=window.open('','_blank','width=420,height=560');
+  if(!w){toast('Permite ventanas emergentes para imprimir');return;}
+  w.document.write('<html><head><title>Etiqueta ASLAN</title></head><body style="margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:Georgia,serif">'+el.outerHTML+'</body></html>');
+  w.document.close();
+  setTimeout(function(){try{w.focus();w.print();}catch(e){}},300);
+}
+function irInv(){go('inventario');}
+function controlMaterialHTML(p){
+  var bajo=(Number(p.stock_actual)<=Number(p.stock_minimo));
+  var color=Number(p.stock_actual)<=0?'var(--err)':(bajo?'var(--warn)':'var(--ok)');
+  var estado=Number(p.stock_actual)<=0?'Sin existencias':(bajo?'En o bajo el mínimo':'En existencia');
+  var h='<a class="back" onclick="irInv()">&larr; Volver a inventario</a>';
+  h+='<div class="card"><h2 class="serif" style="color:var(--gold);font-size:1.7rem;line-height:1.1;margin:0">'+escAttr(p.nombre||'—')+'</h2>'+
+     '<p class="muted" style="margin-top:.25rem">'+(p.sku?('<strong>'+escAttr(p.sku)+'</strong>'):'')+(p.categoria?(' · '+escAttr(p.categoria)):'')+(p.acabado?(' · '+escAttr(p.acabado)):'')+'</p></div>';
+  h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem;margin:1rem 0">'+
+     '<div class="card" style="text-align:center"><div style="font-size:2rem;font-weight:700;color:'+color+'">'+(p.stock_actual!=null?p.stock_actual:0)+' <span style="font-size:.9rem">'+(p.unidad||'')+'</span></div><div class="muted" style="font-size:.74rem;text-transform:uppercase;letter-spacing:.04em">Stock actual · '+estado+'</div></div>'+
+     '<div class="card" style="text-align:center"><div style="font-size:2rem;font-weight:700">'+(p.stock_minimo!=null?p.stock_minimo:0)+'</div><div class="muted" style="font-size:.74rem;text-transform:uppercase;letter-spacing:.04em">Stock mínimo</div></div>'+
+     '<div class="card" style="text-align:center"><div style="font-size:1.3rem;font-weight:700;line-height:1.3;margin-top:.3rem">'+escAttr(p.ubicacion_almacen||'Sin asignar')+'</div><div class="muted" style="font-size:.74rem;text-transform:uppercase;letter-spacing:.04em">Ubicación en almacén</div></div>'+
+     '</div>';
+  if(bajo)h+='<div class="card" style="border-color:var(--warn);background:rgba(255,193,7,.08)"><strong style="color:var(--warn)">Conviene reabastecer.</strong> <span class="muted">El stock está en o por debajo del mínimo definido.</span></div>';
+  h+='<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin:1rem 0">'+
+     '<button class="btn" onclick="movUI('+p.id+')">Registrar entrada / salida</button>'+
+     '<button class="btn sec" onclick="qrProducto('+p.id+')">Ver / imprimir QR</button>'+
+     '</div>';
+  var filas='';
+  function row(k,v){if(v!=null&&String(v).trim()!=='')filas+='<tr><td class="muted">'+k+'</td><td style="text-align:right">'+escAttr(String(v))+'</td></tr>';}
+  row('Dimensiones',p.dimensiones);
+  row('Procedencia',p.procedencia);
+  row('Unidad de venta',p.unidad);
+  if(INV_PUEDE_EDITAR){row('Precio costo',money(p.precio_costo));row('Precio venta',money(p.precio_venta));}
+  if(p.notas_tecnicas)row('Notas técnicas',p.notas_tecnicas);
+  if(filas)h+='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.2rem;margin-bottom:.4rem">Ficha técnica</h3><table>'+filas+'</table></div>';
+  h+='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.2rem;margin-bottom:.4rem">Movimientos recientes</h3><div id="matMovs" class="muted">Cargando…</div></div>';
+  return h;
+}
+async function abrirMaterialControl(clave){
+  try{setActive('inventario');}catch(e){}
+  var sd=document.getElementById('side');if(sd)sd.classList.remove('open');
+  document.getElementById('acciones').innerHTML='';
+  document.getElementById('titulo').textContent='Inventario';
+  var c=document.getElementById('content');c.innerHTML='Cargando material…';
+  INV_PUEDE_EDITAR=(USER.rol==='admin'||USER.rol==='gerente');
+  var d=await api('/api/productos');
+  if(!d||!d.ok){c.innerHTML='<a class="back" onclick="irInv()">&larr; Inventario</a><div class="card"><p class="muted">No se pudo cargar el inventario.</p></div>';return;}
+  INV_PROD=d.data;
+  var p=null,i;
+  for(i=0;i<d.data.length;i++){var x=d.data[i];if((x.sku&&String(x.sku)===String(clave))||String(x.id)===String(clave)){p=x;break;}}
+  if(!p){MAT_CTRL=null;c.innerHTML='<a class="back" onclick="irInv()">&larr; Inventario</a><div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem">Material no encontrado</h3><p class="muted" style="margin-top:.5rem">El código «'+escAttr(String(clave))+'» no corresponde a un material del inventario.</p></div>';return;}
+  MAT_CTRL=p.sku?p.sku:String(p.id);
+  c.innerHTML=controlMaterialHTML(p);
+  var dm=await api('/api/productos/'+p.id+'/movimientos');
+  var mc=document.getElementById('matMovs');if(!mc)return;
+  if(dm&&dm.ok&&dm.data.length){
+    var hh='<div style="max-height:240px;overflow:auto"><table><thead><tr><th>Fecha</th><th>Tipo</th><th>Cant.</th><th>Motivo</th></tr></thead><tbody>';
+    dm.data.slice(0,30).forEach(function(m){hh+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+(m.created_at||'')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+escAttr(m.motivo||'—')+'</td></tr>';});
+    hh+='</tbody></table></div>';mc.innerHTML=hh;
+  }else{mc.innerHTML='<p class="muted">Sin movimientos registrados.</p>';}
 }
 async function viewMovimientos(){
   document.getElementById('acciones').innerHTML='';
@@ -3735,13 +3808,18 @@ async function cargarCFG(){try{var d=await api('/api/config');if(d&&d.ok)CFG=d.d
 cargarCFG();
 renderNav();
 if(USER.debe_cambiar){toast('Recuerda cambiar tu contraseña en Configuración');}
-go('dashboard');
+var _mat=null;try{_mat=sessionStorage.getItem('aslan_mat');if(_mat)sessionStorage.removeItem('aslan_mat');}catch(e){}
+if(_mat){abrirMaterialControl(_mat);}else{go('dashboard');}
 </script></body></html>`;
 }
 
 // ============================================================================
 //  FRONTEND — CHECK-IN GPS (standalone móvil)
 // ============================================================================
+function matRedirectPage() {
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASLAN · Material</title><style>body{background:#0f0f0f;color:#8B6D3F;font-family:'Montserrat',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;letter-spacing:.06em}</style></head><body><div>Abriendo material…</div><script>try{var pp=location.pathname,ix=pp.indexOf('/m/');if(ix>=0){var sk=decodeURIComponent(pp.substring(ix+3).split('?')[0].split('#')[0]);if(sk)sessionStorage.setItem('aslan_mat',sk);}}catch(e){}var t=localStorage.getItem('aslan_token');location.replace(t?'/dashboard':'/login');</script></body></html>`;
+}
+
 function renderCheckin() {
   return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ASLAN · Check-in</title>${FONTS}<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script><style>${baseStyles(false)}
