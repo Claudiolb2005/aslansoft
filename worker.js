@@ -2143,6 +2143,7 @@ a{color:var(--gold2);text-decoration:none}
 .btn:hover{background:var(--gold2)}
 .btn.sec{background:transparent;border:1px solid var(--gold);color:var(--gold2)}
 .btn.ok{background:var(--ok)} .btn.err{background:var(--err)} .btn.block{width:100%}
+.back{cursor:pointer;color:var(--gold2);font-size:.85rem;margin:0 0 .7rem;display:inline-block;background:none;border:none;padding:0;font-family:inherit;text-align:left}
 input,select,textarea{background:#111;border:1px solid var(--bd);color:var(--txt);padding:.65rem .8rem;border-radius:4px;font-family:inherit;width:100%;font-size:.92rem}
 input:focus,select,textarea:focus{outline:none;border-color:var(--gold)}
 label{display:block;font-size:.78rem;color:var(--txt2);margin:.6rem 0 .25rem;text-transform:uppercase;letter-spacing:.04em}
@@ -3367,21 +3368,21 @@ function descargarQR(sku){
   var a=document.createElement('a');a.href=cv.toDataURL('image/png');a.download='QR-'+sku+'.png';a.click();
 }
 async function viewMovimientos(){
-  document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button>';
+  document.getElementById('acciones').innerHTML='';
   document.getElementById('titulo').textContent='Movimientos de inventario';
   var c=document.getElementById('content');var d=await api('/api/movimientos');if(!d||!d.ok)return;
-  var h='<div class="card" style="overflow-x:auto"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cant.</th><th>Motivo</th><th>Ref.</th><th>Usuario</th></tr></thead><tbody>';
+  var h='<button class="back" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button><div class="card" style="overflow-x:auto"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cant.</th><th>Motivo</th><th>Ref.</th><th>Usuario</th></tr></thead><tbody>';
   d.data.forEach(function(m){h+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+(m.created_at||'')+'</td><td>'+(m.producto||'—')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+(m.motivo||'—')+'</td><td>'+(m.referencia||'—')+'</td><td class="muted">'+(m.usuario||'—')+'</td></tr>';});
   if(!d.data.length)h+='<tr><td colspan="7" class="muted">Sin movimientos registrados.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 async function viewAlertas(){
-  document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button>';
+  document.getElementById('acciones').innerHTML='';
   document.getElementById('titulo').textContent='Alertas de stock';
   var c=document.getElementById('content');var d=await api('/api/productos');if(!d||!d.ok)return;
   INV_PROD=d.data;
   var bajos=d.data.filter(function(p){return p.stock_actual<=p.stock_minimo;});
-  var h='<div class="card"><table><thead><tr><th>SKU</th><th>Material</th><th>Stock</th><th>Mín</th><th></th></tr></thead><tbody>';
+  var h='<button class="back" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button><div class="card"><table><thead><tr><th>SKU</th><th>Material</th><th>Stock</th><th>Mín</th><th></th></tr></thead><tbody>';
   bajos.forEach(function(p){
     var color=p.stock_actual<=0?'var(--err)':'var(--warn)';
     h+='<tr><td class="muted">'+(p.sku||'—')+'</td><td>'+p.nombre+'</td><td style="color:'+color+';font-weight:600">'+p.stock_actual+' '+p.unidad+'</td><td class="muted">'+p.stock_minimo+'</td><td><button class="btn sec" style="padding:.25rem .55rem" onclick="movUI('+p.id+')">Registrar entrada</button></td></tr>';
@@ -3390,10 +3391,10 @@ async function viewAlertas(){
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 async function viewProveedores(){
-  document.getElementById('acciones').innerHTML=(USER.rol==='admin'||USER.rol==='gerente'?'<button class="btn" onclick="nuevoProveedor()">+ Nuevo proveedor</button> ':'')+'<button class="btn sec" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button>';
+  document.getElementById('acciones').innerHTML=(USER.rol==='admin'||USER.rol==='gerente'?'<button class="btn" onclick="nuevoProveedor()">+ Nuevo proveedor</button> ':'');
   document.getElementById('titulo').textContent='Proveedores';
   var c=document.getElementById('content');var d=await api('/api/proveedores');if(!d||!d.ok)return;
-  var h='<div class="card" style="overflow-x:auto"><table><thead><tr><th>Nombre</th><th>País</th><th>Contacto</th><th>Teléfono</th><th>Email</th><th>Entrega (días)</th></tr></thead><tbody>';
+  var h='<button class="back" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button><div class="card" style="overflow-x:auto"><table><thead><tr><th>Nombre</th><th>País</th><th>Contacto</th><th>Teléfono</th><th>Email</th><th>Entrega (días)</th></tr></thead><tbody>';
   d.data.forEach(function(p){h+='<tr><td>'+p.nombre+'</td><td>'+(p.pais||'—')+'</td><td>'+(p.contacto||'—')+'</td><td>'+(p.telefono||'—')+'</td><td>'+(p.email||'—')+'</td><td>'+(p.tiempo_entrega_dias||'—')+'</td></tr>';});
   if(!d.data.length)h+='<tr><td colspan="6" class="muted">Sin proveedores.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
@@ -3439,7 +3440,7 @@ async function abrirProyecto(id){
   if(!d||!d.ok){c.innerHTML='<div class="card">'+((d&&d.error)||'Error')+'<br><span class="back" onclick="go(\\'proyectos\\')">‹ Volver</span></div>';return;}
   var p=d.data.proyecto, cli=d.data.cliente||{}, acc=d.data.acceso||{};
   var puede=(USER.rol==='admin'||USER.rol==='gerente');
-  var h='<span class="back" onclick="go(\\'proyectos\\')" style="cursor:pointer;color:var(--gold2)">‹ Volver a proyectos</span>';
+  var h='<span class="back" onclick="go(\\'proyectos\\')">‹ Volver a proyectos</span>';
   h+='<div class="hd" style="margin-top:.4rem"><h2 style="font-size:1.6rem">'+(p.folio||'')+'</h2></div>';
   h+='<p class="muted" style="margin-top:-.6rem;margin-bottom:1rem">'+(p.descripcion||'')+' · Cliente: '+(cli.nombre||'—')+(cli.empresa?(' ('+cli.empresa+')'):'')+'</p>';
 
@@ -3562,7 +3563,11 @@ function estadoCotSel(e,id){
   return '<select style="width:auto;padding:.25rem .4rem;font-size:.78rem" onchange="cambiarEstadoCot('+id+',this.value)">'+ops+'</select>';
 }
 async function cambiarEstadoCot(id,estado){var d=await api('/api/cotizaciones/'+id,{method:'PUT',body:JSON.stringify({estado:estado})});if(d&&d.ok)toast('Estado: '+estado);}
-async function convertirCot(id){if(!confirm('¿Convertir esta cotización en proyecto?'))return;var d=await api('/api/cotizaciones/'+id+'/convertir',{method:'POST',body:JSON.stringify({})});if(d&&d.ok){toast('Proyecto '+d.data.folio+' creado');go('proyectos');}else if(d){toast(d.error);}}
+var _CONFIRM_CB=null;
+function confirmModal(msg,txtOk,cb){_CONFIRM_CB=cb;openModal('<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Confirmar</h3><p style="font-size:.92rem;line-height:1.5;margin-bottom:1.1rem">'+msg+'</p><div style="display:flex;gap:.5rem"><button class="btn" onclick="confirmModalOk()">'+(txtOk||'Aceptar')+'</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');}
+function confirmModalOk(){var cb=_CONFIRM_CB;_CONFIRM_CB=null;if(typeof closeModal==='function')closeModal();if(typeof cb==='function')cb();}
+function convertirCot(id){confirmModal('¿Convertir esta cotización en proyecto? Se creará un proyecto ligado a esta cotización.','Sí, convertir',function(){_convertirCot(id);});}
+async function _convertirCot(id){var d=await api('/api/cotizaciones/'+id+'/convertir',{method:'POST',body:JSON.stringify({})});if(d&&d.ok){toast('Proyecto '+d.data.folio+' creado');go('proyectos');}else if(d){toast(d.error);}}
 
 var COT_PROD=[];var cotSeq=0;
 async function nuevaCotizacion(preselectId){
@@ -3574,7 +3579,7 @@ async function nuevaCotizacion(preselectId){
   COT_PROD=dp.data;
   var cliOpts='<option value="">— Selecciona cliente —</option>';
   dc.data.forEach(function(cl){var sel=(preselectId&&String(cl.id)===String(preselectId))?' selected':'';cliOpts+='<option value="'+cl.id+'"'+sel+'>'+escAttr(cl.nombre)+(cl.empresa?(' · '+escAttr(cl.empresa)):'')+'</option>';});
-  var h='<span class="back" onclick="volverCot()" style="cursor:pointer;color:var(--gold2)">‹ Volver</span>';
+  var h='<span class="back" onclick="volverCot()">‹ Volver</span>';
   h+='<div class="card" style="margin-top:.5rem">';
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
   h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
@@ -3842,7 +3847,6 @@ function renderPortalApp() {
 .msg{max-width:78%;padding:.6rem .9rem;border-radius:12px;margin:.4rem 0;font-size:.88rem}
 .msg.aslan{background:#222;border:1px solid var(--bd)}
 .msg.cliente{background:var(--gold);color:#fff;margin-left:auto}
-.back{cursor:pointer;color:var(--gold2);font-size:.85rem;margin-bottom:.6rem;display:inline-block}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:4000;padding:1rem}
 .modal.open{display:flex}
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:380px;width:100%}
@@ -3859,6 +3863,12 @@ function renderPortalApp() {
 <div style="height:.8rem"></div><button class="btn block" onclick="calcular()">Calcular</button>
 <div id="calcRes" style="margin-top:.9rem;text-align:center"></div>
 <button class="btn sec block" style="margin-top:.6rem" onclick="document.getElementById('calcModal').classList.remove('open')">Cerrar</button>
+</div></div>
+<div class="modal" id="revModal"><div class="inner">
+<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Solicitar revisión</h3>
+<p class="muted" style="font-size:.86rem;margin-bottom:.5rem">Cuéntanos qué te gustaría revisar o cambiar de este material. Tu asesor lo recibirá.</p>
+<label>Comentario</label><textarea id="revNota" rows="4" placeholder="Ej. El tono se ve más claro de lo que esperaba…"></textarea>
+<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="enviarRevision()">Enviar solicitud</button><button class="btn sec" onclick="document.getElementById('revModal').classList.remove('open')">Cancelar</button></div>
 </div></div>
 <script>
 var TOKEN=localStorage.getItem('aslan_token');
@@ -3936,8 +3946,8 @@ async function detalle(id){
       h+='<div style="border-bottom:1px solid var(--bd);padding:.6rem 0"><p>'+(l.descripcion_losa||'')+'</p>';
       if(l.estado==='pendiente'){
         h+='<p class="muted" style="font-size:.85rem;margin:.4rem 0">Revisa y aprueba para que comencemos el corte.</p>'+
-           '<div style="display:flex;gap:.5rem;flex-wrap:wrap"><button class="btn ok" onclick="aprobar('+id+','+l.id+',true)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.35rem"><path d="M5 12l4 4 10-10"/></svg>Aprobar este material</button>'+
-           '<button class="btn sec" onclick="aprobar('+id+','+l.id+',false)">Solicitar revisión</button></div>';
+           '<div style="display:flex;gap:.5rem;flex-wrap:wrap"><button class="btn ok" onclick="aprobar('+id+','+l.id+')"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.35rem"><path d="M5 12l4 4 10-10"/></svg>Aprobar este material</button>'+
+           '<button class="btn sec" onclick="pedirRevision('+id+','+l.id+')">Solicitar revisión</button></div>';
       }else if(l.estado==='aprobado'){
         h+='<p style="color:var(--ok);font-size:.88rem;margin-top:.3rem"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12l4 4 10-10"/></svg>Material aprobado'+(l.respondido_en?' el '+fecha(l.respondido_en):'')+'</p>';
       }else{
@@ -3975,10 +3985,18 @@ async function detalle(id){
   document.getElementById('app').innerHTML=h;
   var ch=document.getElementById('chat');if(ch)ch.scrollTop=ch.scrollHeight;
 }
-async function aprobar(proy,losa,ap){
-  if(!ap){var nota=prompt('¿Qué te gustaría revisar?');if(nota===null)return;var d=await api('/api/portal/proyectos/'+proy+'/losa/aprobar',{method:'POST',body:JSON.stringify({losa_id:losa,aprobado:false,nota:nota})});}
-  else{var d=await api('/api/portal/proyectos/'+proy+'/losa/aprobar',{method:'POST',body:JSON.stringify({losa_id:losa,aprobado:true})});}
-  if(d&&d.ok){toast(ap?'¡Material aprobado!':'Revisión solicitada');detalle(proy);}
+var REV_CTX=null;
+function pedirRevision(proy,losa){REV_CTX={proy:proy,losa:losa};var t=document.getElementById('revNota');if(t)t.value='';document.getElementById('revModal').classList.add('open');}
+async function enviarRevision(){
+  if(!REV_CTX)return;
+  var nota=(document.getElementById('revNota').value||'').trim();
+  var d=await api('/api/portal/proyectos/'+REV_CTX.proy+'/losa/aprobar',{method:'POST',body:JSON.stringify({losa_id:REV_CTX.losa,aprobado:false,nota:nota})});
+  document.getElementById('revModal').classList.remove('open');
+  if(d&&d.ok){toast('Revisión solicitada');detalle(REV_CTX.proy);}else if(d){toast(d.error||'Error');}
+}
+async function aprobar(proy,losa){
+  var d=await api('/api/portal/proyectos/'+proy+'/losa/aprobar',{method:'POST',body:JSON.stringify({losa_id:losa,aprobado:true})});
+  if(d&&d.ok){toast('¡Material aprobado!');detalle(proy);}else if(d){toast(d.error||'Error');}
 }
 async function enviar(id){
   var inp=document.getElementById('msgInput');if(!inp.value.trim())return;
