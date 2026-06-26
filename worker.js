@@ -813,6 +813,19 @@ async function handleClientes(request, env, payload, method, id) {
   if (method === "POST") {
     const b = await request.json().catch(() => ({}));
     if (!b.nombre) return fail("El nombre es obligatorio.");
+    if (!b.force) {
+      const dcond = [], dbind = [];
+      const dnom = (b.nombre || "").trim();
+      if (dnom) { dcond.push("LOWER(TRIM(nombre)) = LOWER(?)"); dbind.push(dnom); }
+      const dtel = (b.telefono || "").toString().replace(/[^0-9]/g, "");
+      if (dtel) { dcond.push("REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(IFNULL(telefono,''),' ',''),'-',''),'(',''),')',''),'+',''),'.','') = ?"); dbind.push(dtel); }
+      const dem = (b.email || "").trim();
+      if (dem) { dcond.push("LOWER(TRIM(email)) = LOWER(?)"); dbind.push(dem); }
+      if (dcond.length) {
+        const dup = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL AND (" + dcond.join(" OR ") + ") LIMIT 10").bind(...dbind).all();
+        if ((dup.results || []).length) return ok({ duplicado: true, existentes: dup.results });
+      }
+    }
     const res = await env.DB.prepare(
       "INSERT INTO clientes (nombre,empresa,tipo,etapa,telefono,email,ciudad,direccion,rfc,notas,empleado_asignado_id,fecha_lead,origen,validacion,estatus_final,asesor,estatus_nota,fecha_contacto,propuesta_factura,notas_vero,notas_actualizacion,notas_seguimiento,material,propuesta_antes_iva,moneda,facturado) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(b.nombre, b.empresa || null, b.tipo || null, b.etapa || "prospecto", b.telefono || null,
@@ -924,6 +937,25 @@ async function agregarNotaCliente(request, env, payload, id) {
   const res = await env.DB.prepare("INSERT INTO notas_crm (cliente_id,usuario_id,nota) VALUES (?,?,?)").bind(id, payload.sub, nota).run();
   await audit(env, payload.sub, "nota", "clientes", id, { nota }, request);
   return ok({ id: res.meta.last_row_id });
+}
+
+// Detecta posibles duplicados (telefono, correo o nombre) y los agrupa
+async function duplicadosClientes(env) {
+  const r = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL").all();
+  const rows = r.results || [];
+  const norm = (s) => (s == null ? "" : String(s)).toLowerCase().trim().replace(/\s+/g, " ");
+  const dig = (s) => (s == null ? "" : String(s)).replace(/[^0-9]/g, "");
+  function agrupar(keyFn, tipo) {
+    const map = {};
+    for (const x of rows) { const k = keyFn(x); if (!k) continue; (map[k] = map[k] || []).push(x); }
+    return Object.keys(map).filter((k) => map[k].length > 1).map((k) => ({ tipo, clave: k, miembros: map[k] }));
+  }
+  const grupos = [].concat(
+    agrupar((x) => dig(x.telefono), "Teléfono"),
+    agrupar((x) => norm(x.email), "Correo"),
+    agrupar((x) => norm(x.nombre), "Nombre")
+  );
+  return ok({ grupos, total: grupos.length });
 }
 
 async function siguienteFolio(env, prefijo, tabla) {
@@ -2011,6 +2043,7 @@ async function handleRequest(request, env) {
     if (path === "/api/dashboard/charts") return await dashboardCharts(env);
 
     let m;
+    if (path === "/api/clientes/duplicados" && method === "GET") return await duplicadosClientes(env);
     m = path.match(/^\/api\/clientes\/(\d+)\/ficha$/);
     if (m && method === "GET") return await fichaCliente(env, m[1]);
     m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
@@ -2207,6 +2240,11 @@ function renderApp() {
 .flink{color:var(--gold);cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}
 .tl{display:flex;flex-direction:column;gap:.5rem}
 .tl-item{background:#0f0f0f;border-left:2px solid var(--gold);border-radius:6px;padding:.45rem .6rem;font-size:.86rem}
+.crmfilt{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;padding:.6rem;margin-bottom:.6rem}
+.crmfilt input,.crmfilt select{width:auto;min-width:120px;padding:.4rem .55rem;font-size:.82rem;margin:0}
+.crmfilt input[type=number]{min-width:110px}
+.crmkpis{margin-bottom:.7rem}
+.crmkpis .kpi{padding:.5rem .7rem}
 .layout{display:flex;min-height:100vh}
 .side{width:240px;background:#111;border-right:1px solid var(--bd);padding:1.2rem .8rem;flex-shrink:0;position:sticky;top:0;height:100vh;align-self:flex-start;display:flex;flex-direction:column;overflow-y:auto}
 .side h1{color:var(--gold);font-size:1.8rem;letter-spacing:.3em;text-align:center;margin-bottom:1.4rem}
@@ -2777,12 +2815,15 @@ var CRM_ESTATUS=['SIN RESPUESTA','SEGUIMIENTO','PRECIO','MATERIAL','OTRO'];
 async function viewClientes(c){
   document.getElementById('acciones').innerHTML=
     '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">📋 Tabla</button> '+
-    '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">📊 Tablero por estatus</button> '+
+    '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">📊 Tablero</button> '+
     '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button> '+
-    '<input id="crmq" placeholder="Buscar contacto, material, asesor..." oninput="filtrarCRM()" style="display:inline-block;width:auto;min-width:220px;margin:0 .4rem;padding:.45rem .7rem"> '+
+    '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">🔍 Duplicados</button> '+
     '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>';
+  var cont=document.getElementById('content');
+  cont.innerHTML='<div id="crmFiltros"></div><div id="crmResumen"></div><div id="crmBody">Cargando…</div>';
   var d=await api('/api/clientes');if(!d||!d.ok)return;
   CRM_ROWS=d.data;
+  pintarFiltros();
   renderCRM();
 }
 function setVistaCRM(v){
@@ -2792,17 +2833,34 @@ function setVistaCRM(v){
   if(bb)bb.className=(v==='tablero'?'btn':'btn sec');
   renderCRM();
 }
+function valFil(id){var e=document.getElementById(id);return e?(''+e.value):'';}
 function filasCRMFiltradas(){
-  var e=document.getElementById('crmq');var q=(e?e.value:'').toLowerCase().trim();
-  if(!q)return CRM_ROWS;
-  return CRM_ROWS.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>=0;});
+  var q=valFil('crmq').toLowerCase().trim();
+  var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact');
+  var mn=parseFloat(valFil('fMin')),mx=parseFloat(valFil('fMax'));
+  return CRM_ROWS.filter(function(r){
+    if(q && JSON.stringify(r).toLowerCase().indexOf(q)<0)return false;
+    if(as && (r.asesor||'').trim()!==as)return false;
+    if(es){var st=(r.estatus_nota||'').trim().toUpperCase();if(es==='__SIN__'){if(st!=='')return false;}else if(st!==es.toUpperCase())return false;}
+    var fl=(r.fecha_lead||'');
+    if(an && fl.slice(0,4)!==an)return false;
+    if(me && fl.slice(5,7)!==me)return false;
+    var fact=Number(r.facturado)||0;
+    if(fa==='con' && !(fact>0))return false;
+    if(fa==='sin' && fact>0)return false;
+    var monto=(r.propuesta_antes_iva!=null)?(Number(r.propuesta_antes_iva)||0):0;
+    if(!isNaN(mn) && monto<mn)return false;
+    if(!isNaN(mx) && monto>mx)return false;
+    return true;
+  });
 }
 function renderCRM(){
   var rows=filasCRMFiltradas();
+  pintarResumen(rows);
   if(CRM_VISTA==='tablero')pintarTableroCRM(rows);else pintarCRM(rows);
 }
 function pintarCRM(rows){
-  var c=document.getElementById('content');
+  var c=document.getElementById('crmBody')||document.getElementById('content');
   var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Doble clic en una celda para editar (estilo Excel); se guarda solo al salir de la celda. Desliza horizontalmente para ver todas las columnas. Registros: '+rows.length+'.</p>';
   var h=nota+'<div class="card" style="overflow-x:auto;padding:.4rem"><table class="crmtable"><thead><tr>'+
     '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
@@ -2848,7 +2906,7 @@ function tcardCRM(r){
     '</div>';
 }
 function pintarTableroCRM(rows){
-  var c=document.getElementById('content');
+  var c=document.getElementById('crmBody')||document.getElementById('content');
   var cols=CRM_ESTATUS.concat(['(Sin estatus)']);
   var color={'SIN RESPUESTA':'var(--err)','SEGUIMIENTO':'var(--gold)','PRECIO':'#5B8DEF','MATERIAL':'var(--ok)','OTRO':'#9C7BD6','(Sin estatus)':'#888'};
   var grupos={};cols.forEach(function(k){grupos[k]=[];});
@@ -2887,11 +2945,90 @@ async function guardarCeldaCRM(el){
     if(num)el.textContent=(body[campo]==null?'':money(body[campo]));
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
+var PEND_CLIENTE=null;
 async function nuevoCliente(){
   var nombre=prompt('Nombre del contacto:');if(!nombre)return;
+  var tel=prompt('Teléfono (opcional, ayuda a evitar duplicados):')||'';
+  crearCliente(nombre, tel, false);
+}
+async function crearCliente(nombre, tel, force){
   var hoy=new Date().toISOString().slice(0,10);
-  var d=await api('/api/clientes',{method:'POST',body:JSON.stringify({nombre:nombre,etapa:'prospecto',fecha_lead:hoy,moneda:'MXN'})});
-  if(d&&d.ok){toast('Registro creado');viewClientes(document.getElementById('content'));}else if(d){toast(d.error);}
+  var body={nombre:nombre,etapa:'prospecto',fecha_lead:hoy,moneda:'MXN'};
+  if(tel)body.telefono=tel;
+  if(force)body.force=true;
+  var d=await api('/api/clientes',{method:'POST',body:JSON.stringify(body)});
+  if(!d)return;
+  if(d.ok && d.data && d.data.duplicado){ PEND_CLIENTE={nombre:nombre,tel:tel}; mostrarDuplicadoAviso(d.data.existentes); return; }
+  if(d.ok){ if(typeof closeModal==='function')closeModal(); toast('Registro creado'); viewClientes(document.getElementById('content')); }
+  else { toast(d.error||'Error'); }
+}
+function crearClienteForzado(){ if(PEND_CLIENTE)crearCliente(PEND_CLIENTE.nombre, PEND_CLIENTE.tel, true); }
+function mostrarDuplicadoAviso(existentes){
+  var h='<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.4rem">Posible duplicado</h3>'+
+    '<p class="muted" style="font-size:.85rem;margin-bottom:.7rem">Ya hay registro(s) parecido(s). Abre el existente para no duplicar, o crea uno nuevo de todos modos.</p>'+
+    '<div style="display:flex;flex-direction:column;gap:.4rem;margin-bottom:1rem">';
+  (existentes||[]).forEach(function(x){
+    h+='<div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.5rem .7rem"><div><strong>'+escAttr(x.nombre||'—')+'</strong>'+(x.empresa?(' · '+escAttr(x.empresa)):'')+'<div class="muted" style="font-size:.76rem">'+escAttr(x.telefono||'')+(x.email?(' · '+escAttr(x.email)):'')+(x.asesor?(' · '+escAttr(x.asesor)):'')+'</div></div><button class="btn" style="padding:.3rem .6rem" onclick="abrirFicha('+x.id+')">Abrir ficha</button></div>';
+  });
+  h+='</div><div style="display:flex;gap:.5rem"><button class="btn sec" onclick="crearClienteForzado()">Crear de todos modos</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>';
+  openModal(h);
+}
+async function verDuplicados(){
+  var d=await api('/api/clientes/duplicados');if(!d||!d.ok){toast('No se pudo revisar');return;}
+  var grupos=d.data.grupos||[];
+  var h='<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.4rem">Posibles duplicados</h3>';
+  if(!grupos.length){ h+='<p class="muted">No se encontraron repetidos por teléfono, correo ni nombre. 👍</p>'; }
+  else{
+    h+='<p class="muted" style="font-size:.84rem;margin-bottom:.7rem">'+grupos.length+' grupo(s). Abre cada ficha para revisar y consolidar.</p>';
+    grupos.forEach(function(g){
+      h+='<div class="card" style="margin-bottom:.6rem;padding:.6rem .8rem"><div class="muted" style="font-size:.74rem;margin-bottom:.3rem">'+escAttr(g.tipo)+': '+escAttr(g.clave)+'</div>';
+      (g.miembros||[]).forEach(function(x){ h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.25rem 0;border-top:1px solid var(--bd)"><div><strong>'+escAttr(x.nombre||'—')+'</strong>'+(x.empresa?(' · '+escAttr(x.empresa)):'')+(x.asesor?('<span class="muted" style="font-size:.74rem"> · '+escAttr(x.asesor)+'</span>'):'')+'</div><button class="btn sec" style="padding:.25rem .55rem" onclick="abrirFicha('+x.id+')">Abrir</button></div>'; });
+      h+='</div>';
+    });
+  }
+  h+='<div style="margin-top:.6rem"><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
+  openModal(h);
+}
+function pintarFiltros(){
+  var box=document.getElementById('crmFiltros');if(!box)return;
+  var ases={};CRM_ROWS.forEach(function(r){var a=(r.asesor||'').trim();if(a)ases[a]=1;});
+  var aopts='<option value="">Asesor: todos</option>';Object.keys(ases).sort().forEach(function(a){aopts+='<option>'+escAttr(a)+'</option>';});
+  var yrs={};CRM_ROWS.forEach(function(r){var y=(r.fecha_lead||'').slice(0,4);if(/^[0-9]{4}$/.test(y))yrs[y]=1;});
+  var yopts='<option value="">Año: todos</option>';Object.keys(yrs).sort().reverse().forEach(function(y){yopts+='<option>'+y+'</option>';});
+  var meses=[['01','Enero'],['02','Febrero'],['03','Marzo'],['04','Abril'],['05','Mayo'],['06','Junio'],['07','Julio'],['08','Agosto'],['09','Septiembre'],['10','Octubre'],['11','Noviembre'],['12','Diciembre']];
+  var mopts='<option value="">Mes: todos</option>';meses.forEach(function(m){mopts+='<option value="'+m[0]+'">'+m[1]+'</option>';});
+  var eopts='<option value="">Estatus: todos</option>';CRM_ESTATUS.forEach(function(s){eopts+='<option>'+escAttr(s)+'</option>';});eopts+='<option value="__SIN__">(Sin estatus)</option>';
+  box.innerHTML='<div class="card crmfilt">'+
+    '<input id="crmq" placeholder="Buscar texto..." oninput="renderCRM()">'+
+    '<select id="fAsesor" onchange="renderCRM()">'+aopts+'</select>'+
+    '<select id="fEstatus" onchange="renderCRM()">'+eopts+'</select>'+
+    '<select id="fAnio" onchange="renderCRM()">'+yopts+'</select>'+
+    '<select id="fMes" onchange="renderCRM()">'+mopts+'</select>'+
+    '<select id="fFact" onchange="renderCRM()"><option value="">Facturación: todas</option><option value="con">Con factura</option><option value="sin">Sin factura</option></select>'+
+    '<input id="fMin" type="number" placeholder="Monto min" oninput="renderCRM()">'+
+    '<input id="fMax" type="number" placeholder="Monto max" oninput="renderCRM()">'+
+    '<button class="btn sec" onclick="soloMios()" title="Filtrar mis registros">Solo míos</button>'+
+    '<button class="btn sec" onclick="limpiarFiltros()">Limpiar</button>'+
+    '</div>';
+}
+function pintarResumen(rows){
+  var box=document.getElementById('crmResumen');if(!box)return;
+  var n=rows.length,sumP=0,sumF=0,conF=0;
+  rows.forEach(function(r){if(r.propuesta_antes_iva!=null)sumP+=Number(r.propuesta_antes_iva)||0;var f=Number(r.facturado)||0;sumF+=f;if(f>0)conF++;});
+  box.innerHTML='<div class="kpis crmkpis">'+kpiCard('Registros',n)+kpiCard('Propuesta s/IVA',money(sumP))+kpiCard('Facturado',money(sumF))+kpiCard('Con factura',conF)+'</div>';
+}
+function soloMios(){
+  var sel=document.getElementById('fAsesor');if(!sel)return;
+  var nom=(typeof USER!=='undefined'&&USER.nombre)?USER.nombre:'';
+  if(!nom){toast('No identifico tu usuario');return;}
+  var found=false;for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===nom||sel.options[i].text===nom){sel.selectedIndex=i;found=true;break;}}
+  if(!found){var o=document.createElement('option');o.text=nom;o.value=nom;sel.add(o);sel.value=nom;}
+  renderCRM();
+}
+function limpiarFiltros(){
+  ['crmq','fMin','fMax'].forEach(function(id){var e=document.getElementById(id);if(e)e.value='';});
+  ['fAsesor','fEstatus','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
+  renderCRM();
 }
 function exportarCRMCSV(){
   var cols=[['fecha_lead','FECHA'],['origen','ORIGEN'],['validacion','VALIDACIÓN'],['estatus_final','ESTATUS FINAL'],['asesor','ASESOR'],['estatus_nota','ESTATUS/NOTA'],['fecha_contacto','FECHA CONTACTO'],['propuesta_factura','PROPUESTA/FACTURA'],['empresa','COMPAÑÍA'],['nombre','CONTACTO'],['notas_vero','NOTAS VERO'],['notas_actualizacion','NOTAS ACTUALIZACION'],['notas_seguimiento','SEGUIMIENTO'],['telefono','TELEFONO'],['email','MAIL'],['material','MATERIAL'],['propuesta_antes_iva','PROPUESTA ANTES IVA'],['moneda','MONEDA'],['facturado','FACTURADO']];
