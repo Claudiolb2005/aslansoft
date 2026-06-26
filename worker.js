@@ -505,6 +505,39 @@ async function migrarV4(env) {
 }
 
 
+let MIGRADO_V5 = false;
+async function migrarV5(env) {
+  if (MIGRADO_V5) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v5_ficha360'").first();
+    if (f && f.valor === "ok") { MIGRADO_V5 = true; return; }
+  } catch (e) { return; }
+  // Campos nuevos de la MATRIZ CRM (idempotente: si ya existen, SQLite lanza y se ignora)
+  const cols = [
+    "ALTER TABLE clientes ADD COLUMN telefono_alt TEXT",
+    "ALTER TABLE clientes ADD COLUMN sitio_web TEXT",
+    "ALTER TABLE clientes ADD COLUMN industria TEXT",
+    "ALTER TABLE clientes ADD COLUMN tipo_origen_lead TEXT",
+    "ALTER TABLE clientes ADD COLUMN proximo_seguimiento TEXT",
+    "ALTER TABLE clientes ADD COLUMN condiciones_pago TEXT",
+    "ALTER TABLE clientes ADD COLUMN linea_credito REAL",
+    "ALTER TABLE clientes ADD COLUMN saldo_actual REAL",
+    "ALTER TABLE clientes ADD COLUMN riesgo_credito TEXT",
+    "ALTER TABLE clientes ADD COLUMN probabilidad_cierre TEXT",
+    "ALTER TABLE clientes ADD COLUMN fecha_cierre_estimada TEXT",
+    "ALTER TABLE clientes ADD COLUMN proxima_accion TEXT",
+    "ALTER TABLE clientes ADD COLUMN cumpleanos TEXT",
+    "ALTER TABLE clientes ADD COLUMN referido_por TEXT"
+  ];
+  for (const sql of cols) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
+  // Tablas de apoyo de la ficha (autocurativo si la BD es previa al esquema completo)
+  try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS notas_crm (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, usuario_id INTEGER, nota TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)").run(); } catch (e) {}
+  try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS contactos_cliente (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, nombre TEXT, cargo TEXT, telefono TEXT, email TEXT, whatsapp TEXT, preferencia_contacto TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)").run(); } catch (e) {}
+  try { await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_notas_crm_cli ON notas_crm(cliente_id)").run(); } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v5_ficha360','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V5 = true;
+}
+
 async function runSetup(env, request) {
   // Solo permitido si no hay admin todavía, o si trae el X-Setup-Token correcto
   let yaHayAdmin = false;
@@ -795,7 +828,7 @@ async function handleClientes(request, env, payload, method, id) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "propuesta_antes_iva", "moneda", "facturado"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
     if (!sets.length) return fail("Nada que actualizar.");
@@ -817,6 +850,82 @@ async function handleClientes(request, env, payload, method, id) {
 //  API — COTIZACIONES
 // ============================================================================
 // Genera el siguiente folio del año: PREFIJO-AÑO-0001
+// ============================================================================
+//  FICHA 360° — concentra TODO de un prospecto/cliente en una sola consulta
+//  Datos + contacto + historial(notas) + cotizaciones + proyectos + trazabilidad
+// ============================================================================
+async function fichaCliente(env, id) {
+  const c = await env.DB.prepare(
+    "SELECT cl.*, u.nombre AS empleado_nombre FROM clientes cl LEFT JOIN usuarios u ON u.id=cl.empleado_asignado_id WHERE cl.id=? AND cl.deleted_at IS NULL"
+  ).bind(id).first();
+  if (!c) return fail("Cliente no encontrado.", 404);
+
+  let contactos = { results: [] }, notas = { results: [] }, cortes = { results: [] };
+  try { contactos = await env.DB.prepare("SELECT * FROM contactos_cliente WHERE cliente_id=? ORDER BY id DESC").bind(id).all(); } catch (e) {}
+  try { notas = await env.DB.prepare("SELECT n.*, u.nombre AS usuario FROM notas_crm n LEFT JOIN usuarios u ON u.id=n.usuario_id WHERE n.cliente_id=? ORDER BY n.created_at DESC, n.id DESC").bind(id).all(); } catch (e) {}
+
+  const cotis = await env.DB.prepare(
+    "SELECT c.id, c.folio, c.estado, c.total, c.created_at, u.nombre AS vendedor," +
+    " (SELECT p.folio FROM proyectos p WHERE p.cotizacion_id=c.id AND p.deleted_at IS NULL LIMIT 1) AS proyecto_folio" +
+    " FROM cotizaciones c LEFT JOIN usuarios u ON u.id=c.usuario_id" +
+    " WHERE c.cliente_id=? AND c.deleted_at IS NULL ORDER BY c.created_at DESC, c.id DESC"
+  ).bind(id).all();
+
+  const proyectos = await env.DB.prepare(
+    "SELECT id, folio, descripcion, estado, etapa_portal, avance_pct, m2_totales, fecha_entrega_estimada" +
+    " FROM proyectos WHERE cliente_id=? AND deleted_at IS NULL ORDER BY id DESC"
+  ).bind(id).all();
+
+  try {
+    cortes = await env.DB.prepare(
+      "SELECT c.id, c.folio, c.cantidad, c.unidad, c.medidas, c.estado," +
+      " p.nombre AS material, p.sku AS material_sku," +
+      " co.folio AS cotizacion_folio, pr.folio AS proyecto_folio, ue.nombre AS cortador" +
+      " FROM cortes c" +
+      " LEFT JOIN productos p ON p.id=c.producto_id" +
+      " LEFT JOIN cotizaciones co ON co.id=c.cotizacion_id" +
+      " LEFT JOIN proyectos pr ON pr.id=c.proyecto_id" +
+      " LEFT JOIN usuarios ue ON ue.id=c.empleado_id" +
+      " WHERE c.cliente_id=? AND c.deleted_at IS NULL ORDER BY c.id DESC"
+    ).bind(id).all();
+  } catch (e) {}
+
+  const rc = cotis.results || [];
+  const totalCotizado = rc.reduce((s, q) => s + (Number(q.total) || 0), 0);
+  const totalAceptado = rc.filter((q) => q.estado === "aceptada").reduce((s, q) => s + (Number(q.total) || 0), 0);
+  const m2 = (cortes.results || []).reduce((s, x) => s + (Number(x.cantidad) || 0), 0);
+
+  return ok({
+    cliente: c,
+    contactos: contactos.results || [],
+    notas: notas.results || [],
+    cotizaciones: rc,
+    proyectos: proyectos.results || [],
+    cortes: cortes.results || [],
+    resumen: {
+      num_cotizaciones: rc.length,
+      total_cotizado: +totalCotizado.toFixed(2),
+      total_aceptado: +totalAceptado.toFixed(2),
+      facturado: Number(c.facturado) || 0,
+      saldo: Number(c.saldo_actual) || 0,
+      m2_cortados: +m2.toFixed(2)
+    }
+  });
+}
+
+// Agregar una entrada a la bitácora (historial de interacciones) del cliente
+async function agregarNotaCliente(request, env, payload, id) {
+  const b = await request.json().catch(() => ({}));
+  const nota = (b.nota || "").trim();
+  if (!nota) return fail("La nota está vacía.");
+  const cli = await env.DB.prepare("SELECT id FROM clientes WHERE id=? AND deleted_at IS NULL").bind(id).first();
+  if (!cli) return fail("Cliente no encontrado.", 404);
+  try { await env.DB.prepare("CREATE TABLE IF NOT EXISTS notas_crm (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, usuario_id INTEGER, nota TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)").run(); } catch (e) {}
+  const res = await env.DB.prepare("INSERT INTO notas_crm (cliente_id,usuario_id,nota) VALUES (?,?,?)").bind(id, payload.sub, nota).run();
+  await audit(env, payload.sub, "nota", "clientes", id, { nota }, request);
+  return ok({ id: res.meta.last_row_id });
+}
+
 async function siguienteFolio(env, prefijo, tabla) {
   const year = new Date().getFullYear();
   const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM " + tabla + " WHERE folio LIKE ?").bind(prefijo + "-" + year + "-%").first();
@@ -1864,6 +1973,7 @@ async function handleRequest(request, env) {
 
   await migrarV3(env);
   await migrarV4(env);
+  await migrarV5(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -1901,6 +2011,10 @@ async function handleRequest(request, env) {
     if (path === "/api/dashboard/charts") return await dashboardCharts(env);
 
     let m;
+    m = path.match(/^\/api\/clientes\/(\d+)\/ficha$/);
+    if (m && method === "GET") return await fichaCliente(env, m[1]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
+    if (m && method === "POST") return await agregarNotaCliente(request, env, payload, m[1]);
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
     if (m) return await handleClientes(request, env, payload, method, m[1]);
     m = path.match(/^\/api\/cotizaciones\/(\d+)\/convertir$/);
@@ -2077,6 +2191,22 @@ function renderApp() {
 .crmc:focus{background:rgba(139,109,63,.16);box-shadow:inset 0 0 0 2px var(--gold)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
+.ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
+.ficha-name{font-family:'Cormorant Garamond',serif;font-size:1.9rem;color:var(--gold);line-height:1.1}
+.ficha-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+.fsec{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:1rem;margin-top:1rem}
+.fsec h3{font-family:'Cormorant Garamond',serif;color:var(--gold);font-size:1.25rem;margin-bottom:.7rem}
+.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.7rem}
+.ffield{display:flex;flex-direction:column;gap:.2rem}
+.ffield label,.fwide label{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:var(--txt2)}
+.fwide{grid-column:1/-1;display:flex;flex-direction:column;gap:.2rem}
+.fedit{background:#0f0f0f;border:1px solid var(--bd);border-radius:8px;padding:.45rem .6rem;font-size:.9rem;color:var(--txt);min-height:1.2rem;outline:none;word-break:break-word}
+.fedit:focus{border-color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
+.fedit:empty:before{content:attr(data-ph);color:var(--txt2);opacity:.45}
+.fnum{font-variant-numeric:tabular-nums;color:var(--gold);font-weight:600}
+.flink{color:var(--gold);cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}
+.tl{display:flex;flex-direction:column;gap:.5rem}
+.tl-item{background:#0f0f0f;border-left:2px solid var(--gold);border-radius:6px;padding:.45rem .6rem;font-size:.86rem}
 .layout{display:flex;min-height:100vh}
 .side{width:240px;background:#111;border-right:1px solid var(--bd);padding:1.2rem .8rem;flex-shrink:0;position:sticky;top:0;height:100vh;align-self:flex-start;display:flex;flex-direction:column;overflow-y:auto}
 .side h1{color:var(--gold);font-size:1.8rem;letter-spacing:.3em;text-align:center;margin-bottom:1.4rem}
@@ -2288,7 +2418,7 @@ function pintarTraza(rows){
     var proy=r.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+r.proyecto_folio+'</span>'):'—';
     h+='<tr><td>'+escAttr(r.material||'—')+(r.material_sku?(' <span class="muted">'+escAttr(r.material_sku)+'</span>'):'')+'</td>'+
        '<td>'+(r.folio||'—')+'</td><td style="white-space:nowrap">'+(r.cantidad||0)+' '+(r.unidad||'')+'</td>'+
-       '<td>'+escAttr(r.cortador||'—')+'</td><td>'+cot+'</td><td>'+escAttr(r.cliente||'—')+(r.cliente_empresa?(' <span class="muted">'+escAttr(r.cliente_empresa)+'</span>'):'')+'</td>'+
+       '<td>'+escAttr(r.cortador||'—')+'</td><td>'+cot+'</td><td>'+(r.cliente_id?('<span class="flink" onclick="abrirFicha('+r.cliente_id+')">'+escAttr(r.cliente||'')+'</span>'):escAttr(r.cliente||'—'))+(r.cliente_empresa?(' <span class="muted">'+escAttr(r.cliente_empresa)+'</span>'):'')+'</td>'+
        '<td>'+escAttr(r.asesor||'—')+'</td><td>'+proy+'</td><td>'+escAttr(r.estado||'—')+'</td></tr>';
   });
   if(!rows.length)h+='<tr><td colspan="9" class="muted">Sin cortes que mostrar. Registra cortes en el módulo Cortes para construir la cadena.</td></tr>';
@@ -2697,7 +2827,7 @@ function pintarCRM(rows){
       crmCell(r,'propuesta_antes_iva',(r.propuesta_antes_iva==null?'':money(r.propuesta_antes_iva)),true)+
       crmCell(r,'moneda',r.moneda)+
       crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
-      '<td style="white-space:nowrap;text-align:center"><button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">📄 '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
+      '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">👤</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">📄 '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
       '</tr>';
   });
   if(!rows.length)h+='<tr><td colspan="20" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
@@ -2714,7 +2844,7 @@ function tcardCRM(r){
     (sub?'<div class="mt">'+escAttr(sub)+'</div>':'')+
     '<div class="mt">'+(r.asesor?('Asesor: '+escAttr(r.asesor)):'Sin asesor')+(monto?(' · '+monto):'')+'</div>'+
     '<select onchange="cambiarEstatusCRM('+r.id+',this.value)">'+opts+'</select> '+
-    '<button class="btn sec" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="verCotizacionesCliente('+r.id+')" title="Cotizaciones del cliente">📄 '+(r.num_cotizaciones||0)+'</button>'+
+    '<button class="btn" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="abrirFicha('+r.id+')" title="Ficha 360">👤 Ficha</button> <button class="btn sec" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="verCotizacionesCliente('+r.id+')" title="Cotizaciones del cliente">📄 '+(r.num_cotizaciones||0)+'</button>'+
     '</div>';
 }
 function pintarTableroCRM(rows){
@@ -2791,6 +2921,148 @@ async function verCotizacionesCliente(id){
   openModal(h);
 }
 function cotizarCliente(id){ if(typeof closeModal==='function')closeModal(); nuevaCotizacion(id); }
+
+// ============================================================================
+//  FICHA 360° — vista integral del prospecto/cliente (datos+historial+
+//  cotizaciones+proyectos+trazabilidad en un solo lugar). Editable inline.
+// ============================================================================
+var FICHA={};
+function volverCRM(){ go('clientes'); }
+async function abrirFicha(id){
+  FICHA={id:id};
+  var content=document.getElementById('content');
+  content.innerHTML='<button class="back" onclick="volverCRM()">‹ Volver al CRM</button><p class="muted">Cargando ficha…</p>';
+  var acc=document.getElementById('acciones'); if(acc)acc.innerHTML='';
+  var d=await api('/api/clientes/'+id+'/ficha');
+  if(!d||!d.ok){ content.innerHTML='<button class="back" onclick="volverCRM()">‹ Volver al CRM</button><p class="muted">No se pudo cargar la ficha.</p>'; return; }
+  FICHA=d.data; FICHA.id=id;
+  renderFicha();
+}
+// Guarda una celda editable de la ficha (PUT a /api/clientes/:id)
+function fGuardar(el){
+  var id=el.dataset.id, campo=el.dataset.campo, tipo=el.dataset.tipo||'text';
+  var raw=el.textContent.trim();
+  var body={};
+  if(tipo==='num'){ body[campo]=(raw===''?null:(parseFloat(raw.replace(/[^0-9.-]/g,''))||0)); }
+  else { body[campo]=(raw===''?null:raw); }
+  api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify(body)}).then(function(d){
+    if(d&&d.ok){ toast('Guardado'); if(FICHA.cliente)FICHA.cliente[campo]=body[campo]; if(tipo==='num')el.textContent=(body[campo]==null?'':money(body[campo])); }
+    else if(d){ toast(d.error||'Error al guardar'); }
+  });
+}
+function fField(label,campo,val,tipo){
+  tipo=tipo||'text';
+  var disp=(val==null||val==='')?'':(tipo==='num'?money(val):String(val));
+  return '<div class="ffield"><label>'+label+'</label>'+
+    '<span class="fedit'+(tipo==='num'?' fnum':'')+'" contenteditable="true" data-id="'+FICHA.id+'" data-campo="'+campo+'" data-tipo="'+tipo+'" data-ph="'+escAttr(label)+'" onblur="fGuardar(this)">'+escAttr(disp)+'</span></div>';
+}
+function fWide(label,campo,val){
+  return '<div class="fwide"><label>'+label+'</label>'+
+    '<div class="fedit" contenteditable="true" data-id="'+FICHA.id+'" data-campo="'+campo+'" data-tipo="text" data-ph="'+escAttr(label)+'" onblur="fGuardar(this)">'+escAttr(val==null?'':String(val))+'</div></div>';
+}
+async function toggleEtapaFicha(){
+  var cid=FICHA.id; var c=FICHA.cliente||{};
+  var nueva=(c.etapa==='cliente')?'prospecto':'cliente';
+  var d=await api('/api/clientes/'+cid,{method:'PUT',body:JSON.stringify({etapa:nueva})});
+  if(d&&d.ok){ if(FICHA.cliente)FICHA.cliente.etapa=nueva; toast('Etapa actualizada'); renderFicha(); }
+  else if(d){ toast(d.error||'Error'); }
+}
+function cotizarClienteFicha(){ nuevaCotizacion(FICHA.id); }
+async function agregarNotaFicha(){
+  var cid=FICHA.id;
+  var inp=document.getElementById('fNota'); var nota=inp?inp.value.trim():'';
+  if(!nota){ toast('Escribe una nota'); return; }
+  var d=await api('/api/clientes/'+cid+'/notas',{method:'POST',body:JSON.stringify({nota:nota})});
+  if(d&&d.ok){
+    var fresh=await api('/api/clientes/'+cid+'/ficha');
+    if(fresh&&fresh.ok){ FICHA=fresh.data; FICHA.id=cid; renderFicha(); }
+    toast('Agregado al historial');
+  } else if(d){ toast(d.error||'Error'); }
+}
+function renderFicha(){
+  var c=FICHA.cliente||{}, R=FICHA.resumen||{};
+  var content=document.getElementById('content'); if(!content)return;
+  var etapaBadge=(c.etapa==='cliente')?'<span class="pill" style="background:var(--ok)">CLIENTE</span>':'<span class="pill" style="background:var(--gold)">PROSPECTO</span>';
+  var h='<button class="back" onclick="volverCRM()">‹ Volver al CRM</button>';
+  h+='<div class="ficha-head"><div><div class="ficha-name">'+escAttr(c.nombre||'—')+'</div>'+
+     '<div class="muted" style="font-size:.85rem">'+escAttr(c.empresa||'Sin empresa')+(c.industria?(' · '+escAttr(c.industria)):'')+'</div></div>'+
+     '<div class="ficha-actions">'+etapaBadge+
+     ' <button class="btn" onclick="cotizarClienteFicha()">+ Cotización</button>'+
+     ' <button class="btn sec" onclick="toggleEtapaFicha()">'+(c.etapa==='cliente'?'Marcar prospecto':'Marcar cliente')+'</button></div></div>';
+  h+='<div class="kpis" style="margin:1rem 0">'+
+     kpiCard('Cotizaciones',(R.num_cotizaciones||0))+
+     kpiCard('Total cotizado',money(R.total_cotizado))+
+     kpiCard('Total aceptado',money(R.total_aceptado))+
+     kpiCard('Facturado',money(R.facturado))+
+     kpiCard('Saldo pendiente',money(R.saldo))+
+     kpiCard('m² cortados',(R.m2_cortados||0))+'</div>';
+  h+='<div class="fsec"><h3>Datos de contacto</h3><div class="fgrid">'+
+     fField('Teléfono','telefono',c.telefono)+
+     fField('Teléfono alterno','telefono_alt',c.telefono_alt)+
+     fField('Correo','email',c.email)+
+     fField('Sitio web','sitio_web',c.sitio_web)+
+     fField('Ciudad','ciudad',c.ciudad)+
+     fField('RFC','rfc',c.rfc)+
+     fField('Asesor','asesor',c.asesor)+
+     fField('Origen del lead','origen',c.origen)+
+     fWide('Dirección','direccion',c.direccion)+'</div></div>';
+  h+='<div class="fsec"><h3>Comercial y oportunidad</h3><div class="fgrid">'+
+     fField('Validación','validacion',c.validacion)+
+     fField('Estatus','estatus_nota',c.estatus_nota)+
+     fField('Estatus final','estatus_final',c.estatus_final)+
+     fField('Material de interés','material',c.material)+
+     fField('Probabilidad de cierre','probabilidad_cierre',c.probabilidad_cierre)+
+     fField('Cierre estimado','fecha_cierre_estimada',c.fecha_cierre_estimada)+
+     fField('Próximo seguimiento','proximo_seguimiento',c.proximo_seguimiento)+
+     fField('Próxima acción','proxima_accion',c.proxima_accion)+'</div></div>';
+  h+='<div class="fsec"><h3>Financiero</h3><div class="fgrid">'+
+     fField('Condiciones de pago','condiciones_pago',c.condiciones_pago)+
+     fField('Línea de crédito','linea_credito',c.linea_credito,'num')+
+     fField('Saldo actual','saldo_actual',c.saldo_actual,'num')+
+     fField('Riesgo de crédito','riesgo_credito',c.riesgo_credito)+
+     fField('Facturado','facturado',c.facturado,'num')+
+     fField('Moneda','moneda',c.moneda)+'</div></div>';
+  h+='<div class="fsec"><h3>Datos personalizados</h3><div class="fgrid">'+
+     fField('Cumpleaños','cumpleanos',c.cumpleanos)+
+     fField('Referido por','referido_por',c.referido_por)+
+     fField('Industria','industria',c.industria)+
+     fField('Tipo de origen','tipo_origen_lead',c.tipo_origen_lead)+'</div></div>';
+  h+='<div class="fsec"><h3>Historial del lead</h3><div class="fgrid">'+
+     fWide('Notas admin','notas_vero',c.notas_vero)+
+     fWide('Notas de actualización','notas_actualizacion',c.notas_actualizacion)+
+     fWide('Notas del asesor','notas_seguimiento',c.notas_seguimiento)+
+     fWide('Notas generales','notas',c.notas)+'</div>';
+  h+='<div style="margin-top:.8rem"><div style="display:flex;gap:.5rem;margin-bottom:.6rem"><input id="fNota" placeholder="Agregar al historial (llamada, visita, acuerdo...)" style="flex:1"><button class="btn" onclick="agregarNotaFicha()">Agregar</button></div>';
+  var notas=FICHA.notas||[];
+  if(!notas.length){ h+='<p class="muted" style="font-size:.83rem">Sin entradas en la bitácora todavía.</p>'; }
+  else { h+='<div class="tl">'; notas.forEach(function(n){ h+='<div class="tl-item"><div class="muted" style="font-size:.72rem;margin-bottom:.15rem">'+fmtFechaHora(n.created_at)+(n.usuario?(' · '+escAttr(n.usuario)):'')+'</div><div>'+escAttr(n.nota||'')+'</div></div>'; }); h+='</div>'; }
+  h+='</div></div>';
+  var cots=FICHA.cotizaciones||[];
+  h+='<div class="fsec"><h3>Cotizaciones y documentos</h3>';
+  if(!cots.length){ h+='<p class="muted" style="font-size:.83rem">Sin cotizaciones ligadas a este cliente.</p>'; }
+  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Folio</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>PDF</th></tr></thead><tbody>';
+    cots.forEach(function(q){ var proy=q.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+q.proyecto_folio+'</span>'):'—';
+      h+='<tr><td>'+(q.folio||'—')+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
+    h+='</tbody></table></div>'; }
+  h+='</div>';
+  var prys=FICHA.proyectos||[];
+  h+='<div class="fsec"><h3>Proyectos y compras</h3>';
+  if(!prys.length){ h+='<p class="muted" style="font-size:.83rem">Sin proyectos registrados.</p>'; }
+  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Folio</th><th>Descripción</th><th>Etapa</th><th>Avance</th><th>m²</th><th></th></tr></thead><tbody>';
+    prys.forEach(function(p){ h+='<tr><td>'+(p.folio||'—')+'</td><td>'+escAttr(p.descripcion||'—')+'</td><td>'+escAttr(p.etapa_portal||p.estado||'—')+'</td><td>'+(p.avance_pct||0)+'%</td><td>'+(p.m2_totales||0)+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="abrirProyecto('+p.id+')">Ver</button></td></tr>'; });
+    h+='</tbody></table></div>'; }
+  h+='</div>';
+  var cortes=FICHA.cortes||[];
+  h+='<div class="fsec"><h3>Trazabilidad · de dónde viene cada material</h3>'+
+     '<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Cadena: Material → Corte → Cotización → Cortador → Proyecto.</p>';
+  if(!cortes.length){ h+='<p class="muted" style="font-size:.83rem">Aún no hay cortes ligados a este cliente.</p>'; }
+  else { h+='<div style="overflow-x:auto"><table style="font-size:.8rem"><thead><tr><th>Material</th><th>Corte</th><th>Cant.</th><th>Cotización</th><th>Cortador</th><th>Proyecto</th><th>Estado</th></tr></thead><tbody>';
+    cortes.forEach(function(x){ var cot=x.cotizacion_folio?('<span class="pill" style="background:var(--gold)">'+x.cotizacion_folio+'</span>'):'—'; var proy=x.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+x.proyecto_folio+'</span>'):'—';
+      h+='<tr><td>'+escAttr(x.material||'—')+(x.material_sku?(' <span class="muted">'+escAttr(x.material_sku)+'</span>'):'')+'</td><td>'+(x.folio||'—')+'</td><td style="white-space:nowrap">'+(x.cantidad||0)+' '+escAttr(x.unidad||'')+'</td><td>'+cot+'</td><td>'+escAttr(x.cortador||'—')+'</td><td>'+proy+'</td><td>'+escAttr(x.estado||'—')+'</td></tr>'; });
+    h+='</tbody></table></div>'; }
+  h+='</div>';
+  content.innerHTML=h;
+}
 
 var INV_PROD=[];
 var INV_PUEDE_EDITAR=false;
