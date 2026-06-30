@@ -2160,6 +2160,7 @@ tr:hover td{background:rgba(139,109,63,.06)}
 svg{vertical-align:middle;flex-shrink:0}
 input[type=number]{-moz-appearance:textfield;appearance:textfield}
 input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+img,canvas,video{max-width:100%}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
 @media(max-width:768px){.g2{grid-template-columns:1fr}.btn{min-height:44px;padding:.8rem 1.1rem}}
 `;
@@ -2295,7 +2296,7 @@ function renderApp() {
 .modal .inner{background:var(--card);border:1px solid var(--gold);border-radius:10px;padding:1.4rem;max-width:420px;width:100%;max-height:90vh;overflow:auto}
 td[contenteditable]{cursor:text;border-bottom:1px dashed rgba(139,109,63,.4)}
 td[contenteditable]:focus{outline:1px solid var(--gold);background:rgba(139,109,63,.08)}
-@media(max-width:768px){.hd h2{font-size:1.5rem}.kpi .n{font-size:1.8rem}.kpis{grid-template-columns:1fr 1fr}.card{overflow-x:auto}.modal{padding:0;align-items:flex-end}.modal .inner{max-width:none;width:100%;border-radius:14px 14px 0 0;max-height:92vh}.side.open{box-shadow:0 0 40px rgba(0,0,0,.6)}}
+@media(max-width:768px){body{overflow-x:hidden}.layout{max-width:100%}.main{min-width:0}.hd{flex-wrap:wrap;gap:.5rem;align-items:center}.hd-l{flex:1 1 55%;min-width:0}.hd h2{font-size:1.45rem;overflow-wrap:anywhere;line-height:1.12}.hd-r{flex:1 1 auto;flex-wrap:wrap;gap:.4rem;justify-content:flex-start}#acciones{display:flex;flex-wrap:wrap;gap:.4rem;flex:1 1 100%}.hd-r .btn,#acciones .btn{font-size:.78rem;padding:.48rem .7rem;min-height:40px}.kpis{grid-template-columns:1fr 1fr;gap:.6rem}.kpi{padding:.7rem .6rem}.kpi .n{font-size:clamp(1.05rem,4.4vw,1.7rem);line-height:1.15;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.card{overflow-x:auto}.modal{padding:0;align-items:flex-end}.modal .inner{max-width:none;width:100%;border-radius:14px 14px 0 0;max-height:92vh}.side.open{box-shadow:0 0 40px rgba(0,0,0,.6)}}
 </style></head><body>
 <div class="layout">
 <aside class="side" id="side">
