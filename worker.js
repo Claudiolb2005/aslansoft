@@ -563,7 +563,6 @@ async function runSetup(env, request) {
   const usuarios = [
     ["Administrador ASLAN", "admin@aslan.com", "Admin2024!", "admin", "Dirección", "administracion", 0],
     ["Gerente ASLAN", "gerente@aslan.com", "Gerente2024!", "gerente", "Gerente General", "administracion", 1],
-    ["Empleado ASLAN", "empleado@aslan.com", "Emp2024!", "empleado", "Asesor de Ventas", "ventas", 1],
     ["Cliente Demo", "cliente@demo.com", "Cliente2024!", "cliente", "Cliente", "", 1],
   ];
   for (const u of usuarios) {
@@ -2781,9 +2780,10 @@ async function guardarGeocerca(){
   var d=await api('/api/geofencing',{method:'POST',body:JSON.stringify(b)});
   if(d&&d.ok){closeModal();toast('Geocerca guardada');go('empleados');}else if(d){toast(d.error||'Error');}
 }
+var EMP_SEL_NOMBRE='';
 async function editarEmpleado(id){
   var d=await api('/api/empleados/'+id);if(!d||!d.ok){toast('No se pudo cargar');return;}
-  var e=d.data.empleado;
+  var e=d.data.empleado;EMP_SEL_NOMBRE=e.nombre;
   function v(x){return (x===null||x===undefined)?'':x;}
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">'+escAttr(e.nombre)+'</h3>'+
     '<div class="g2"><div><label>Cargo</label><input id="edCargo" value="'+escAttr(v(e.cargo))+'"></div><div><label>Área</label><input id="edArea" value="'+escAttr(v(e.area))+'"></div></div>'+
@@ -2791,15 +2791,22 @@ async function editarEmpleado(id){
     '<div class="g2"><div><label>Rol</label><select id="edRol"><option value="empleado"'+(e.rol==='empleado'?' selected':'')+'>Empleado</option><option value="gerente"'+(e.rol==='gerente'?' selected':'')+'>Gerente</option><option value="admin"'+(e.rol==='admin'?' selected':'')+'>Admin</option></select></div><div><label>Estado</label><select id="edAct"><option value="1"'+(e.activo?' selected':'')+'>Activo</option><option value="0"'+(!e.activo?' selected':'')+'>Inactivo</option></select></div></div>'+
     '<div class="g2"><div><label>CURP</label><input id="edCurp" value="'+escAttr(v(e.curp))+'"></div><div><label>RFC</label><input id="edRfc" value="'+escAttr(v(e.rfc))+'"></div></div>'+
     '<div class="g2"><div><label>Fecha de ingreso</label><input id="edIng" type="date" value="'+escAttr(v(e.fecha_ingreso))+'"></div><div><label>Tipo de contrato</label><input id="edCon" value="'+escAttr(v(e.tipo_contrato))+'"></div></div>'+
-    '<label>Salario mensual</label><input id="edSal" type="number" value="'+(e.salario!=null?e.salario:'')+'">'+
     '<label style="text-transform:none;display:flex;align-items:center;gap:.5rem;margin-top:.7rem"><input type="checkbox" id="edGps" style="width:auto"'+(e.consentimiento_gps?' checked':'')+'> Consentimiento de ubicación GPS</label>'+
-    '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarEmpleadoEdit('+id+')">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+    '<div style="display:flex;gap:.5rem;margin-top:.9rem;flex-wrap:wrap"><button class="btn" onclick="guardarEmpleadoEdit('+id+')">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button>'+((USER.rol==='admin'&&USER.id!==id)?'<button class="btn" style="background:#7a1f1f;border-color:#7a1f1f;color:#fff;margin-left:auto" onclick="eliminarEmpleado('+id+')">Eliminar empleado</button>':'')+'</div>');
 }
 async function guardarEmpleadoEdit(id){
   var b={cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),rol:val('edRol'),activo:val('edAct')==='1',curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
-  var sal=val('edSal');if(sal!=='')b.salario=parseFloat(sal);
   var d=await api('/api/empleados/'+id,{method:'PUT',body:JSON.stringify(b)});
   if(d&&d.ok){closeModal();toast('Guardado');go('empleados');}else if(d){toast(d.error||'Error');}
+}
+async function eliminarEmpleado(id){
+  if(USER.rol!=='admin'){toast('Solo administracion puede eliminar empleados');return;}
+  if(USER.id===id){toast('No puedes eliminar tu propia cuenta');return;}
+  var nom=EMP_SEL_NOMBRE||'este empleado';
+  if(!confirm('Vas a eliminar a '+nom+' del sistema. Ya no podra iniciar sesion ni aparecera en la lista de empleados. Continuar?'))return;
+  var d=await api('/api/empleados/'+id,{method:'DELETE'});
+  if(!d)return;
+  if(d.ok){closeModal();toast('Empleado eliminado');go('empleados');}else{toast(d.error||'No se pudo eliminar');}
 }
 async function revisarAlertaUI(id){
   var d=await api('/api/geofencing/alertas/'+id+'/revisar',{method:'POST'});
