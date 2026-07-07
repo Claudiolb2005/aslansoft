@@ -442,7 +442,9 @@ async function migrarV3(env) {
     "ALTER TABLE clientes ADD COLUMN material TEXT",
     "ALTER TABLE clientes ADD COLUMN propuesta_antes_iva REAL",
     "ALTER TABLE clientes ADD COLUMN moneda TEXT",
-    "ALTER TABLE clientes ADD COLUMN facturado REAL"
+    "ALTER TABLE clientes ADD COLUMN facturado REAL",
+    "ALTER TABLE clientes ADD COLUMN propuesta_inicial REAL",
+    "ALTER TABLE clientes ADD COLUMN propuesta_updated_at TEXT"
   ];
   for (const sql of nuevas) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
 
@@ -840,12 +842,13 @@ async function handleClientes(request, env, payload, method, id) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
     if (!sets.length) return fail("Nada que actualizar.");
+    const stampProp = ("propuesta_antes_iva" in b) ? ", propuesta_updated_at=CURRENT_TIMESTAMP" : "";
     vals.push(id);
-    await env.DB.prepare("UPDATE clientes SET " + sets.join(",") + ", updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(...vals).run();
+    await env.DB.prepare("UPDATE clientes SET " + sets.join(",") + stampProp + ", updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(...vals).run();
     await audit(env, payload.sub, "editar", "clientes", id, b, request);
     return ok({ id });
   }
@@ -3235,6 +3238,18 @@ function renderFicha(){
      fField('Cierre estimado','fecha_cierre_estimada',c.fecha_cierre_estimada)+
      fField('Próximo seguimiento','proximo_seguimiento',c.proximo_seguimiento)+
      fField('Próxima acción','proxima_accion',c.proxima_accion)+'</div></div>';
+  var pIni=(c.propuesta_inicial==null?null:Number(c.propuesta_inicial));
+  var pAct=(c.propuesta_antes_iva==null?null:Number(c.propuesta_antes_iva));
+  var crec=(pIni!=null&&pAct!=null)?(pAct-pIni):null;
+  var crecPct=(crec!=null&&pIni&&pIni>0)?(' ('+(crec>0?'+':'')+((crec/pIni)*100).toFixed(1)+'%)'):'';
+  var crecTxt=(crec==null)?'\u2014':((crec>0?'+':'')+money(crec)+crecPct);
+  var crecColor=(crec==null||crec===0)?'var(--txt2)':(crec>0?'var(--ok)':'var(--err)');
+  h+='<div class="fsec"><h3>Propuesta comercial</h3><div class="fgrid">'+
+     '<div class="ffield"><label>Valor inicial (primer contacto)</label><span class="fnum" style="color:var(--txt2)">'+(pIni==null?'\u2014':money(pIni))+'</span></div>'+
+     fField('Propuesta actual antes de IVA','propuesta_antes_iva',c.propuesta_antes_iva,'num')+
+     '<div class="ffield"><label>Crecimiento vs inicial</label><span class="fnum" style="color:'+crecColor+'">'+crecTxt+'</span></div>'+
+     '<div class="ffield"><label>\u00daltima actualizaci\u00f3n</label><span style="color:var(--txt2);font-size:.85rem">'+(c.propuesta_updated_at?fmtFechaHora(c.propuesta_updated_at):'Sin cambios desde el inicial')+'</span></div>'+
+     '</div><p class="muted" style="font-size:.78rem;margin-top:.4rem">El valor inicial queda congelado del primer contacto. La propuesta actual es la que suma al pipeline; al editarla se guarda sola la fecha del cambio.</p></div>';
   h+='<div class="fsec"><h3>Financiero</h3><div class="fgrid">'+
      fField('Condiciones de pago','condiciones_pago',c.condiciones_pago)+
      fField('Línea de crédito','linea_credito',c.linea_credito,'num')+
