@@ -2226,6 +2226,11 @@ function renderApp() {
 .crmtable{border-collapse:collapse;min-width:1980px;font-size:.8rem}
 .crmtable th{position:sticky;top:0;background:var(--thead,#1d1a14);color:var(--gold);font-size:.7rem;letter-spacing:.02em;padding:.5rem .55rem;border:1px solid var(--bd);white-space:nowrap;text-align:left;z-index:2}
 .crmtable td{border:1px solid var(--bd);padding:.4rem .55rem;vertical-align:top}
+.xls{overflow:auto;max-height:calc(100vh - 240px);max-height:calc(100dvh - 240px);-webkit-overflow-scrolling:touch}
+.xls:focus,.xls:focus-visible{box-shadow:inset 0 0 0 2px var(--gold),0 4px 20px var(--cardsh,rgba(0,0,0,.4))}
+.xls::-webkit-scrollbar{height:14px;width:14px}
+.xls::-webkit-scrollbar-thumb{background:var(--gold);border-radius:8px;border:3px solid var(--card)}
+.xls::-webkit-scrollbar-track{background:rgba(139,109,63,.12)}
 .crmc{min-width:110px;outline:none;cursor:text}
 .crmc:focus{background:rgba(139,109,63,.16);box-shadow:inset 0 0 0 2px var(--gold)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
@@ -2921,8 +2926,8 @@ function renderCRM(){
 }
 function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
-  var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Doble clic en una celda para editar (estilo Excel); se guarda solo al salir de la celda. Desliza horizontalmente para ver todas las columnas. Registros: '+rows.length+'.</p>';
-  var h=nota+'<div class="card" style="overflow-x:auto;padding:.4rem"><table class="crmtable"><thead><tr>'+
+  var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Doble clic en una celda para editar (estilo Excel); se guarda solo al salir de la celda. Desliza, o haz clic en la tabla y usa las flechas ← → ↑ ↓ (Inicio/Fin, Re Pag/Av Pag) para navegar. Registros: '+rows.length+'.</p>';
+  var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable"><thead><tr>'+
     '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
   rows.forEach(function(r){
     h+='<tr>'+
@@ -2952,6 +2957,9 @@ function pintarCRM(rows){
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 function filtrarCRM(){ renderCRM(); }
+function xlsEditable(el){if(!el)return false;var t=(el.tagName||'').toLowerCase();return t==='input'||t==='textarea'||t==='select'||el.isContentEditable;}
+function xlsPane(){var a=document.activeElement;if(!a)return null;if(a.classList&&a.classList.contains('xls'))return a;return a.closest?a.closest('.xls'):null;}
+function xlsKey(e){if(xlsEditable(document.activeElement))return;var p=xlsPane();if(!p)return;var k=e.key,dx=0,dy=0,V=Math.max(80,p.clientHeight-60);if(k==='ArrowLeft')dx=-140;else if(k==='ArrowRight')dx=140;else if(k==='ArrowUp')dy=-70;else if(k==='ArrowDown')dy=70;else if(k==='PageDown')dy=V;else if(k==='PageUp')dy=-V;else if(k==='Home'){p.scrollTo(0,p.scrollTop);e.preventDefault();return;}else if(k==='End'){p.scrollTo(p.scrollWidth,p.scrollTop);e.preventDefault();return;}else return;p.scrollBy(dx,dy);e.preventDefault();}
 function tcardCRM(r){
   var opts='<option value="">(Sin estatus)</option>';
   CRM_ESTATUS.forEach(function(s){opts+='<option value="'+s+'"'+(((r.estatus_nota||'').trim().toUpperCase()===s)?' selected':'')+'>'+s+'</option>';});
@@ -3311,7 +3319,7 @@ async function viewInventario(c){
   var d=await api('/api/productos');if(!d||!d.ok)return;
   INV_PROD=d.data;
   var nota=INV_PUEDE_EDITAR?'<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Doble clic en una celda con borde punteado para editar. El stock se cambia con «Mov» para dejar registro.</p>':'';
-  var h=nota+'<div class="card" style="overflow-x:auto"><table><thead><tr><th>SKU</th><th>Material</th><th>Categoría</th><th>Stock</th><th>Mín</th><th>Ubicación</th><th>Costo</th><th>Venta</th><th>Acciones</th></tr></thead><tbody>';
+  var h=nota+'<div class="card xls" tabindex="0"><table><thead><tr><th>SKU</th><th>Material</th><th>Categoría</th><th>Stock</th><th>Mín</th><th>Ubicación</th><th>Costo</th><th>Venta</th><th>Acciones</th></tr></thead><tbody>';
   d.data.forEach(function(r){
     var color=r.stock_actual<=0?'var(--err)':(r.stock_actual<=r.stock_minimo?'var(--warn)':'var(--ok)');
     var ed=INV_PUEDE_EDITAR;
@@ -3841,6 +3849,7 @@ async function cargarCFG(){try{var d=await api('/api/config');if(d&&d.ok)CFG=d.d
 cargarCFG();
 renderNav();
 aplicarIconoTema();
+document.addEventListener('keydown',xlsKey);
 if(USER.debe_cambiar){toast('Recuerda cambiar tu contraseña en Configuración');}
 var _mat=null;try{_mat=sessionStorage.getItem('aslan_mat');if(_mat)sessionStorage.removeItem('aslan_mat');}catch(e){}
 if(_mat){abrirMaterialControl(_mat);}else{go('dashboard');}
