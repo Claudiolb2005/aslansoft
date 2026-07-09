@@ -2926,7 +2926,7 @@ function renderCRM(){
 }
 function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
-  var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Doble clic en una celda para editar (estilo Excel); se guarda solo al salir de la celda. Desliza, o haz clic en la tabla y usa las flechas ← → ↑ ↓ (Inicio/Fin, Re Pag/Av Pag) para navegar. Registros: '+rows.length+'.</p>';
+  var nota='';
   var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable"><thead><tr>'+
     '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
   rows.forEach(function(r){
@@ -2958,7 +2958,7 @@ function pintarCRM(rows){
 }
 function filtrarCRM(){ renderCRM(); }
 function xlsEditable(el){if(!el)return false;var t=(el.tagName||'').toLowerCase();return t==='input'||t==='textarea'||t==='select'||el.isContentEditable;}
-function xlsPane(){var a=document.activeElement;if(!a)return null;if(a.classList&&a.classList.contains('xls'))return a;return a.closest?a.closest('.xls'):null;}
+var XLS_HOVER=null;function xlsPane(){var a=document.activeElement;if(a&&a.closest){var pf=a.closest('.xls');if(pf)return pf;}return XLS_HOVER;}
 function xlsKey(e){if(xlsEditable(document.activeElement))return;var p=xlsPane();if(!p)return;var k=e.key,dx=0,dy=0,V=Math.max(80,p.clientHeight-60);if(k==='ArrowLeft')dx=-140;else if(k==='ArrowRight')dx=140;else if(k==='ArrowUp')dy=-70;else if(k==='ArrowDown')dy=70;else if(k==='PageDown')dy=V;else if(k==='PageUp')dy=-V;else if(k==='Home'){p.scrollTo(0,p.scrollTop);e.preventDefault();return;}else if(k==='End'){p.scrollTo(p.scrollWidth,p.scrollTop);e.preventDefault();return;}else return;p.scrollBy(dx,dy);e.preventDefault();}
 function tcardCRM(r){
   var opts='<option value="">(Sin estatus)</option>';
@@ -3849,7 +3849,7 @@ async function cargarCFG(){try{var d=await api('/api/config');if(d&&d.ok)CFG=d.d
 cargarCFG();
 renderNav();
 aplicarIconoTema();
-document.addEventListener('keydown',xlsKey);
+document.addEventListener('keydown',xlsKey);document.addEventListener('mouseover',function(e){var t=e.target;var p=(t&&t.closest)?t.closest('.xls'):null;if(p)XLS_HOVER=p;});
 if(USER.debe_cambiar){toast('Recuerda cambiar tu contraseña en Configuración');}
 var _mat=null;try{_mat=sessionStorage.getItem('aslan_mat');if(_mat)sessionStorage.removeItem('aslan_mat');}catch(e){}
 if(_mat){abrirMaterialControl(_mat);}else{go('dashboard');}
