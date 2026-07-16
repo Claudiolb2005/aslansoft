@@ -65,7 +65,7 @@ const ok = (data = null) => json({ ok: true, data });
 const fail = (error, status = 400) => json({ ok: false, error }, status);
 
 function html(body, status = 200) {
-  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", ...CORS } });
+  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store, must-revalidate", ...CORS } });
 }
 
 // ---------------------------------------------------------------------------
@@ -2254,6 +2254,8 @@ function renderApp() {
 .crmfilt{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;padding:.6rem;margin-bottom:.6rem}
 .crmfilt input,.crmfilt select{width:auto;min-width:120px;padding:.4rem .55rem;font-size:.82rem;margin:0}
 .crmfilt input[type=number]{min-width:110px}
+.crmfilt .filsep{width:1px;align-self:stretch;background:var(--bd);margin:0 .35rem}
+.crmfilt .btn{margin:0}
 .crmkpis{margin-bottom:.7rem}
 .crmkpis .kpi{padding:.5rem .7rem}
 .layout{display:flex;min-height:100vh}
@@ -2891,12 +2893,7 @@ function crmCellWide(r,campo,val){
 var CRM_VISTA='tabla';
 var CRM_ESTATUS=['SIN RESPUESTA','SEGUIMIENTO','PRECIO','MATERIAL','OTRO'];
 async function viewClientes(c){
-  document.getElementById('acciones').innerHTML=
-    '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">📋 Tabla</button> '+
-    '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">📊 Tablero</button> '+
-    '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button> '+
-    '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">🔍 Duplicados</button> '+
-    '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>';
+  document.getElementById('acciones').innerHTML='';
   var cont=document.getElementById('content');
   cont.innerHTML='<div id="crmFiltros"></div><div id="crmResumen"></div><div id="crmBody">Cargando…</div>';
   var d=await api('/api/clientes');if(!d||!d.ok)return;
@@ -2963,7 +2960,7 @@ function pintarCRM(rows){
       crmCell(r,'propuesta_antes_iva',(r.propuesta_antes_iva==null?'':money(r.propuesta_antes_iva)),true)+
       crmCell(r,'moneda',r.moneda)+
       crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
-      '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">👤</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">📄 '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
+      '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
       '</tr>';
   });
   if(!rows.length)h+='<tr><td colspan="20" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
@@ -2983,7 +2980,7 @@ function tcardCRM(r){
     (sub?'<div class="mt">'+escAttr(sub)+'</div>':'')+
     '<div class="mt">'+(r.asesor?('Asesor: '+escAttr(r.asesor)):'Sin asesor')+(monto?(' · '+monto):'')+'</div>'+
     '<select onchange="cambiarEstatusCRM('+r.id+',this.value)">'+opts+'</select> '+
-    '<button class="btn" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="abrirFicha('+r.id+')" title="Ficha 360">👤 Ficha</button> <button class="btn sec" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="verCotizacionesCliente('+r.id+')" title="Cotizaciones del cliente">📄 '+(r.num_cotizaciones||0)+'</button>'+
+    '<button class="btn" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="abrirFicha('+r.id+')" title="Ficha 360">Ficha</button> <button class="btn sec" style="padding:.18rem .45rem;font-size:.68rem;margin-top:.35rem" onclick="verCotizacionesCliente('+r.id+')" title="Cotizaciones del cliente">Cot. '+(r.num_cotizaciones||0)+'</button>'+
     '</div>';
 }
 function pintarTableroCRM(rows){
@@ -3084,7 +3081,7 @@ async function verDuplicados(){
   var d=await api('/api/clientes/duplicados');if(!d||!d.ok){toast('No se pudo revisar');return;}
   var grupos=d.data.grupos||[];
   var h='<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.4rem">Posibles duplicados</h3>';
-  if(!grupos.length){ h+='<p class="muted">No se encontraron repetidos por teléfono, correo ni nombre. 👍</p>'; }
+  if(!grupos.length){ h+='<p class="muted">No se encontraron repetidos por teléfono, correo ni nombre.</p>'; }
   else{
     h+='<p class="muted" style="font-size:.84rem;margin-bottom:.7rem">'+grupos.length+' grupo(s). Abre cada ficha para revisar y consolidar.</p>';
     grupos.forEach(function(g){
@@ -3117,6 +3114,12 @@ function pintarFiltros(){
     '<input id="fMax" type="number" placeholder="Monto max" oninput="renderCRM()">'+
     '<button class="btn sec" onclick="soloMios()" title="Filtrar mis registros">Solo míos</button>'+
     '<button class="btn sec" onclick="limpiarFiltros()">Limpiar</button>'+
+    '<span class="filsep"></span>'+
+    '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">Tabla</button>'+
+    '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">Tablero</button>'+
+    '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
+    '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">Duplicados</button>'+
+    '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>'+
     '</div>';
 }
 function pintarResumen(rows){
