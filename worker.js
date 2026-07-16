@@ -2370,7 +2370,7 @@ function toast(t){var d=document.createElement('div');d.className='toast';d.text
 
 var MENU=[
   {id:'dashboard',label:'Dashboard',roles:['admin','gerente','empleado']},
-  {id:'alertas',label:'Alertas',roles:['admin','gerente','empleado']},
+  {id:'alertas',label:'Alertas de leads',roles:['admin','gerente','empleado']},
   {id:'clientes',label:'Clientes / CRM',roles:['admin','gerente','empleado']},
   {id:'cotizaciones',label:'Cotizaciones',roles:['admin','gerente','empleado']},
   {id:'inventario',label:'Inventario',roles:['admin','gerente','empleado']},
@@ -2400,7 +2400,7 @@ async function go(id){
   MAT_CTRL=null;
   setActive(id);document.getElementById('side').classList.remove('open');
   document.getElementById('acciones').innerHTML='';
-  var t={dashboard:'Dashboard',alertas:'Alertas',clientes:'Clientes / CRM',cotizaciones:'Cotizaciones',inventario:'Inventario',proyectos:'Proyectos',cortes:'Cortes',trazabilidad:'Trazabilidad',empleados:'Empleados',whatsapp:'WhatsApp',reportes:'Reportes',config:'Configuración'};
+  var t={dashboard:'Dashboard',alertas:'Alertas de leads',clientes:'Clientes / CRM',cotizaciones:'Cotizaciones',inventario:'Inventario',proyectos:'Proyectos',cortes:'Cortes',trazabilidad:'Trazabilidad',empleados:'Empleados',whatsapp:'WhatsApp',reportes:'Reportes',config:'Configuración'};
   document.getElementById('titulo').textContent=t[id]||id;
   var c=document.getElementById('content');c.innerHTML='Cargando…';
   if(id==='dashboard')return viewDashboard(c);
@@ -2880,7 +2880,7 @@ async function viewDashboard(c){
   var h='<div class="kpis">';
   kpis.forEach(function(x){h+='<div class="card kpi kpi-click" data-mod="'+x[2]+'" onclick="go(this.dataset.mod)" title="Ir a '+x[0]+'"><div class="n">'+x[1]+'</div><div class="l">'+x[0]+'</div></div>';});
   h+='</div>';
-  h+='<div class="card al-sec" id="dashAlertas"><h3 class="serif" style="color:var(--gold);font-size:1.15rem">Alertas de gestión</h3><p class="muted" style="font-size:.8rem;margin-top:.4rem">Cargando alertas…</p></div>';
+  h+='<div class="card al-sec" id="dashAlertas"><h3 class="serif" style="color:var(--gold);font-size:1.15rem">Alertas de leads (CRM)</h3><p class="muted" style="font-size:.8rem;margin-top:.4rem">Cargando alertas…</p></div>';
   h+='<div class="charts-grid">'+chartCard('Monto cotizado por mes','chCotiz')+chartCard('Proyectos por etapa','chProy')+chartCard('Pipeline de clientes','chCli')+chartCard('Valor de inventario por categoría','chInv')+chartCard('Asistencia · entradas (7 días)','chAsis')+'</div>';
   h+='<div class="card" style="overflow-x:auto"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Cotizaciones recientes</h3><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th></tr></thead><tbody>';
   (d.data.recientes||[]).forEach(function(r){h+='<tr><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoPill(r.estado)+'</td></tr>';});
@@ -2996,9 +2996,9 @@ async function pintarAlertasDash(){
   actualizarBadgeAlertas(r);
   var todos=r.fechas.concat(r.seg,r.sinresp,r.noviable);
   todos.sort(function(x,y){return (x.nivel===y.nivel)?0:(x.nivel==='alarma'?-1:1);});
-  var h='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap"><h3 class="serif" style="color:var(--gold);font-size:1.15rem">Alertas de gestión</h3><button class="btn sec" style="padding:.3rem .7rem;font-size:.74rem" onclick="irAlertas()">Ver todas</button></div>';
+  var h='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap"><h3 class="serif" style="color:var(--gold);font-size:1.15rem">Alertas de leads (CRM)</h3><button class="btn sec" style="padding:.3rem .7rem;font-size:.74rem" onclick="irAlertas()">Ver todas</button></div>';
   h+='<div style="display:flex;gap:1.4rem;margin:.5rem 0 .7rem;font-size:.85rem;flex-wrap:wrap"><span><strong style="color:#d9534f;font-size:1.05rem">'+r.alarmas+'</strong> <span class="muted">alarmas</span></span><span><strong style="color:#c4983a;font-size:1.05rem">'+r.avisos+'</strong> <span class="muted">avisos</span></span><span><strong style="font-size:1.05rem">'+(r.alarmas+r.avisos)+'</strong> <span class="muted">por gestionar</span></span></div>';
-  if(!todos.length){h+='<p class="muted" style="font-size:.82rem">Sin alertas pendientes. Todo al día.</p>';}
+  if(!todos.length){h+='<p class="muted" style="font-size:.82rem">Sin leads pendientes de gestión. Todo al día.</p>';}
   else{
     todos.slice(0,6).forEach(function(i){var c=i.c;
       h+='<div class="al-item '+i.nivel+'" style="cursor:pointer" onclick="abrirFicha('+c.id+')" title="Abrir ficha 360"><div style="min-width:0"><span class="al-tag '+i.nivel+'">'+(i.nivel==='alarma'?'Alarma':'Aviso')+'</span> <strong>'+escAttr(c.nombre||'—')+'</strong>'+(c.empresa?(' · '+escAttr(c.empresa)):'')+'<div class="muted" style="font-size:.76rem;margin-top:.15rem">'+escAttr(i.txt)+(c.asesor?(' · '+escAttr(c.asesor)):'')+'</div></div></div>';
