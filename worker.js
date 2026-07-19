@@ -3589,7 +3589,7 @@ async function viewInventario(c){
   INV_PUEDE_EDITAR=(USER.rol==='admin'||USER.rol==='gerente');
   var acc='';
   if(INV_PUEDE_EDITAR)acc+='<button class="btn" onclick="nuevoProducto()">+ Nuevo producto</button> ';
-  acc+='<button class="btn sec" onclick="viewAlertas()">Alertas de stock</button> <button class="btn sec" onclick="viewMovimientos()">Movimientos</button> <button class="btn sec" onclick="viewProveedores()">Proveedores</button> <button class="btn sec" onclick="exportarInventarioCSV()">Exportar CSV</button>';
+  acc+='<button class="btn sec" onclick="viewAlertasStock()">Alertas de stock</button> <button class="btn sec" onclick="viewMovimientos()">Movimientos</button> <button class="btn sec" onclick="viewProveedores()">Proveedores</button> <button class="btn sec" onclick="exportarInventarioCSV()">Exportar CSV</button>';
   document.getElementById('acciones').innerHTML=acc;
   var d=await api('/api/productos');if(!d||!d.ok)return;
   INV_PROD=d.data;
@@ -3765,7 +3765,7 @@ async function viewMovimientos(){
   if(!d.data.length)h+='<tr><td colspan="7" class="muted">Sin movimientos registrados.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
-async function viewAlertas(){
+async function viewAlertasStock(){
   document.getElementById('acciones').innerHTML='';
   document.getElementById('titulo').textContent='Alertas de stock';
   var c=document.getElementById('content');var d=await api('/api/productos');if(!d||!d.ok)return;
