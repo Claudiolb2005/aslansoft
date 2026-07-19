@@ -1998,6 +1998,62 @@ async function handleReportes(request, env, payload, url) {
   });
 }
 
+async function handleReportesCrmOpciones(request, env, payload) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  async function distintos(col) {
+    const rows = (await env.DB.prepare("SELECT DISTINCT " + col + " AS v FROM clientes WHERE deleted_at IS NULL AND " + col + " IS NOT NULL AND TRIM(" + col + ")<>'' ORDER BY v COLLATE NOCASE").all()).results || [];
+    return rows.map((r) => r.v);
+  }
+  return ok({
+    asesores: await distintos("asesor"),
+    tipos: await distintos("tipo"),
+    origenes: await distintos("origen"),
+    materiales: await distintos("material"),
+    ciudades: await distintos("ciudad"),
+    monedas: await distintos("moneda"),
+    estatus: await distintos("estatus_nota"),
+  });
+}
+
+async function handleReportesCrm(request, env, payload, url) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  const q = url.searchParams;
+  const cond = ["deleted_at IS NULL"]; const args = [];
+  const campoAllow = { created_at: "created_at", fecha_lead: "fecha_lead", fecha_contacto: "fecha_contacto" };
+  const campo = campoAllow[q.get("campo")] || "created_at";
+  const desde = q.get("desde"); const hasta = q.get("hasta");
+  if (desde) { cond.push("date(" + campo + ") >= ?"); args.push(desde); }
+  if (hasta) { cond.push("date(" + campo + ") <= ?"); args.push(hasta); }
+  const fin = q.get("final") || "activos";
+  if (fin === "activos") cond.push("(estatus_final IS NULL OR UPPER(TRIM(estatus_final)) <> 'NV')");
+  else if (fin === "nv") cond.push("UPPER(TRIM(estatus_final)) = 'NV'");
+  function eq(param, col) { const v = q.get(param); if (v) { cond.push(col + " = ?"); args.push(v); } }
+  eq("asesor", "asesor"); eq("tipo", "tipo"); eq("origen", "origen");
+  eq("ciudad", "ciudad"); eq("moneda", "moneda"); eq("estatus", "estatus_nota");
+  const material = q.get("material"); if (material) { cond.push("material LIKE ?"); args.push("%" + material + "%"); }
+  const qq = q.get("q"); if (qq) { cond.push("(nombre LIKE ? OR empresa LIKE ?)"); args.push("%" + qq + "%", "%" + qq + "%"); }
+  const mn = q.get("min"); if (mn !== null && mn !== "") { cond.push("COALESCE(propuesta_antes_iva,0) >= ?"); args.push(Number(mn)); }
+  const mx = q.get("max"); if (mx !== null && mx !== "") { cond.push("COALESCE(propuesta_antes_iva,0) <= ?"); args.push(Number(mx)); }
+  if (q.get("facturado") === "1") cond.push("COALESCE(facturado,0) > 0");
+  const where = cond.join(" AND ");
+
+  const resumen = await env.DB.prepare("SELECT COUNT(*) AS registros, COALESCE(SUM(propuesta_antes_iva),0) AS suma_propuesta, COALESCE(SUM(facturado),0) AS suma_facturado, COALESCE(AVG(NULLIF(propuesta_antes_iva,0)),0) AS promedio FROM clientes WHERE " + where).bind(...args).first();
+  const porAsesor = (await env.DB.prepare("SELECT COALESCE(asesor,'(sin asesor)') AS asesor, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY asesor ORDER BY monto DESC").bind(...args).all()).results || [];
+  const porEstatus = (await env.DB.prepare("SELECT COALESCE(estatus_nota,'(sin estatus)') AS estatus, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY estatus_nota ORDER BY monto DESC").bind(...args).all()).results || [];
+  const porMaterial = (await env.DB.prepare("SELECT COALESCE(NULLIF(TRIM(material),''),'(sin material)') AS material, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY material ORDER BY monto DESC LIMIT 30").bind(...args).all()).results || [];
+  const porCiudad = (await env.DB.prepare("SELECT COALESCE(NULLIF(TRIM(ciudad),''),'(sin ciudad)') AS ciudad, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY ciudad ORDER BY monto DESC LIMIT 30").bind(...args).all()).results || [];
+  const LIMITE = 1000;
+  const filasRows = (await env.DB.prepare("SELECT id, nombre, empresa, asesor, tipo, ciudad, material, estatus_nota AS estatus, estatus_final, moneda, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, " + campo + " AS fecha FROM clientes WHERE " + where + " ORDER BY COALESCE(propuesta_antes_iva,0) DESC, id DESC LIMIT " + (LIMITE + 1)).bind(...args).all()).results || [];
+  const truncado = filasRows.length > LIMITE;
+  const filas = truncado ? filasRows.slice(0, LIMITE) : filasRows;
+
+  return ok({
+    resumen: { registros: resumen ? resumen.registros : 0, suma_propuesta: resumen ? resumen.suma_propuesta : 0, suma_facturado: resumen ? resumen.suma_facturado : 0, promedio: resumen ? resumen.promedio : 0 },
+    por_asesor: porAsesor, por_estatus: porEstatus, por_material: porMaterial, por_ciudad: porCiudad,
+    filas: filas, truncado: truncado,
+  });
+}
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -2093,6 +2149,8 @@ async function handleRequest(request, env) {
 
     // ----- Configuración y Reportes -----
     if (path === "/api/config") return await handleConfig(request, env, payload, method);
+    if (path === "/api/reportes/crm/opciones" && method === "GET") return await handleReportesCrmOpciones(request, env, payload);
+    if (path === "/api/reportes/crm" && method === "GET") return await handleReportesCrm(request, env, payload, url);
     if (path === "/api/reportes" && method === "GET") return await handleReportes(request, env, payload, url);
 
     m = path.match(/^\/api\/admin\/proyectos\/(\d+)\/fotos$/);
@@ -2584,7 +2642,7 @@ function tablaReporte(titulo,cols,filas){
   return h;
 }
 function aplicarReporte(){REP_DESDE=val('repDesde');REP_HASTA=val('repHasta');viewReportes(document.getElementById('content'));}
-async function viewReportes(c){
+async function viewReportesGeneral(c){
   document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="exportarReporteCSV()">Exportar CSV</button>';
   var hoy=new Date();var d1=REP_DESDE||(hoy.getFullYear()+'-01-01');var d2=REP_HASTA||fechaISO(hoy);
   var d=await api('/api/reportes?desde='+d1+'&hasta='+d2);
@@ -2621,6 +2679,86 @@ function exportarReporteCSV(){
   lines=lines.concat(sec('Asistencia por empleado',['Empleado','Entradas'],REP_DATA.asistencia_por_empleado.map(function(x){return [x.empleado,x.entradas];})));
   var blob=new Blob([bom+lines.join(nl)],{type:'text/csv;charset=utf-8'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_aslan.csv';a.click();
+}
+var REP_MODE='general',REP_OPC=null,REP_CRM=null;
+function repTabs(){
+  var g=REP_MODE==='general',k=REP_MODE==='crm';
+  return '<div class="card" style="margin-bottom:1rem;display:flex;gap:.5rem;flex-wrap:wrap">'
+    +'<button class="btn'+(g?'':' sec')+'" onclick="setRepMode(0)">Resumen general</button>'
+    +'<button class="btn'+(k?'':' sec')+'" onclick="setRepMode(1)">Reporte avanzado (CRM)</button>'
+    +'</div>';
+}
+function setRepMode(m){REP_MODE=m?'crm':'general';viewReportes(document.getElementById('content'));}
+async function viewReportes(c){
+  c.innerHTML=repTabs()+'<div id="repBody">Cargando…</div>';
+  var body=document.getElementById('repBody');
+  if(REP_MODE==='crm')return viewReportesCRM(body);
+  return viewReportesGeneral(body);
+}
+function repOptEls(arr,sel){
+  var s='<option value="">— Todos —</option>';
+  (arr||[]).forEach(function(v){if(v==null||v==='')return;s+='<option value="'+escAttr(v)+'"'+(String(v)===String(sel)?' selected':'')+'>'+escAttr(v)+'</option>';});
+  return s;
+}
+async function viewReportesCRM(c){
+  document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="exportarCrmCSV()">Exportar CSV</button>';
+  if(!REP_OPC){var o=await api('/api/reportes/crm/opciones');REP_OPC=(o&&o.ok)?o.data:{asesores:[],tipos:[],origenes:[],materiales:[],ciudades:[],monedas:[],estatus:[]};}
+  var O=REP_OPC;
+  var h='<div class="card" style="margin-bottom:1rem">';
+  h+='<h3 style="color:var(--gold);font-size:1.15rem;margin-bottom:.7rem">Filtros del reporte</h3>';
+  h+='<div class="g2"><div><label>Desde</label><input id="fDesde" type="date"></div><div><label>Hasta</label><input id="fHasta" type="date"></div></div>';
+  h+='<div class="g2"><div><label>Campo de fecha</label><select id="fCampo"><option value="created_at">Fecha de alta</option><option value="fecha_lead">Fecha lead</option><option value="fecha_contacto">Fecha contacto</option></select></div>';
+  h+='<div><label>Estatus del trato</label><select id="fFinal"><option value="activos">Activos (en pipeline)</option><option value="nv">No vendidos (NV)</option><option value="todos">Todos</option></select></div></div>';
+  h+='<div class="g2"><div><label>Asesor</label><select id="fAsesor">'+repOptEls(O.asesores)+'</select></div><div><label>Tipo de cliente</label><select id="fTipo">'+repOptEls(O.tipos)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Origen</label><select id="fOrigen">'+repOptEls(O.origenes)+'</select></div><div><label>Ciudad</label><select id="fCiudad">'+repOptEls(O.ciudades)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Material</label><select id="fMaterial">'+repOptEls(O.materiales)+'</select></div><div><label>Moneda</label><select id="fMoneda">'+repOptEls(O.monedas)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Estatus / nota</label><select id="fEstatus">'+repOptEls(O.estatus)+'</select></div><div><label>Buscar (nombre / empresa)</label><input id="fQ" type="text" placeholder="texto libre"></div></div>';
+  h+='<div class="g2"><div><label>Monto mínimo (antes IVA)</label><input id="fMin" type="number" step="any" placeholder="0"></div><div><label>Monto máximo (antes IVA)</label><input id="fMax" type="number" step="any" placeholder="sin límite"></div></div>';
+  h+='<div style="margin-top:.7rem"><label style="display:inline-flex;align-items:center;gap:.4rem;margin:0;text-transform:none;letter-spacing:0"><input id="fFact" type="checkbox" style="width:auto"> Solo con monto facturado</label></div>';
+  h+='<div style="height:.8rem"></div><button class="btn" onclick="aplicarCrmReporte()">Aplicar filtros</button> <button class="btn sec" onclick="limpiarCrmReporte()">Limpiar</button>';
+  h+='</div><div id="crmResultado"><p class="muted" style="font-size:.9rem">Ajusta los filtros y pulsa «Aplicar filtros».</p></div>';
+  c.innerHTML=h;
+}
+function limpiarCrmReporte(){REP_CRM=null;viewReportesCRM(document.getElementById('repBody'));}
+function crmQS(){
+  var p=[];
+  function add(k,v){if(v!==''&&v!=null)p.push(k+'='+encodeURIComponent(v));}
+  add('desde',val('fDesde'));add('hasta',val('fHasta'));add('campo',val('fCampo'));
+  add('final',val('fFinal'));add('asesor',val('fAsesor'));add('tipo',val('fTipo'));
+  add('origen',val('fOrigen'));add('ciudad',val('fCiudad'));add('material',val('fMaterial'));
+  add('moneda',val('fMoneda'));add('estatus',val('fEstatus'));add('q',val('fQ'));
+  add('min',val('fMin'));add('max',val('fMax'));
+  var fc=document.getElementById('fFact');if(fc&&fc.checked)add('facturado','1');
+  return p.join('&');
+}
+async function aplicarCrmReporte(){
+  var box=document.getElementById('crmResultado');box.innerHTML='Cargando…';
+  var d=await api('/api/reportes/crm?'+crmQS());
+  if(!d||!d.ok){box.innerHTML='<p class="muted">'+((d&&d.error)||'Error')+'</p>';return;}
+  REP_CRM=d.data;var r=d.data.resumen;
+  var h='<div class="kpis">';
+  h+=kpiCard('Registros',r.registros);
+  h+=kpiCard('Propuesta antes IVA',money(r.suma_propuesta));
+  h+=kpiCard('Facturado',money(r.suma_facturado));
+  h+=kpiCard('Ticket promedio',money(r.promedio));
+  h+='</div>';
+  h+=tablaReporte('Por asesor',['Asesor','Registros','Monto'],d.data.por_asesor.map(function(x){return [x.asesor||'—',x.n,money(x.monto)];}));
+  h+=tablaReporte('Por estatus',['Estatus','Registros','Monto'],d.data.por_estatus.map(function(x){return [x.estatus||'—',x.n,money(x.monto)];}));
+  h+=tablaReporte('Por material',['Material','Registros','Monto'],d.data.por_material.map(function(x){return [x.material||'—',x.n,money(x.monto)];}));
+  h+=tablaReporte('Por ciudad',['Ciudad','Registros','Monto'],d.data.por_ciudad.map(function(x){return [x.ciudad||'—',x.n,money(x.monto)];}));
+  h+=tablaReporte('Detalle ('+d.data.filas.length+' registros)',['Cliente','Empresa','Asesor','Tipo','Ciudad','Material','Estatus','Propuesta','Facturado'],d.data.filas.map(function(x){return [x.nombre||'—',x.empresa||'—',x.asesor||'—',x.tipo||'—',x.ciudad||'—',x.material||'—',x.estatus||'—',money(x.propuesta),money(x.facturado)];}));
+  if(d.data.truncado)h+='<p class="muted" style="font-size:.82rem">Se muestran los primeros '+d.data.filas.length+' registros. Refina los filtros para acotar.</p>';
+  document.getElementById('crmResultado').innerHTML=h;
+}
+function exportarCrmCSV(){
+  if(!REP_CRM){toast('Aplica los filtros primero');return;}
+  var nl=String.fromCharCode(10),bom=String.fromCharCode(0xFEFF);
+  function q(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
+  var cols=['Cliente','Empresa','Asesor','Tipo','Ciudad','Material','Estatus','EstatusFinal','Moneda','PropuestaAntesIVA','Facturado','Fecha'];
+  var L=[cols.map(q).join(',')];
+  REP_CRM.filas.forEach(function(x){L.push([x.nombre,x.empresa,x.asesor,x.tipo,x.ciudad,x.material,x.estatus,x.estatus_final,x.moneda,x.propuesta,x.facturado,x.fecha].map(q).join(','));});
+  var blob=new Blob([bom+L.join(nl)],{type:'text/csv;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_crm_aslan.csv';a.click();
 }
 
 // ----- CONFIGURACIÓN -----
