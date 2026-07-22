@@ -748,18 +748,22 @@ async function handleChangePassword(request, env, payload) {
 // ============================================================================
 //  API — DASHBOARD
 // ============================================================================
-async function dashboardStats(env) {
-  const q = async (sql) => (await env.DB.prepare(sql).first()).n;
-  const clientes = await q("SELECT COUNT(*) AS n FROM clientes WHERE deleted_at IS NULL");
-  const cotizMes = await q("SELECT COUNT(*) AS n FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','start of month')");
-  const proyectos = await q("SELECT COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL AND estado NOT IN ('cerrado','entregado')");
+async function dashboardStats(env, payload) {
+  const _sc = asesorScope(payload);
+  const _ab = _sc ? [_sc.first, _sc.full] : [];
+  const cliCond = _sc ? " AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?)" : "";
+  const subCli = _sc ? " AND cliente_id IN (SELECT id FROM clientes WHERE deleted_at IS NULL AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?))" : "";
+  const q = async (sql, b) => (await env.DB.prepare(sql).bind(...(b || [])).first()).n;
+  const clientes = await q("SELECT COUNT(*) AS n FROM clientes WHERE deleted_at IS NULL" + cliCond, _ab);
+  const cotizMes = await q("SELECT COUNT(*) AS n FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','start of month')" + subCli, _ab);
+  const proyectos = await q("SELECT COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL AND estado NOT IN ('cerrado','entregado')" + subCli, _ab);
   const stockCritico = await q("SELECT COUNT(*) AS n FROM productos WHERE deleted_at IS NULL AND stock_actual <= stock_minimo");
   const empleadosHoy = await q("SELECT COUNT(DISTINCT usuario_id) AS n FROM gps_checkins WHERE tipo='entrada' AND created_at >= date('now')");
-  const pipeline = (await env.DB.prepare("SELECT COALESCE(SUM(total),0) AS n FROM cotizaciones WHERE estado IN ('enviada','borrador','aceptada') AND deleted_at IS NULL").first()).n;
+  const pipeline = (await env.DB.prepare("SELECT COALESCE(SUM(total),0) AS n FROM cotizaciones WHERE estado IN ('enviada','borrador','aceptada') AND deleted_at IS NULL" + subCli).bind(..._ab).first()).n;
   const porCategoria = await env.DB.prepare("SELECT categoria, COUNT(*) AS n FROM productos WHERE deleted_at IS NULL GROUP BY categoria").all();
   const recientes = await env.DB.prepare(
-    "SELECT c.folio, c.total, c.estado, cl.nombre AS cliente FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.deleted_at IS NULL ORDER BY c.created_at DESC LIMIT 10"
-  ).all();
+    "SELECT c.folio, c.total, c.estado, cl.nombre AS cliente FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.deleted_at IS NULL" + (_sc ? " AND c.cliente_id IN (SELECT id FROM clientes WHERE deleted_at IS NULL AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?))" : "") + " ORDER BY c.created_at DESC LIMIT 10"
+  ).bind(..._ab).all();
   return ok({
     kpis: { clientes, cotizMes, proyectos, stockCritico, empleadosHoy, pipeline },
     porCategoria: porCategoria.results || [],
@@ -767,20 +771,24 @@ async function dashboardStats(env) {
   });
 }
 
-async function dashboardCharts(env) {
+async function dashboardCharts(env, payload) {
+  const _sc = asesorScope(payload);
+  const _ab = _sc ? [_sc.first, _sc.full] : [];
+  const cliCond = _sc ? " AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?)" : "";
+  const subCli = _sc ? " AND cliente_id IN (SELECT id FROM clientes WHERE deleted_at IS NULL AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?))" : "";
   const cotiz = await env.DB.prepare(
     "SELECT strftime('%Y-%m', created_at) AS mes, COUNT(*) AS n, COALESCE(SUM(total),0) AS monto" +
-    " FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','-6 months') GROUP BY mes ORDER BY mes ASC"
-  ).all();
+    " FROM cotizaciones WHERE deleted_at IS NULL AND created_at >= date('now','-6 months')" + subCli + " GROUP BY mes ORDER BY mes ASC"
+  ).bind(..._ab).all();
   const proyEtapa = await env.DB.prepare(
-    "SELECT etapa_portal AS etapa, COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL GROUP BY etapa_portal"
-  ).all();
+    "SELECT etapa_portal AS etapa, COUNT(*) AS n FROM proyectos WHERE deleted_at IS NULL" + subCli + " GROUP BY etapa_portal"
+  ).bind(..._ab).all();
   const nombreEtapa = {};
   for (const e of ETAPAS) nombreEtapa[e.clave] = e.nombre;
   const proyectos_por_etapa = (proyEtapa.results || []).map((r) => ({ etapa: r.etapa, nombre: nombreEtapa[r.etapa] || r.etapa, n: r.n }));
   const cliEtapa = await env.DB.prepare(
-    "SELECT COALESCE(etapa,'sin etapa') AS etapa, COUNT(*) AS n FROM clientes WHERE deleted_at IS NULL GROUP BY etapa ORDER BY n DESC"
-  ).all();
+    "SELECT COALESCE(etapa,'sin etapa') AS etapa, COUNT(*) AS n FROM clientes WHERE deleted_at IS NULL" + cliCond + " GROUP BY etapa ORDER BY n DESC"
+  ).bind(..._ab).all();
   const invCat = await env.DB.prepare(
     "SELECT COALESCE(categoria,'Otros') AS categoria, COALESCE(SUM(stock_actual*precio_venta),0) AS valor, COUNT(*) AS n" +
     " FROM productos WHERE deleted_at IS NULL GROUP BY categoria ORDER BY valor DESC"
@@ -807,6 +815,12 @@ function asesorScope(payload) {
   var full = (payload.nombre || "").trim();
   var first = full.split(/\s+/)[0] || "";
   return { full: full.toUpperCase(), first: first.toUpperCase() };
+}
+// Restringe a la cartera del asesor por su columna cliente_id. Vacio si admin/gerente.
+function scopeClienteSQL(payload, col) {
+  const s = asesorScope(payload);
+  if (!s) return { cond: "", bind: [] };
+  return { cond: " AND " + col + " IN (SELECT id FROM clientes WHERE deleted_at IS NULL AND UPPER(TRIM(IFNULL(asesor,''))) IN (?,?))", bind: [s.first, s.full] };
 }
 async function handleClientes(request, env, payload, method, id) {
   if (method === "GET" && !id) {
@@ -839,7 +853,8 @@ async function handleClientes(request, env, payload, method, id) {
       const dem = (b.email || "").trim();
       if (dem) { dcond.push("LOWER(TRIM(email)) = LOWER(?)"); dbind.push(dem); }
       if (dcond.length) {
-        const dup = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL AND (" + dcond.join(" OR ") + ") LIMIT 10").bind(...dbind).all();
+        const _scd = scopeClienteSQL(payload, "id");
+        const dup = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL" + _scd.cond + " AND (" + dcond.join(" OR ") + ") LIMIT 10").bind(..._scd.bind, ...dbind).all();
         if ((dup.results || []).length) return ok({ duplicado: true, existentes: dup.results });
       }
     }
@@ -960,8 +975,9 @@ async function agregarNotaCliente(request, env, payload, id) {
 }
 
 // Detecta posibles duplicados (telefono, correo o nombre) y los agrupa
-async function duplicadosClientes(env) {
-  const r = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL").all();
+async function duplicadosClientes(env, payload) {
+  const _scq = scopeClienteSQL(payload, "id");
+  const r = await env.DB.prepare("SELECT id,nombre,empresa,telefono,email,asesor FROM clientes WHERE deleted_at IS NULL" + _scq.cond).bind(..._scq.bind).all();
   const rows = r.results || [];
   const norm = (s) => (s == null ? "" : String(s)).toLowerCase().trim().replace(/\s+/g, " ");
   const dig = (s) => (s == null ? "" : String(s)).replace(/[^0-9]/g, "");
@@ -1007,6 +1023,8 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     const clienteFiltro = url.searchParams.get("cliente");
     let sql = "SELECT c.*, cl.nombre AS cliente, u.nombre AS vendedor, (SELECT p.folio FROM proyectos p WHERE p.cotizacion_id=c.id AND p.deleted_at IS NULL LIMIT 1) AS proyecto_folio FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id LEFT JOIN usuarios u ON u.id=c.usuario_id WHERE c.deleted_at IS NULL";
     const binds = [];
+    const _scc = scopeClienteSQL(payload, "c.cliente_id");
+    sql += _scc.cond; if (_scc.bind.length) binds.push(..._scc.bind);
     if (clienteFiltro) { sql += " AND c.cliente_id=?"; binds.push(clienteFiltro); }
     sql += " ORDER BY c.created_at DESC, c.id DESC";
     const r = await env.DB.prepare(sql).bind(...binds).all();
@@ -1014,9 +1032,12 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "GET" && id) {
     const c = await env.DB.prepare(
-      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL"
+      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL"
     ).bind(id).first();
     if (!c) return fail("Cotización no encontrada.", 404);
+    const _scv = asesorScope(payload);
+    if (_scv) { var _av = (c._asesor || "").trim().toUpperCase(); if (_av !== _scv.first && _av !== _scv.full) return fail("Sin acceso a esta cotización.", 403); }
+    delete c._asesor;
     const items = await env.DB.prepare("SELECT * FROM cotizacion_items WHERE cotizacion_id=? ORDER BY id ASC").bind(id).all();
     c.items = items.results || [];
     return ok(c);
@@ -1342,16 +1363,20 @@ async function handleProveedores(request, env, payload, method, id) {
 // ============================================================================
 async function handleProyectos(request, env, payload, method, id) {
   if (method === "GET" && !id) {
+    const _scp = scopeClienteSQL(payload, "p.cliente_id");
     const r = await env.DB.prepare(
-      "SELECT p.*, cl.nombre AS cliente FROM proyectos p LEFT JOIN clientes cl ON cl.id=p.cliente_id WHERE p.deleted_at IS NULL ORDER BY p.updated_at DESC"
-    ).all();
+      "SELECT p.*, cl.nombre AS cliente FROM proyectos p LEFT JOIN clientes cl ON cl.id=p.cliente_id WHERE p.deleted_at IS NULL" + _scp.cond + " ORDER BY p.updated_at DESC"
+    ).bind(..._scp.bind).all();
     return ok(r.results || []);
   }
   if (method === "GET" && id) {
     const p = await env.DB.prepare(
-      "SELECT p.*, cl.nombre AS cliente FROM proyectos p LEFT JOIN clientes cl ON cl.id=p.cliente_id WHERE p.id=? AND p.deleted_at IS NULL"
+      "SELECT p.*, cl.nombre AS cliente, cl.asesor AS _asesor FROM proyectos p LEFT JOIN clientes cl ON cl.id=p.cliente_id WHERE p.id=? AND p.deleted_at IS NULL"
     ).bind(id).first();
     if (!p) return fail("Proyecto no encontrado.", 404);
+    const _scp2 = asesorScope(payload);
+    if (_scp2) { var _ap = (p._asesor || "").trim().toUpperCase(); if (_ap !== _scp2.first && _ap !== _scp2.full) return fail("Sin acceso a este proyecto.", 403); }
+    delete p._asesor;
     return ok(p);
   }
   return fail("Método no soportado.", 405);
@@ -1903,18 +1928,23 @@ async function waEstado(env, payload) {
   return ok({ configurado: !!(env.WA_TOKEN && env.WA_PHONE_ID), verify_token: !!env.WA_VERIFY_TOKEN });
 }
 async function waListarConversaciones(env, payload) {
+  const _scw = scopeClienteSQL(payload, "w.cliente_id");
   const r = await env.DB.prepare(
     "SELECT w.id,w.numero_wa,w.no_leidos,w.ultimo_mensaje_en,cl.nombre AS cliente," +
     " (SELECT m.contenido FROM wa_mensajes m WHERE m.conversacion_id=w.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS ultimo," +
     " (SELECT m.direction FROM wa_mensajes m WHERE m.conversacion_id=w.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS ultimo_dir" +
     " FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id" +
+    " WHERE 1=1" + _scw.cond +
     " ORDER BY w.ultimo_mensaje_en DESC, w.id DESC LIMIT 100"
-  ).all();
+  ).bind(..._scw.bind).all();
   return ok(r.results || []);
 }
 async function waVerConversacion(env, payload, id) {
-  const conv = await env.DB.prepare("SELECT w.id,w.numero_wa,w.cliente_id,cl.nombre AS cliente FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id WHERE w.id=?").bind(id).first();
+  const conv = await env.DB.prepare("SELECT w.id,w.numero_wa,w.cliente_id,cl.nombre AS cliente,cl.asesor AS _asesor FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id WHERE w.id=?").bind(id).first();
   if (!conv) return fail("Conversación no encontrada.", 404);
+  const _scw = asesorScope(payload);
+  if (_scw) { var _aw = (conv._asesor || "").trim().toUpperCase(); if (_aw !== _scw.first && _aw !== _scw.full) return fail("Sin acceso a esta conversación.", 403); }
+  delete conv._asesor;
   const msgs = await env.DB.prepare("SELECT id,direction,tipo,contenido,wa_message_id,created_at FROM wa_mensajes WHERE conversacion_id=? ORDER BY created_at ASC, id ASC LIMIT 300").bind(id).all();
   await env.DB.prepare("UPDATE wa_conversaciones SET no_leidos=0 WHERE id=?").bind(id).run();
   return ok({ conversacion: conv, mensajes: msgs.results || [] });
@@ -1927,8 +1957,10 @@ async function waNuevaConversacion(request, env, payload) {
   return ok({ id, numero_wa: numero });
 }
 async function waEnviar(request, env, payload, id) {
-  const conv = await env.DB.prepare("SELECT id,numero_wa FROM wa_conversaciones WHERE id=?").bind(id).first();
+  const conv = await env.DB.prepare("SELECT w.id,w.numero_wa,cl.asesor AS _asesor FROM wa_conversaciones w LEFT JOIN clientes cl ON cl.id=w.cliente_id WHERE w.id=?").bind(id).first();
   if (!conv) return fail("Conversación no encontrada.", 404);
+  const _scw = asesorScope(payload);
+  if (_scw) { var _aw = (conv._asesor || "").trim().toUpperCase(); if (_aw !== _scw.first && _aw !== _scw.full) return fail("Sin acceso a esta conversación.", 403); }
   const b = await request.json().catch(() => ({}));
   const texto = (b.mensaje || "").trim();
   if (!texto) return fail("Mensaje vacío.");
@@ -2127,11 +2159,11 @@ async function handleRequest(request, env) {
 
     if (path === "/api/me") return ok({ id: payload.sub, nombre: payload.nombre, rol: payload.rol });
     if (path === "/api/auth/change-password" && method === "POST") return await handleChangePassword(request, env, payload);
-    if (path === "/api/dashboard/stats") return await dashboardStats(env);
-    if (path === "/api/dashboard/charts") return await dashboardCharts(env);
+    if (path === "/api/dashboard/stats") return await dashboardStats(env, payload);
+    if (path === "/api/dashboard/charts") return await dashboardCharts(env, payload);
 
     let m;
-    if (path === "/api/clientes/duplicados" && method === "GET") return await duplicadosClientes(env);
+    if (path === "/api/clientes/duplicados" && method === "GET") return await duplicadosClientes(env, payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/ficha$/);
     if (m && method === "GET") return await fichaCliente(env, m[1], payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
