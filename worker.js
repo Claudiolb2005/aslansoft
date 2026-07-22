@@ -2302,8 +2302,9 @@ function renderApp() {
 .xls::-webkit-scrollbar{height:14px;width:14px}
 .xls::-webkit-scrollbar-thumb{background:var(--gold);border-radius:8px;border:3px solid var(--card)}
 .xls::-webkit-scrollbar-track{background:rgba(139,109,63,.12)}
-.crmc{min-width:110px;outline:none;cursor:text}
-.crmc:focus{background:rgba(139,109,63,.16);box-shadow:inset 0 0 0 2px var(--gold)}
+.crmc{min-width:110px;outline:none;cursor:cell;user-select:none;-webkit-user-select:none}
+.crmc.sel{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.10)}
+.crmc.edit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.22);cursor:text;user-select:text;-webkit-user-select:text}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
 .ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
@@ -3051,10 +3052,10 @@ var CRM_ROWS=[];
 function fFecha(s){if(!s)return '';s=(''+s).trim();var m=/^([0-9]{4})-([0-9]{2})-([0-9]{2})/.exec(s);return m?m[3]+'-'+m[2]+'-'+m[1]:s;}
 function fFechaISO(s){if(!s)return '';s=(''+s).trim();if(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s))return s;var m=/^([0-9]{1,2})[-/]([0-9]{1,2})[-/]([0-9]{4})$/.exec(s);if(!m)return s;var d=('0'+m[1]).slice(-2),mo=('0'+m[2]).slice(-2);return m[3]+'-'+mo+'-'+d;}
 function crmCell(r,campo,val,num){
-  return '<td contenteditable="true" class="crmc'+(num?' crmnum':'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onblur="guardarCeldaCRM(this)">'+escAttr(val==null?'':(num?String(val):String(val)))+'</td>';
+  return '<td tabindex="-1" class="crmc'+(num?' crmnum':'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':(num?String(val):String(val)))+'</td>';
 }
 function crmCellWide(r,campo,val){
-  return '<td contenteditable="true" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onblur="guardarCeldaCRM(this)">'+escAttr(val==null?'':String(val))+'</td>';
+  return '<td tabindex="-1" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
 var CRM_VISTA='tabla';
 var CRM_ESTATUS=['SIN RESPUESTA','SEGUIMIENTO','PRECIO','MATERIAL','OTRO'];
@@ -3241,7 +3242,91 @@ function pintarCRM(rows){
 function filtrarCRM(){ renderCRM(); }
 function xlsEditable(el){if(!el)return false;var t=(el.tagName||'').toLowerCase();return t==='input'||t==='textarea'||t==='select'||el.isContentEditable;}
 var XLS_HOVER=null;function xlsPane(){var a=document.activeElement;if(a&&a.closest){var pf=a.closest('.xls');if(pf)return pf;}return XLS_HOVER;}
-function xlsKey(e){if(xlsEditable(document.activeElement))return;var p=xlsPane();if(!p)return;var k=e.key,dx=0,dy=0,V=Math.max(80,p.clientHeight-60);if(k==='ArrowLeft')dx=-140;else if(k==='ArrowRight')dx=140;else if(k==='ArrowUp')dy=-70;else if(k==='ArrowDown')dy=70;else if(k==='PageDown')dy=V;else if(k==='PageUp')dy=-V;else if(k==='Home'){p.scrollTo(0,p.scrollTop);e.preventDefault();return;}else if(k==='End'){p.scrollTo(p.scrollWidth,p.scrollTop);e.preventDefault();return;}else return;p.scrollBy(dx,dy);e.preventDefault();}
+var XLS_CUR=null,XLS_EDIT=false,XLS_ORIG='';
+function xlsSel(td){
+  if(!td)return;
+  if(XLS_EDIT&&XLS_CUR===td)return;
+  if(XLS_EDIT&&XLS_CUR&&XLS_CUR!==td)xlsCommit();
+  if(XLS_CUR===td&&!XLS_EDIT){xlsEditStart(td);return;}
+  if(XLS_CUR&&XLS_CUR!==td)XLS_CUR.classList.remove('sel');
+  XLS_CUR=td;td.classList.add('sel');
+  try{td.focus({preventScroll:true});}catch(e){td.focus();}
+  if(td.scrollIntoView)td.scrollIntoView({block:'nearest',inline:'nearest'});
+}
+function xlsEditStart(td,ch){
+  if(!td)return;
+  if(XLS_CUR!==td){if(XLS_CUR)XLS_CUR.classList.remove('sel');XLS_CUR=td;td.classList.add('sel');}
+  XLS_EDIT=true;XLS_ORIG=td.textContent;
+  td.classList.add('edit');td.contentEditable='true';
+  if(ch!=null)td.textContent=ch;
+  td.focus();
+  var rg=document.createRange();rg.selectNodeContents(td);rg.collapse(false);
+  var sl=window.getSelection();sl.removeAllRanges();sl.addRange(rg);
+  td.onblur=function(){if(XLS_EDIT&&XLS_CUR===td)xlsCommit();};
+}
+function xlsCommit(){
+  var td=XLS_CUR;if(!td||!XLS_EDIT)return;
+  XLS_EDIT=false;td.onblur=null;td.contentEditable='false';td.classList.remove('edit');
+  if(td.textContent!==XLS_ORIG)guardarCeldaCRM(td);
+}
+function xlsCancel(){
+  var td=XLS_CUR;if(!td)return;
+  XLS_EDIT=false;td.onblur=null;td.contentEditable='false';td.classList.remove('edit');
+  td.textContent=XLS_ORIG;
+  try{td.focus({preventScroll:true});}catch(e){}
+}
+function xlsMove(dx,dy,edge){
+  var td=XLS_CUR;if(!td)return;
+  var tr=td.parentNode,i;
+  if(dy){
+    var t=tr;
+    if(edge){for(;;){var nx=(dy>0)?t.nextElementSibling:t.previousElementSibling;if(!nx)break;t=nx;}}
+    else{var n=Math.abs(dy);while(n-->0){var nx2=(dy>0)?t.nextElementSibling:t.previousElementSibling;if(!nx2)break;t=nx2;}}
+    var cell=t.cells&&t.cells[td.cellIndex];
+    if(cell&&cell.classList.contains('crmc'))xlsSel(cell);
+    return;
+  }
+  if(dx){
+    if(edge){
+      var cells=tr.cells,target=null;
+      if(dx<0){for(i=0;i<cells.length;i++){if(cells[i].classList.contains('crmc')){target=cells[i];break;}}}
+      else{for(i=cells.length-1;i>=0;i--){if(cells[i].classList.contains('crmc')){target=cells[i];break;}}}
+      if(target)xlsSel(target);
+      return;
+    }
+    var nxt=(dx>0)?td.nextElementSibling:td.previousElementSibling;
+    if(nxt&&nxt.classList.contains('crmc'))xlsSel(nxt);
+  }
+}
+function xlsKey(e){
+  var k=e.key;
+  if(XLS_EDIT&&XLS_CUR){
+    if(k==='Enter'){e.preventDefault();xlsCommit();xlsMove(0,1);}
+    else if(k==='Tab'){e.preventDefault();xlsCommit();xlsMove(e.shiftKey?-1:1,0);}
+    else if(k==='Escape'){e.preventDefault();xlsCancel();}
+    return;
+  }
+  if(XLS_CUR&&document.body.contains(XLS_CUR)&&!xlsEditable(document.activeElement)){
+    if(k==='ArrowDown'){e.preventDefault();xlsMove(0,1,e.ctrlKey);}
+    else if(k==='ArrowUp'){e.preventDefault();xlsMove(0,-1,e.ctrlKey);}
+    else if(k==='ArrowRight'){e.preventDefault();xlsMove(1,0,e.ctrlKey);}
+    else if(k==='ArrowLeft'){e.preventDefault();xlsMove(-1,0,e.ctrlKey);}
+    else if(k==='Tab'){e.preventDefault();xlsMove(e.shiftKey?-1:1,0);}
+    else if(k==='PageDown'){e.preventDefault();xlsMove(0,12);}
+    else if(k==='PageUp'){e.preventDefault();xlsMove(0,-12);}
+    else if(k==='Home'){e.preventDefault();xlsMove(-1,0,true);}
+    else if(k==='End'){e.preventDefault();xlsMove(1,0,true);}
+    else if(k==='Enter'||k==='F2'){e.preventDefault();xlsEditStart(XLS_CUR);}
+    else if(k==='Delete'||k==='Backspace'){e.preventDefault();var prev=XLS_CUR.textContent;XLS_CUR.textContent='';if(prev!=='')guardarCeldaCRM(XLS_CUR);}
+    else if((e.ctrlKey||e.metaKey)&&(k==='c'||k==='C')){e.preventDefault();try{navigator.clipboard.writeText(XLS_CUR.textContent);toast('Copiado');}catch(err){}}
+    else if((e.ctrlKey||e.metaKey)&&(k==='v'||k==='V')){e.preventDefault();try{navigator.clipboard.readText().then(function(tx){if(tx==null||!XLS_CUR)return;XLS_CUR.textContent=(''+tx).trim();guardarCeldaCRM(XLS_CUR);});}catch(err){}}
+    else if(k.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();xlsEditStart(XLS_CUR,k);}
+    return;
+  }
+  if(xlsEditable(document.activeElement))return;
+  var p=xlsPane();if(!p)return;
+  var dx=0,dy=0,V=Math.max(80,p.clientHeight-60);if(k==='ArrowLeft')dx=-140;else if(k==='ArrowRight')dx=140;else if(k==='ArrowUp')dy=-70;else if(k==='ArrowDown')dy=70;else if(k==='PageDown')dy=V;else if(k==='PageUp')dy=-V;else if(k==='Home'){p.scrollTo(0,p.scrollTop);e.preventDefault();return;}else if(k==='End'){p.scrollTo(p.scrollWidth,p.scrollTop);e.preventDefault();return;}else return;p.scrollBy(dx,dy);e.preventDefault();
+}
 function tcardCRM(r){
   var opts='<option value="">(Sin estatus)</option>';
   CRM_ESTATUS.forEach(function(s){opts+='<option value="'+s+'"'+(((r.estatus_nota||'').trim().toUpperCase()===s)?' selected':'')+'>'+s+'</option>';});
