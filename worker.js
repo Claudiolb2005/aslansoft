@@ -440,6 +440,7 @@ async function migrarV3(env) {
     "ALTER TABLE clientes ADD COLUMN notas_actualizacion TEXT",
     "ALTER TABLE clientes ADD COLUMN notas_seguimiento TEXT",
     "ALTER TABLE clientes ADD COLUMN material TEXT",
+    "ALTER TABLE clientes ADD COLUMN acabado TEXT",
     "ALTER TABLE clientes ADD COLUMN propuesta_antes_iva REAL",
     "ALTER TABLE clientes ADD COLUMN moneda TEXT",
     "ALTER TABLE clientes ADD COLUMN facturado REAL",
@@ -842,7 +843,7 @@ async function handleClientes(request, env, payload, method, id) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
     if (!sets.length) return fail("Nada que actualizar.");
@@ -3207,7 +3208,7 @@ function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
   var nota='';
   var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable"><thead><tr>'+
-    '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
+    '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>TIPO</th><th>ACABADO</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
   rows.forEach(function(r){
     h+='<tr>'+
       crmCell(r,'fecha_lead',fFecha(r.fecha_lead))+
@@ -3226,13 +3227,15 @@ function pintarCRM(rows){
       crmCell(r,'telefono',r.telefono)+
       crmCell(r,'email',r.email)+
       crmCell(r,'material',r.material)+
+      crmCell(r,'tipo',r.tipo)+
+      crmCell(r,'acabado',r.acabado)+
       crmCell(r,'propuesta_antes_iva',(r.propuesta_antes_iva==null?'':money(r.propuesta_antes_iva)),true)+
       crmCell(r,'moneda',r.moneda)+
       crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
       '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
       '</tr>';
   });
-  if(!rows.length)h+='<tr><td colspan="20" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
+  if(!rows.length)h+='<tr><td colspan="22" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;ajustarXls();
 }
 function filtrarCRM(){ renderCRM(); }
