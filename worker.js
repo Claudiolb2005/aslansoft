@@ -2821,7 +2821,7 @@ async function cambiarMiPassword(){
 
 var EMP_MAP=null;
 function recargarEmpleados(){go('empleados');}
-function fmtFechaHora(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleString('es-MX',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}catch(e){return s;}}
+function fmtFechaHora(s){if(!s)return '—';try{var d=new Date(s.replace(' ','T')+'Z');function z(n){return (n<10?'0':'')+n;}return z(d.getDate())+'-'+z(d.getMonth()+1)+'-'+d.getFullYear()+' '+z(d.getHours())+':'+z(d.getMinutes());}catch(e){return s;}}
 function empEstadoBadge(tipo,checkin){
   if(!checkin)return '<span class="pill" style="background:rgba(255,255,255,.06);color:var(--txt2)">Sin registro</span>';
   var dt=new Date(checkin.replace(' ','T')+'Z'),hoy=new Date();
@@ -3047,6 +3047,8 @@ function estadoPill(e){
 }
 
 var CRM_ROWS=[];
+function fFecha(s){if(!s)return '';s=(''+s).trim();var m=/^([0-9]{4})-([0-9]{2})-([0-9]{2})/.exec(s);return m?m[3]+'-'+m[2]+'-'+m[1]:s;}
+function fFechaISO(s){if(!s)return '';s=(''+s).trim();if(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s))return s;var m=/^([0-9]{1,2})[-/]([0-9]{1,2})[-/]([0-9]{4})$/.exec(s);if(!m)return s;var d=('0'+m[1]).slice(-2),mo=('0'+m[2]).slice(-2);return m[3]+'-'+mo+'-'+d;}
 function crmCell(r,campo,val,num){
   return '<td contenteditable="true" class="crmc'+(num?' crmnum':'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onblur="guardarCeldaCRM(this)">'+escAttr(val==null?'':(num?String(val):String(val)))+'</td>';
 }
@@ -3208,13 +3210,13 @@ function pintarCRM(rows){
     '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
   rows.forEach(function(r){
     h+='<tr>'+
-      crmCell(r,'fecha_lead',r.fecha_lead)+
+      crmCell(r,'fecha_lead',fFecha(r.fecha_lead))+
       crmCell(r,'origen',r.origen)+
       crmCell(r,'validacion',r.validacion)+
       crmCell(r,'estatus_final',r.estatus_final)+
       crmCell(r,'asesor',r.asesor)+
       crmCell(r,'estatus_nota',r.estatus_nota)+
-      crmCell(r,'fecha_contacto',r.fecha_contacto)+
+      crmCell(r,'fecha_contacto',fFecha(r.fecha_contacto))+
       crmCell(r,'propuesta_factura',r.propuesta_factura)+
       crmCell(r,'empresa',r.empresa)+
       crmCell(r,'nombre',r.nombre)+
@@ -3281,6 +3283,7 @@ async function guardarCeldaCRM(el){
   var raw=el.textContent.trim();
   var body={};
   if(num){ body[campo]=(raw===''?null:(parseFloat(raw.replace(/[^0-9.-]/g,''))||0)); }
+  else if(campo==='fecha_lead'||campo==='fecha_contacto'){ body[campo]=fFechaISO(raw); }
   else { body[campo]=raw; }
   var d=await api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify(body)});
   if(d&&d.ok){
@@ -3288,6 +3291,7 @@ async function guardarCeldaCRM(el){
     var row=CRM_ROWS.find(function(x){return String(x.id)===String(id);});
     if(row)row[campo]=body[campo];
     if(num)el.textContent=(body[campo]==null?'':money(body[campo]));
+    else if(campo==='fecha_lead'||campo==='fecha_contacto')el.textContent=fFecha(body[campo]);
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
@@ -3677,7 +3681,7 @@ async function enviarMov(prodId){
 async function historialProd(prodId){
   var d=await api('/api/productos/'+prodId+'/movimientos');if(!d||!d.ok)return;
   var h='<div style="max-height:200px;overflow:auto;border-top:1px solid var(--bd);padding-top:.5rem"><table><thead><tr><th>Fecha</th><th>Tipo</th><th>Cant.</th><th>Motivo</th></tr></thead><tbody>';
-  d.data.forEach(function(m){h+='<tr><td class="muted" style="font-size:.78rem">'+(m.created_at||'')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+(m.motivo||'—')+'</td></tr>';});
+  d.data.forEach(function(m){h+='<tr><td class="muted" style="font-size:.78rem">'+fmtFechaHora(m.created_at)+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+(m.motivo||'—')+'</td></tr>';});
   if(!d.data.length)h+='<tr><td colspan="4" class="muted">Sin movimientos.</td></tr>';
   h+='</tbody></table></div>';
   document.getElementById('mvHist').innerHTML=h;
@@ -3764,7 +3768,7 @@ async function abrirMaterialControl(clave){
   var mc=document.getElementById('matMovs');if(!mc)return;
   if(dm&&dm.ok&&dm.data.length){
     var hh='<div style="max-height:240px;overflow:auto"><table><thead><tr><th>Fecha</th><th>Tipo</th><th>Cant.</th><th>Motivo</th></tr></thead><tbody>';
-    dm.data.slice(0,30).forEach(function(m){hh+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+(m.created_at||'')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+escAttr(m.motivo||'—')+'</td></tr>';});
+    dm.data.slice(0,30).forEach(function(m){hh+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+fmtFechaHora(m.created_at)+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+escAttr(m.motivo||'—')+'</td></tr>';});
     hh+='</tbody></table></div>';mc.innerHTML=hh;
   }else{mc.innerHTML='<p class="muted">Sin movimientos registrados.</p>';}
 }
@@ -3773,7 +3777,7 @@ async function viewMovimientos(){
   document.getElementById('titulo').textContent='Movimientos de inventario';
   var c=document.getElementById('content');var d=await api('/api/movimientos');if(!d||!d.ok)return;
   var h='<button class="back" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button><div class="card" style="overflow-x:auto"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cant.</th><th>Motivo</th><th>Ref.</th><th>Usuario</th></tr></thead><tbody>';
-  d.data.forEach(function(m){h+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+(m.created_at||'')+'</td><td>'+(m.producto||'—')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+(m.motivo||'—')+'</td><td>'+(m.referencia||'—')+'</td><td class="muted">'+(m.usuario||'—')+'</td></tr>';});
+  d.data.forEach(function(m){h+='<tr><td class="muted" style="font-size:.78rem;white-space:nowrap">'+fmtFechaHora(m.created_at)+'</td><td>'+(m.producto||'—')+'</td><td>'+m.tipo+'</td><td>'+m.cantidad+'</td><td>'+(m.motivo||'—')+'</td><td>'+(m.referencia||'—')+'</td><td class="muted">'+(m.usuario||'—')+'</td></tr>';});
   if(!d.data.length)h+='<tr><td colspan="7" class="muted">Sin movimientos registrados.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
@@ -4071,8 +4075,8 @@ async function pdfCotizacion(id){
   doc.setFontSize(9);doc.setTextColor(60);
   var hoy=new Date();var vig=new Date(hoy.getTime()+((c.vigencia_dias||15)*86400000));
   doc.text('Folio: '+(c.folio||''),R,26,{align:'right'});
-  doc.text('Fecha: '+hoy.toLocaleDateString('es-MX'),R,31,{align:'right'});
-  doc.text('Vigencia: '+vig.toLocaleDateString('es-MX'),R,36,{align:'right'});
+  doc.text('Fecha: '+hoy.toLocaleDateString('es-MX').split('/').join('-'),R,31,{align:'right'});
+  doc.text('Vigencia: '+vig.toLocaleDateString('es-MX').split('/').join('-'),R,36,{align:'right'});
   doc.setDrawColor(gold[0],gold[1],gold[2]);doc.setLineWidth(0.5);doc.line(L,55,R,55);
   // ----- Datos de Facturación / Datos de Entrega -----
   var yc=62;var midX=110;
@@ -4288,7 +4292,7 @@ function H(){return {'Content-Type':'application/json','Authorization':'Bearer '
 async function api(p,opt){opt=opt||{};opt.headers=H();var r=await fetch(p,opt);if(r.status===401){localStorage.clear();location.href='/login';return null;}return await r.json();}
 function logout(){localStorage.clear();location.href='/login';}
 function ic(p,s){s=s||18;return "<svg viewBox='0 0 24 24' width='"+s+"' height='"+s+"' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'>"+p+"</svg>";}
-function fecha(s){if(!s)return '—';try{return new Date(s.replace(' ','T')+'Z').toLocaleDateString('es-MX',{day:'2-digit',month:'short',year:'numeric'});}catch(e){return s;}}
+function fecha(s){if(!s)return '—';var m=/^([0-9]{4})-([0-9]{2})-([0-9]{2})/.exec((''+s).trim());if(m)return m[3]+'-'+m[2]+'-'+m[1];try{return new Date(s.replace(' ','T')+'Z').toLocaleDateString('es-MX').split('/').join('-');}catch(e){return s;}}
 function dias(s){if(!s)return 0;var d=Math.floor((Date.now()-new Date(s.replace(' ','T')).getTime())/86400000);return d>0?d:0;}
 var ETAPAS=[];
 
