@@ -1615,11 +1615,23 @@ async function handleEmpleados(request, env, payload, method, id) {
     if (!hasRole(payload, "admin")) return fail("Solo admin da de alta empleados.", 403);
     const b = await request.json().catch(() => ({}));
     if (!b.nombre || !b.email) return fail("Nombre y correo son obligatorios.");
-    const existe = await env.DB.prepare("SELECT id FROM usuarios WHERE email=?").bind(b.email).first();
-    if (existe) return fail("Ya existe un usuario con ese correo.");
+    const existe = await env.DB.prepare("SELECT id, deleted_at FROM usuarios WHERE email=?").bind(b.email).first();
+    if (existe && !existe.deleted_at) return fail("Ya existe un usuario con ese correo.");
     const rol = (b.rol === "gerente" || b.rol === "empleado") ? b.rol : "empleado";
     const pw = passwordTemporal();
     const ph = await hashPassword(pw);
+    if (existe && existe.deleted_at) {
+      const uid = existe.id;
+      await env.DB.prepare(
+        "UPDATE usuarios SET nombre=?, password_hash=?, rol=?, cargo=?, area=?, telefono=?, activo=1, password_debe_cambiar=1, deleted_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+      ).bind(b.nombre, ph, rol, b.cargo || null, b.area || null, b.telefono || null, uid).run();
+      await env.DB.prepare("INSERT OR IGNORE INTO empleados_perfil (usuario_id) VALUES (?)").bind(uid).run();
+      await env.DB.prepare(
+        "UPDATE empleados_perfil SET curp=?, rfc=?, fecha_ingreso=?, salario=?, tipo_contrato=?, consentimiento_gps=?, updated_at=CURRENT_TIMESTAMP WHERE usuario_id=?"
+      ).bind(b.curp || null, b.rfc || null, b.fecha_ingreso || null, (b.salario != null && b.salario !== "") ? Number(b.salario) : null, b.tipo_contrato || null, b.consentimiento_gps ? 1 : 0, uid).run();
+      await audit(env, payload.sub, "reactivar", "empleados", uid, { email: b.email, rol }, request);
+      return ok({ id: uid, email: b.email, password_temporal: pw, reactivado: true });
+    }
     const res = await env.DB.prepare(
       "INSERT INTO usuarios (nombre,email,password_hash,rol,cargo,area,telefono,password_debe_cambiar) VALUES (?,?,?,?,?,?,?,1)"
     ).bind(b.nombre, b.email, ph, rol, b.cargo || null, b.area || null, b.telefono || null).run();
