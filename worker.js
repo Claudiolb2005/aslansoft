@@ -800,21 +800,36 @@ async function dashboardCharts(env) {
 // ============================================================================
 //  API — CLIENTES (CRM)
 // ============================================================================
+// Alcance de asesor: admin/gerente ven todo (null). Empleado solo ve SUS leads
+// (match por el campo de texto "asesor" contra su nombre/primer nombre).
+function asesorScope(payload) {
+  if (!payload || payload.rol !== "empleado") return null;
+  var full = (payload.nombre || "").trim();
+  var first = full.split(/\s+/)[0] || "";
+  return { full: full.toUpperCase(), first: first.toUpperCase() };
+}
 async function handleClientes(request, env, payload, method, id) {
   if (method === "GET" && !id) {
+    const _sc = asesorScope(payload);
+    let _wh = "WHERE c.deleted_at IS NULL";
+    const _bind = [];
+    if (_sc) { _wh += " AND UPPER(TRIM(IFNULL(c.asesor,''))) IN (?,?)"; _bind.push(_sc.first, _sc.full); }
     const r = await env.DB.prepare(
-      "SELECT c.*, u.nombre AS empleado_nombre, (SELECT COUNT(*) FROM cotizaciones q WHERE q.cliente_id=c.id AND q.deleted_at IS NULL) AS num_cotizaciones FROM clientes c LEFT JOIN usuarios u ON u.id=c.empleado_asignado_id WHERE c.deleted_at IS NULL ORDER BY c.id DESC"
-    ).all();
+      "SELECT c.*, u.nombre AS empleado_nombre, (SELECT COUNT(*) FROM cotizaciones q WHERE q.cliente_id=c.id AND q.deleted_at IS NULL) AS num_cotizaciones FROM clientes c LEFT JOIN usuarios u ON u.id=c.empleado_asignado_id " + _wh + " ORDER BY c.id DESC"
+    ).bind(..._bind).all();
     return ok(r.results || []);
   }
   if (method === "GET" && id) {
     const c = await env.DB.prepare("SELECT * FROM clientes WHERE id=? AND deleted_at IS NULL").bind(id).first();
     if (!c) return fail("Cliente no encontrado.", 404);
+    const _sc = asesorScope(payload);
+    if (_sc) { var _a = (c.asesor || "").trim().toUpperCase(); if (_a !== _sc.first && _a !== _sc.full) return fail("Sin acceso a este lead.", 403); }
     return ok(c);
   }
   if (method === "POST") {
     const b = await request.json().catch(() => ({}));
     if (!b.nombre) return fail("El nombre es obligatorio.");
+    if (payload && payload.rol === "empleado") b.asesor = (payload.nombre || "").trim().split(/\s+/)[0];
     if (!b.force) {
       const dcond = [], dbind = [];
       const dnom = (b.nombre || "").trim();
@@ -870,11 +885,13 @@ async function handleClientes(request, env, payload, method, id) {
 //  FICHA 360° — concentra TODO de un prospecto/cliente en una sola consulta
 //  Datos + contacto + historial(notas) + cotizaciones + proyectos + trazabilidad
 // ============================================================================
-async function fichaCliente(env, id) {
+async function fichaCliente(env, id, payload) {
   const c = await env.DB.prepare(
     "SELECT cl.*, u.nombre AS empleado_nombre FROM clientes cl LEFT JOIN usuarios u ON u.id=cl.empleado_asignado_id WHERE cl.id=? AND cl.deleted_at IS NULL"
   ).bind(id).first();
   if (!c) return fail("Cliente no encontrado.", 404);
+  const _sc = asesorScope(payload);
+  if (_sc) { var _a = (c.asesor || "").trim().toUpperCase(); if (_a !== _sc.first && _a !== _sc.full) return fail("Sin acceso a este lead.", 403); }
 
   let contactos = { results: [] }, notas = { results: [] }, cortes = { results: [] };
   try { contactos = await env.DB.prepare("SELECT * FROM contactos_cliente WHERE cliente_id=? ORDER BY id DESC").bind(id).all(); } catch (e) {}
@@ -2116,7 +2133,7 @@ async function handleRequest(request, env) {
     let m;
     if (path === "/api/clientes/duplicados" && method === "GET") return await duplicadosClientes(env);
     m = path.match(/^\/api\/clientes\/(\d+)\/ficha$/);
-    if (m && method === "GET") return await fichaCliente(env, m[1]);
+    if (m && method === "GET") return await fichaCliente(env, m[1], payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
     if (m && method === "POST") return await agregarNotaCliente(request, env, payload, m[1]);
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
