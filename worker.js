@@ -442,6 +442,7 @@ async function migrarV3(env) {
     "ALTER TABLE clientes ADD COLUMN material TEXT",
     "ALTER TABLE clientes ADD COLUMN acabado TEXT",
     "ALTER TABLE clientes ADD COLUMN formato TEXT",
+    "ALTER TABLE clientes ADD COLUMN cantidad TEXT",
     "ALTER TABLE clientes ADD COLUMN propuesta_antes_iva REAL",
     "ALTER TABLE clientes ADD COLUMN moneda TEXT",
     "ALTER TABLE clientes ADD COLUMN facturado REAL",
@@ -860,23 +861,24 @@ async function handleClientes(request, env, payload, method, id) {
       }
     }
     const res = await env.DB.prepare(
-      "INSERT INTO clientes (nombre,empresa,tipo,etapa,telefono,email,ciudad,direccion,rfc,notas,empleado_asignado_id,fecha_lead,origen,validacion,estatus_final,asesor,estatus_nota,fecha_contacto,propuesta_factura,notas_vero,notas_actualizacion,notas_seguimiento,material,acabado,formato,propuesta_antes_iva,moneda,facturado) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      "INSERT INTO clientes (nombre,empresa,tipo,etapa,telefono,email,ciudad,direccion,rfc,notas,empleado_asignado_id,fecha_lead,origen,validacion,estatus_final,asesor,estatus_nota,fecha_contacto,propuesta_factura,notas_vero,notas_actualizacion,notas_seguimiento,material,acabado,formato,cantidad,propuesta_antes_iva,moneda,facturado) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(b.nombre, b.empresa || null, b.tipo || null, b.etapa || "prospecto", b.telefono || null,
            b.email || null, b.ciudad || null, b.direccion || null, b.rfc || null, b.notas || null,
            b.empleado_asignado_id || null,
            b.fecha_lead || null, b.origen || null, b.validacion || null, b.estatus_final || null,
            b.asesor || null, b.estatus_nota || null, b.fecha_contacto || null, b.propuesta_factura || null,
            b.notas_vero || null, b.notas_actualizacion || null, b.notas_seguimiento || null,
-           b.material || null, b.acabado || null, b.formato || null, (b.propuesta_antes_iva==null?null:b.propuesta_antes_iva), b.moneda || null,
+           b.material || null, b.acabado || null, b.formato || null, b.cantidad || null, (b.propuesta_antes_iva==null?null:b.propuesta_antes_iva), b.moneda || null,
            (b.facturado==null?null:b.facturado)).run();
     await audit(env, payload.sub, "crear", "clientes", res.meta.last_row_id, b, request);
     return ok({ id: res.meta.last_row_id });
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "cantidad", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
+    for (const c of Object.keys(b)) if (RX_COL.test(c) && !campos.includes(c)) { sets.push(c + "=?"); vals.push(b[c]); }
     if (!sets.length) return fail("Nada que actualizar.");
     const stampProp = ("propuesta_antes_iva" in b) ? ", propuesta_updated_at=CURRENT_TIMESTAMP" : "";
     vals.push(id);
@@ -1992,7 +1994,52 @@ async function getConfig(env) {
     email: map.email || EMPRESA.email || "",
     iva: map.iva != null ? Number(map.iva) : 16,
     crm_titulos: map.crm_titulos || "",
+    crm_cols: map.crm_cols || "",
   };
+}
+const RX_COL = /^col_[a-z0-9_]{1,24}$/;
+function slugColumna(t) {
+  const s = String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+/, "").replace(/_+$/, "").slice(0, 24).replace(/_+$/, "");
+  return s ? "col_" + s : "";
+}
+async function crmColsList(env) {
+  const r = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='crm_cols'").first();
+  if (!r || !r.valor) return [];
+  try {
+    const a = JSON.parse(r.valor);
+    return Array.isArray(a) ? a.filter((x) => x && typeof x.c === "string" && RX_COL.test(x.c)) : [];
+  } catch (e) { return []; }
+}
+async function crmColsSave(env, lista) {
+  await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES ('crm_cols',?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(JSON.stringify(lista)).run();
+}
+async function handleCrmColumnas(request, env, payload) {
+  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administracion o gerencia puede cambiar las columnas.", 403);
+  const b = await request.json().catch(() => ({}));
+  let lista = await crmColsList(env);
+  if (b.quitar) {
+    if (!RX_COL.test(String(b.quitar))) return fail("Columna no valida.");
+    lista = lista.filter((x) => x.c !== String(b.quitar));
+    await crmColsSave(env, lista);
+    await audit(env, payload.sub, "crm_columna_quitar", "config", null, String(b.quitar), request);
+    return ok(lista);
+  }
+  const titulo = String(b.titulo || "").replace(/[<>]/g, "").trim().slice(0, 28);
+  if (!titulo) return fail("Escribe el nombre de la columna.");
+  const col = slugColumna(titulo);
+  if (!RX_COL.test(col)) return fail("El nombre debe llevar al menos una letra o numero.");
+  if (lista.some((x) => x.c === col)) return fail("Ya existe una columna con ese nombre.");
+  if (lista.length >= 20) return fail("Maximo 20 columnas adicionales.");
+  const info = await env.DB.prepare("SELECT name FROM pragma_table_info('clientes') WHERE name=?").bind(col).first();
+  if (!info) {
+    try { await env.DB.prepare("ALTER TABLE clientes ADD COLUMN " + col + " TEXT").run(); }
+    catch (e) { return fail("No se pudo crear la columna: " + (e && e.message ? e.message : "error")); }
+  }
+  lista.push({ c: col, t: titulo.toUpperCase() });
+  await crmColsSave(env, lista);
+  await audit(env, payload.sub, "crm_columna_agregar", "config", null, col, request);
+  return ok(lista);
 }
 async function handleConfig(request, env, payload, method) {
   if (method === "GET") {
@@ -2214,6 +2261,7 @@ async function handleRequest(request, env) {
     if (m && method === "POST") return await waEnviar(request, env, payload, m[1]);
 
     // ----- Configuración y Reportes -----
+    if (path === "/api/crm/columnas" && method === "POST") return await handleCrmColumnas(request, env, payload);
     if (path === "/api/config") return await handleConfig(request, env, payload, method);
     if (path === "/api/reportes/crm/opciones" && method === "GET") return await handleReportesCrmOpciones(request, env, payload);
     if (path === "/api/reportes/crm" && method === "GET") return await handleReportesCrm(request, env, payload, url);
@@ -3143,6 +3191,11 @@ function fFechaISO(s){if(!s)return '';s=(''+s).trim();if(/^[0-9]{4}-[0-9]{2}-[0-
 function crmCell(r,campo,val,num){
   return '<td tabindex="-1" class="crmc'+(num?' crmnum':'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':(num?String(val):String(val)))+'</td>';
 }
+function celdasExtraCRM(r){
+  var h='';
+  for(var i=0;i<CRM_COLS.length;i++)h+=crmCell(r,CRM_COLS[i].c,r[CRM_COLS[i].c]);
+  return h;
+}
 function crmCellWide(r,campo,val){
   return '<td tabindex="-1" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
@@ -3296,13 +3349,27 @@ function renderCRM(){
   pintarResumen(rows);
   if(CRM_VISTA==='tablero')pintarTableroCRM(rows);else pintarCRM(rows);
 }
-var CRM_TIT_DEF=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','FORMATO','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
-var CRM_TIT_CAMPOS=['fecha_lead','origen','validacion','estatus_final','asesor','estatus_nota','fecha_contacto','propuesta_factura','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','formato','propuesta_antes_iva','moneda','facturado'];
+var CRM_TIT_DEF=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','FORMATO','CANTIDAD','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
+var CRM_TIT_CAMPOS=['fecha_lead','origen','validacion','estatus_final','asesor','estatus_nota','fecha_contacto','propuesta_factura','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','formato','cantidad','propuesta_antes_iva','moneda','facturado'];
 var CRM_TIT=CRM_TIT_DEF.slice();
+var CRM_COLS=[];
 var TIT_ORIG='';
 function escT(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function cargarColsCRM(){
+  CRM_COLS=[];
+  try{
+    var raw=(CFG&&CFG.crm_cols)?CFG.crm_cols:'';
+    if(!raw)return;
+    var a=JSON.parse(raw);
+    if(!a||typeof a.length!=='number')return;
+    for(var i=0;i<a.length;i++){
+      if(a[i]&&typeof a[i].c==='string'&&/^col_[a-z0-9_]{1,24}$/.test(a[i].c))CRM_COLS.push({c:a[i].c,t:String(a[i].t||a[i].c)});
+    }
+  }catch(e){CRM_COLS=[];}
+}
 function cargarTitulosCRM(){
   CRM_TIT=CRM_TIT_DEF.slice();
+  cargarColsCRM();
   try{
     var raw=(CFG&&CFG.crm_titulos)?CFG.crm_titulos:'';
     if(!raw)return;
@@ -3316,10 +3383,14 @@ function cargarTitulosCRM(){
 }
 function puedeTitulosCRM(){return USER&&(USER.rol==='admin'||USER.rol==='gerente');}
 function thsCRM(){
-  var ed=puedeTitulosCRM(),h='';
-  for(var i=0;i<CRM_TIT.length;i++){
+  var ed=puedeTitulosCRM(),h='',n=CRM_TIT.length-1;
+  for(var i=0;i<n;i++){
     h+='<th data-ti="'+i+'"'+(ed?' class="thed" ondblclick="tituloCRMEdit('+i+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[i])+'</th>';
   }
+  for(var j=0;j<CRM_COLS.length;j++){
+    h+='<th title="Columna agregada por ti">'+escT(CRM_COLS[j].t)+'</th>';
+  }
+  h+='<th data-ti="'+n+'"'+(ed?' class="thed" ondblclick="tituloCRMEdit('+n+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[n])+'</th>';
   return h;
 }
 function tituloCRMEdit(i){
@@ -3382,13 +3453,15 @@ function pintarCRM(rows){
       crmCell(r,'tipo',r.tipo)+
       crmCell(r,'acabado',r.acabado)+
       crmCell(r,'formato',r.formato)+
+      crmCell(r,'cantidad',r.cantidad)+
       crmCell(r,'propuesta_antes_iva',(r.propuesta_antes_iva==null?'':money(r.propuesta_antes_iva)),true)+
       crmCell(r,'moneda',r.moneda)+
       crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
+      celdasExtraCRM(r)+
       '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
       '</tr>';
   });
-  if(!rows.length)h+='<tr><td colspan="23" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
+  if(!rows.length)h+='<tr><td colspan="'+(CRM_TIT.length+CRM_COLS.length)+'" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;ajustarXls();
 }
 function filtrarCRM(){ renderCRM(); }
@@ -3539,7 +3612,7 @@ var CAT_MATERIAL=['Mármol','Granito','Cuarcita','Cuarzo','Piedra sinterizada','
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
 var CAT_ACABADO=['Pulido','Brillado','Mate','Apomazado','Abujardado','Buzardeado','Flameado','Cepillado','Sandblasteado','Envejecido','Natural','Antiderrapante'];
-var NC_IDS=['ncMat','ncTipo','ncAcab','ncForm'];
+var NC_IDS=['ncMat','ncAcab'];
 function catKey(v){
   var ac='ÁÀÄÂÃÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇ',pl='AAAAAEEEEIIIIOOOOOUUUUNC',o='';
   var u=String(v==null?'':v).toUpperCase().trim();
@@ -3579,7 +3652,7 @@ function ncPick(n){
 function nuevoCliente(){
   var ases={};(CRM_ROWS||[]).forEach(function(r){var a=(r.asesor||'').trim();if(a)ases[a]=1;});
   var aopt='<option value="">— Asesor —</option>';Object.keys(ases).sort().forEach(function(a){aopt+='<option>'+escAttr(a)+'</option>';});
-  var origenes=['WhatsApp','Llamada','Correo','Redes','Oficina','Recomendación','Otro'];
+  var origenes=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
   var oopt='<option value="">— Origen —</option>';origenes.forEach(function(o){oopt+='<option>'+o+'</option>';});
   var eopt='<option value="">— Estatus —</option>';CRM_ESTATUS.forEach(function(s){eopt+='<option>'+escAttr(s)+'</option>';});
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Nuevo registro</h3>'+
@@ -3588,8 +3661,9 @@ function nuevoCliente(){
     '<div class="g2"><div><label>Empresa</label><input id="ncEmp"></div><div><label>Teléfono</label><input id="ncTel" placeholder="55..."></div></div>'+
     '<div class="g2"><div><label>Correo</label><input id="ncMail" type="email"></div><div><label>Asesor</label><select id="ncAse">'+aopt+'</select></div></div>'+
     '<div class="g2"><div><label>Origen del lead</label><select id="ncOri">'+oopt+'</select></div><div><label>Estatus</label><select id="ncEst">'+eopt+'</select></div></div>'+
-    '<div class="g2"><div>'+catSelect('ncMat','Material',catCombina('material',CAT_MATERIAL),0)+'</div><div>'+catSelect('ncTipo','Tipo',catCombina('tipo',CAT_TIPO),1)+'</div></div>'+
-    '<div class="g2"><div>'+catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),2)+'</div><div>'+catSelect('ncForm','Formato',catCombina('formato',CAT_FORMATO),3)+'</div></div>'+
+    '<div class="g2"><div>'+catSelect('ncMat','Material',catCombina('material',CAT_MATERIAL),0)+'</div><div>'+catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),1)+'</div></div>'+
+    '<div class="g2"><div><label>Tipo</label><input id="ncTipo" placeholder="Ejemplo: Santo Tomás"></div><div><label>Formato</label><input id="ncForm" placeholder="Ejemplo: Plancha 3.20 x 1.80"></div></div>'+
+    '<label>Cantidad</label><input id="ncCant" placeholder="Ejemplo: 30 m2 / 2 planchas">'+
     '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
     '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarNuevoCliente()">Crear registro</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
   setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();},80);
@@ -3604,9 +3678,10 @@ function guardarNuevoCliente(){
   var ori=val('ncOri');if(ori)body.origen=ori;
   var est=val('ncEst');if(est)body.estatus_nota=est;
   var mat=ncPick(0);if(mat)body.material=mat;
-  var tip=ncPick(1);if(tip)body.tipo=tip;
-  var aca=ncPick(2);if(aca)body.acabado=aca;
-  var fmt=ncPick(3);if(fmt)body.formato=fmt;
+  var aca=ncPick(1);if(aca)body.acabado=aca;
+  var tip=val('ncTipo');if(tip)body.tipo=tip;
+  var fmt=val('ncForm');if(fmt)body.formato=fmt;
+  var cant=val('ncCant');if(cant)body.cantidad=cant;
   var prop=val('ncProp');if(prop!=='')body.propuesta_antes_iva=parseFloat(prop);
   crearCliente(body, false);
 }
@@ -3668,7 +3743,6 @@ function pintarFiltros(){
     '<select id="fFact" onchange="renderCRM()"><option value="">Facturación: todas</option><option value="con">Con factura</option><option value="sin">Sin factura</option></select>'+
     '<input id="fMin" type="number" placeholder="Monto min" oninput="renderCRM()">'+
     '<input id="fMax" type="number" placeholder="Monto max" oninput="renderCRM()">'+
-    '<button class="btn sec" onclick="soloMios()" title="Filtrar mis registros">Solo míos</button>'+
     '<button class="btn sec" onclick="limpiarFiltros()">Limpiar</button>'+
     '<span class="filsep"></span>'+
     '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">Tabla</button>'+
@@ -3676,6 +3750,7 @@ function pintarFiltros(){
     '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
     '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">Duplicados</button>'+
     '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>'+
+    (puedeTitulosCRM()?'<button class="btn sec" onclick="gestionColumnasCRM()" title="Agregar o quitar columnas de esta tabla">+ Columna</button>':'')+
     (puedeTitulosCRM()?'<button class="btn sec" onclick="restaurarTitulosCRM()" title="Regresar los encabezados a su nombre original">Títulos por defecto</button>':'')+
     '</div>';
 }
@@ -3701,8 +3776,37 @@ function limpiarFiltros(){
   ['fAsesor','fEstatus','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
   renderCRM();
 }
+function gestionColumnasCRM(){
+  var h='<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Columnas del CRM</h3>'+
+    '<p class="muted" style="font-size:.8rem;margin-bottom:.8rem">Agrega las columnas que necesites. Se capturan igual que las demás: doble clic en la celda.</p>'+
+    '<label>Nombre de la nueva columna</label><input id="ncColT" placeholder="Ejemplo: Espesor" maxlength="28">'+
+    '<div style="display:flex;gap:.5rem;margin-top:.7rem"><button class="btn" onclick="agregarColumnaCRM()">Agregar columna</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
+  if(CRM_COLS.length){
+    h+='<div style="margin-top:1.1rem"><label>Columnas agregadas</label><table style="width:100%;font-size:.85rem">';
+    for(var i=0;i<CRM_COLS.length;i++){
+      h+='<tr><td style="padding:.3rem 0">'+escT(CRM_COLS[i].t)+'</td><td style="text-align:right"><button class="btn sec" style="padding:.2rem .55rem;font-size:.72rem" onclick="quitarColumnaCRM('+i+')">Quitar</button></td></tr>';
+    }
+    h+='</table><p class="muted" style="font-size:.75rem;margin-top:.4rem">Quitar solo la esconde de la tabla. La información capturada no se borra.</p></div>';
+  }
+  openModal(h);
+  setTimeout(function(){var e=document.getElementById('ncColT');if(e)e.focus();},80);
+}
+async function agregarColumnaCRM(){
+  var t=val('ncColT');
+  if(!t){toast('Escribe el nombre de la columna');return;}
+  var d=await api('/api/crm/columnas',{method:'POST',body:JSON.stringify({titulo:t})});
+  if(d&&d.ok){CRM_COLS=d.data||[];closeModal();renderCRM();toast('Columna agregada');}
+  else toast((d&&d.error)||'No se pudo agregar la columna');
+}
+async function quitarColumnaCRM(i){
+  var c=CRM_COLS[i];if(!c)return;
+  var d=await api('/api/crm/columnas',{method:'POST',body:JSON.stringify({quitar:c.c})});
+  if(d&&d.ok){CRM_COLS=d.data||[];renderCRM();gestionColumnasCRM();toast('Columna oculta');}
+  else toast((d&&d.error)||'No se pudo quitar la columna');
+}
 function exportarCRMCSV(){
   var cols=CRM_TIT_CAMPOS.map(function(k,i){return [k,CRM_TIT[i]];});
+  CRM_COLS.forEach(function(c){cols.push([c.c,c.t]);});
   function esc(v){v=(v==null?'':String(v));return '"'+v.replace(/"/g,'""')+'"';}
   var lines=[cols.map(function(x){return esc(x[1]);}).join(',')];
   CRM_ROWS.forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
