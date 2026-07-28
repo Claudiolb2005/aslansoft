@@ -2450,6 +2450,8 @@ function renderApp() {
 .crmtable th.thedit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.30);cursor:text;outline:none;color:var(--gold2,#d8b877)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
+.crmtable td.crmact{position:sticky;right:0;z-index:3;background:var(--card);box-shadow:-9px 0 10px -8px var(--cardsh,rgba(0,0,0,.35))}
+.crmtable th.crmact{position:sticky;right:0;z-index:4;background:var(--thead,#1d1a14);box-shadow:-9px 0 10px -8px var(--cardsh,rgba(0,0,0,.35))}
 .ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
 .ficha-name{font-family:'Cormorant Garamond',serif;font-size:1.9rem;color:var(--gold);line-height:1.1}
 .ficha-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
@@ -3196,6 +3198,9 @@ function celdasExtraCRM(r){
   for(var i=0;i<CRM_COLS.length;i++)h+=crmCell(r,CRM_COLS[i].c,r[CRM_COLS[i].c]);
   return h;
 }
+function crmCellNombre(r){
+  return '<td tabindex="-1" class="crmc" data-id="'+r.id+'" data-campo="nombre" data-num="0" title="Clic derecho para abrir el cardex" oncontextmenu="return cardexLead(event,'+r.id+')" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
+}
 function crmCellWide(r,campo,val){
   return '<td tabindex="-1" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
@@ -3390,7 +3395,7 @@ function thsCRM(){
   for(var j=0;j<CRM_COLS.length;j++){
     h+='<th title="Columna agregada por ti">'+escT(CRM_COLS[j].t)+'</th>';
   }
-  h+='<th data-ti="'+n+'"'+(ed?' class="thed" ondblclick="tituloCRMEdit('+n+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[n])+'</th>';
+  h+='<th class="crmact'+(ed?' thed':'')+'" data-ti="'+n+'"'+(ed?' ondblclick="tituloCRMEdit('+n+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[n])+'</th>';
   return h;
 }
 function tituloCRMEdit(i){
@@ -3430,7 +3435,7 @@ async function restaurarTitulosCRM(){
 function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
   var nota='';
-  var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable"><thead><tr>'+
+  var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable" style="min-width:'+(1980+(CRM_TIT.length-22+CRM_COLS.length)*150)+'px"><thead><tr>'+
     thsCRM()+'</tr></thead><tbody>';
   rows.forEach(function(r){
     h+='<tr>'+
@@ -3443,7 +3448,7 @@ function pintarCRM(rows){
       crmCell(r,'fecha_contacto',fFecha(r.fecha_contacto))+
       crmCell(r,'propuesta_factura',r.propuesta_factura)+
       crmCell(r,'empresa',r.empresa)+
-      crmCell(r,'nombre',r.nombre)+
+      crmCellNombre(r)+
       crmCellWide(r,'notas_vero',r.notas_vero)+
       crmCellWide(r,'notas_actualizacion',r.notas_actualizacion)+
       crmCellWide(r,'notas_seguimiento',r.notas_seguimiento)+
@@ -3458,7 +3463,7 @@ function pintarCRM(rows){
       crmCell(r,'moneda',r.moneda)+
       crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
       celdasExtraCRM(r)+
-      '<td style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
+      '<td class="crmact" style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
       '</tr>';
   });
   if(!rows.length)h+='<tr><td colspan="'+(CRM_TIT.length+CRM_COLS.length)+'" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
@@ -3747,11 +3752,10 @@ function pintarFiltros(){
     '<span class="filsep"></span>'+
     '<button class="btn" id="cvTabla" data-v="tabla" onclick="setVistaCRM(this.dataset.v)">Tabla</button>'+
     '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">Tablero</button>'+
-    '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
     '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">Duplicados</button>'+
     '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>'+
     (puedeTitulosCRM()?'<button class="btn sec" onclick="gestionColumnasCRM()" title="Agregar o quitar columnas de esta tabla">+ Columna</button>':'')+
-    (puedeTitulosCRM()?'<button class="btn sec" onclick="restaurarTitulosCRM()" title="Regresar los encabezados a su nombre original">Títulos por defecto</button>':'')+
+    '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
     '</div>';
 }
 function pintarResumen(rows){
@@ -3775,6 +3779,71 @@ function limpiarFiltros(){
   ['crmq','fMin','fMax'].forEach(function(id){var e=document.getElementById(id);if(e)e.value='';});
   ['fAsesor','fEstatus','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
   renderCRM();
+}
+var CX_ID=null;
+function cxSel(id,label,lista,actual){
+  var v=(actual==null?'':String(actual)).trim(),vis=[],seen={};
+  for(var i=0;i<lista.length;i++){
+    var x=String(lista[i]).trim();
+    if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;vis.push(x);}
+  }
+  if(v&&!seen[v.toUpperCase()])vis.unshift(v);
+  var h='<label>'+escT(label)+'</label><select id="'+id+'"><option value="">— '+escT(label)+' —</option>';
+  for(var j=0;j<vis.length;j++){
+    h+='<option'+(vis[j].toUpperCase()===v.toUpperCase()?' selected':'')+'>'+escT(vis[j])+'</option>';
+  }
+  return h+'</select>';
+}
+function cxIn(id,label,v,ph,tipo){
+  return '<label>'+escT(label)+'</label><input id="'+id+'"'+(tipo?' type="'+tipo+'"':'')+' placeholder="'+escAttr(ph||'')+'" value="'+escAttr(v==null?'':String(v))+'">';
+}
+function cardexLead(ev,id){
+  if(ev&&ev.preventDefault)ev.preventDefault();
+  var r=null;
+  for(var i=0;i<CRM_ROWS.length;i++){if(String(CRM_ROWS[i].id)===String(id))r=CRM_ROWS[i];}
+  if(!r){toast('No encontré ese registro');return false;}
+  CX_ID=r.id;
+  var ases={};CRM_ROWS.forEach(function(x){var a=(x.asesor||'').trim();if(a)ases[a]=1;});
+  var lAse=Object.keys(ases).sort();
+  var lOri=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
+  var sub=[];
+  if(r.fecha_lead)sub.push('Lead '+fFecha(r.fecha_lead));
+  if(r.estatus_final)sub.push('Final: '+r.estatus_final);
+  if(r.facturado!=null&&Number(r.facturado)>0)sub.push('Facturado '+money(r.facturado));
+  sub.push((r.num_cotizaciones||0)+' cotizaciones');
+  var h='<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Cardex del lead</h3>'+
+    '<p class="muted" style="font-size:.8rem;margin-bottom:.8rem">'+escT(sub.join('  ·  '))+'</p>'+
+    cxIn('cxNom','Nombre del contacto *',r.nombre,'Nombre y apellido')+
+    '<div class="g2"><div>'+cxIn('cxEmp','Empresa',r.empresa,'')+'</div><div>'+cxIn('cxTel','Teléfono',r.telefono,'55...')+'</div></div>'+
+    '<div class="g2"><div>'+cxIn('cxMail','Correo',r.email,'','email')+'</div><div>'+cxSel('cxAse','Asesor',lAse,r.asesor)+'</div></div>'+
+    '<div class="g2"><div>'+cxSel('cxOri','Origen del lead',lOri,r.origen)+'</div><div>'+cxSel('cxEst','Estatus',CRM_ESTATUS,r.estatus_nota)+'</div></div>'+
+    '<div class="g2"><div>'+cxSel('cxMat','Material',CAT_MATERIAL,r.material)+'</div><div>'+cxSel('cxAcab','Acabado',catCombina('acabado',CAT_ACABADO),r.acabado)+'</div></div>'+
+    '<div class="g2"><div>'+cxIn('cxTipo','Tipo',r.tipo,'Ejemplo: Santo Tomás')+'</div><div>'+cxIn('cxForm','Formato',r.formato,'Ejemplo: Plancha 3.20 x 1.80')+'</div></div>'+
+    cxIn('cxCant','Cantidad',r.cantidad,'Ejemplo: 30 m2 / 2 planchas')+
+    cxIn('cxProp','Propuesta s/IVA',(r.propuesta_antes_iva==null?'':r.propuesta_antes_iva),'0.00','number')+
+    '<div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap"><button class="btn" onclick="guardarCardex()">Guardar cambios</button><button class="btn sec" onclick="cardexFicha()">Abrir ficha completa</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
+  openModal(h);
+  return false;
+}
+function cardexFicha(){var id=CX_ID;closeModal();if(id)abrirFicha(id);}
+async function guardarCardex(){
+  var id=CX_ID;if(!id)return;
+  var nom=val('cxNom');
+  if(!nom){toast('El nombre no puede quedar vacío');return;}
+  function nn(x){x=val(x);return x===''?null:x;}
+  var body={nombre:nom,empresa:nn('cxEmp'),telefono:nn('cxTel'),email:nn('cxMail'),
+    asesor:nn('cxAse'),origen:nn('cxOri'),estatus_nota:nn('cxEst'),
+    material:nn('cxMat'),acabado:nn('cxAcab'),tipo:nn('cxTipo'),
+    formato:nn('cxForm'),cantidad:nn('cxCant')};
+  var p=val('cxProp');
+  body.propuesta_antes_iva=(p===''?null:parseFloat(p));
+  var d=await api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify(body)});
+  if(d&&d.ok){
+    for(var i=0;i<CRM_ROWS.length;i++){
+      if(String(CRM_ROWS[i].id)===String(id)){for(var k in body)CRM_ROWS[i][k]=body[k];}
+    }
+    closeModal();renderCRM();toast('Cardex guardado');
+  }else toast((d&&d.error)||'No se pudo guardar el cardex');
 }
 function gestionColumnasCRM(){
   var h='<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Columnas del CRM</h3>'+
