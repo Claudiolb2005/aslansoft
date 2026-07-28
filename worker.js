@@ -3608,7 +3608,7 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
-var CAT_MATERIAL=['Mármol','Granito','Cuarcita','Cuarzo','Piedra sinterizada','Ónix'];
+var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CUARZO','PIEDRA SINTERIZADA','ONIX'];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
 var CAT_ACABADO=['Pulido','Brillado','Mate','Apomazado','Abujardado','Buzardeado','Flameado','Cepillado','Sandblasteado','Envejecido','Natural','Antiderrapante'];
@@ -3661,7 +3661,7 @@ function nuevoCliente(){
     '<div class="g2"><div><label>Empresa</label><input id="ncEmp"></div><div><label>Teléfono</label><input id="ncTel" placeholder="55..."></div></div>'+
     '<div class="g2"><div><label>Correo</label><input id="ncMail" type="email"></div><div><label>Asesor</label><select id="ncAse">'+aopt+'</select></div></div>'+
     '<div class="g2"><div><label>Origen del lead</label><select id="ncOri">'+oopt+'</select></div><div><label>Estatus</label><select id="ncEst">'+eopt+'</select></div></div>'+
-    '<div class="g2"><div>'+catSelect('ncMat','Material',catCombina('material',CAT_MATERIAL),0)+'</div><div>'+catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),1)+'</div></div>'+
+    '<div class="g2"><div>'+catSelect('ncMat','Material',CAT_MATERIAL,0)+'</div><div>'+catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),1)+'</div></div>'+
     '<div class="g2"><div><label>Tipo</label><input id="ncTipo" placeholder="Ejemplo: Santo Tomás"></div><div><label>Formato</label><input id="ncForm" placeholder="Ejemplo: Plancha 3.20 x 1.80"></div></div>'+
     '<label>Cantidad</label><input id="ncCant" placeholder="Ejemplo: 30 m2 / 2 planchas">'+
     '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
