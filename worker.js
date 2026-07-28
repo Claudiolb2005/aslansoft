@@ -2450,8 +2450,6 @@ function renderApp() {
 .crmtable th.thedit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.30);cursor:text;outline:none;color:var(--gold2,#d8b877)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
-.crmtable td.crmact{position:sticky;right:0;z-index:3;background:var(--card);box-shadow:-9px 0 10px -8px var(--cardsh,rgba(0,0,0,.35))}
-.crmtable th.crmact{position:sticky;right:0;z-index:4;background:var(--thead,#1d1a14);box-shadow:-9px 0 10px -8px var(--cardsh,rgba(0,0,0,.35))}
 .ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
 .ficha-name{font-family:'Cormorant Garamond',serif;font-size:1.9rem;color:var(--gold);line-height:1.1}
 .ficha-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
