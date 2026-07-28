@@ -859,14 +859,14 @@ async function handleClientes(request, env, payload, method, id) {
       }
     }
     const res = await env.DB.prepare(
-      "INSERT INTO clientes (nombre,empresa,tipo,etapa,telefono,email,ciudad,direccion,rfc,notas,empleado_asignado_id,fecha_lead,origen,validacion,estatus_final,asesor,estatus_nota,fecha_contacto,propuesta_factura,notas_vero,notas_actualizacion,notas_seguimiento,material,propuesta_antes_iva,moneda,facturado) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      "INSERT INTO clientes (nombre,empresa,tipo,etapa,telefono,email,ciudad,direccion,rfc,notas,empleado_asignado_id,fecha_lead,origen,validacion,estatus_final,asesor,estatus_nota,fecha_contacto,propuesta_factura,notas_vero,notas_actualizacion,notas_seguimiento,material,acabado,propuesta_antes_iva,moneda,facturado) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(b.nombre, b.empresa || null, b.tipo || null, b.etapa || "prospecto", b.telefono || null,
            b.email || null, b.ciudad || null, b.direccion || null, b.rfc || null, b.notas || null,
            b.empleado_asignado_id || null,
            b.fecha_lead || null, b.origen || null, b.validacion || null, b.estatus_final || null,
            b.asesor || null, b.estatus_nota || null, b.fecha_contacto || null, b.propuesta_factura || null,
            b.notas_vero || null, b.notas_actualizacion || null, b.notas_seguimiento || null,
-           b.material || null, (b.propuesta_antes_iva==null?null:b.propuesta_antes_iva), b.moneda || null,
+           b.material || null, b.acabado || null, (b.propuesta_antes_iva==null?null:b.propuesta_antes_iva), b.moneda || null,
            (b.facturado==null?null:b.facturado)).run();
     await audit(env, payload.sub, "crear", "clientes", res.meta.last_row_id, b, request);
     return ok({ id: res.meta.last_row_id });
@@ -1990,6 +1990,7 @@ async function getConfig(env) {
     whatsapp: map.whatsapp || EMPRESA.whatsapp || "",
     email: map.email || EMPRESA.email || "",
     iva: map.iva != null ? Number(map.iva) : 16,
+    crm_titulos: map.crm_titulos || "",
   };
 }
 async function handleConfig(request, env, payload, method) {
@@ -1998,9 +1999,11 @@ async function handleConfig(request, env, payload, method) {
     cfg.sistema = { whatsapp: !!(env.WA_TOKEN && env.WA_PHONE_ID), fotos_r2: !!env.FILES, verify_token: !!env.WA_VERIFY_TOKEN };
     return ok(cfg);
   }
-  if (!hasRole(payload, "admin")) return fail("Solo administración puede cambiar la configuración.", 403);
   const b = await request.json().catch(() => ({}));
-  const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva"];
+  const _kcfg = Object.keys(b || {});
+  const _soloTitulos = _kcfg.length > 0 && _kcfg.every((k) => k === "crm_titulos");
+  if (!hasRole(payload, "admin") && !(_soloTitulos && hasRole(payload, "gerente"))) return fail("Solo administración puede cambiar la configuración.", 403);
+  const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva", "crm_titulos"];
   for (const k of campos) {
     if (k in b && b[k] !== undefined && b[k] !== null) {
       const v = (k === "iva") ? String(Number(b[k]) || 0) : String(b[k]);
@@ -2354,6 +2357,9 @@ function renderApp() {
 .crmc{min-width:110px;outline:none;cursor:cell;user-select:none;-webkit-user-select:none}
 .crmc.sel{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.10)}
 .crmc.edit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.22);cursor:text;user-select:text;-webkit-user-select:text}
+.crmtable th.thed{cursor:cell}
+.crmtable th.thed:hover{background:rgba(139,109,63,.28)}
+.crmtable th.thedit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.30);cursor:text;outline:none;color:var(--gold2,#d8b877)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
 .ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
@@ -3218,6 +3224,8 @@ async function viewClientes(c){
   cont.innerHTML='<div id="crmFiltros"></div><div id="crmResumen"></div><div id="crmBody">Cargando…</div>';
   var d=await api('/api/clientes');if(!d||!d.ok)return;
   CRM_ROWS=d.data;
+  if(!CFG)await cargarCFG();
+  cargarTitulosCRM();
   pintarFiltros();
   renderCRM();
 }
@@ -3254,11 +3262,71 @@ function renderCRM(){
   pintarResumen(rows);
   if(CRM_VISTA==='tablero')pintarTableroCRM(rows);else pintarCRM(rows);
 }
+var CRM_TIT_DEF=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
+var CRM_TIT_CAMPOS=['fecha_lead','origen','validacion','estatus_final','asesor','estatus_nota','fecha_contacto','propuesta_factura','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','propuesta_antes_iva','moneda','facturado'];
+var CRM_TIT=CRM_TIT_DEF.slice();
+var TIT_ORIG='';
+function escT(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function cargarTitulosCRM(){
+  CRM_TIT=CRM_TIT_DEF.slice();
+  try{
+    var raw=(CFG&&CFG.crm_titulos)?CFG.crm_titulos:'';
+    if(!raw)return;
+    var a=JSON.parse(raw);
+    if(!a||typeof a.length!=='number')return;
+    for(var i=0;i<CRM_TIT_DEF.length;i++){
+      var v=(a[i]==null)?'':String(a[i]).replace(/[<>]/g,'').trim();
+      CRM_TIT[i]=v||CRM_TIT_DEF[i];
+    }
+  }catch(e){CRM_TIT=CRM_TIT_DEF.slice();}
+}
+function puedeTitulosCRM(){return USER&&(USER.rol==='admin'||USER.rol==='gerente');}
+function thsCRM(){
+  var ed=puedeTitulosCRM(),h='';
+  for(var i=0;i<CRM_TIT.length;i++){
+    h+='<th data-ti="'+i+'"'+(ed?' class="thed" ondblclick="tituloCRMEdit('+i+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[i])+'</th>';
+  }
+  return h;
+}
+function tituloCRMEdit(i){
+  if(!puedeTitulosCRM())return;
+  var th=document.querySelector('.crmtable th[data-ti="'+i+'"]');if(!th)return;
+  TIT_ORIG=th.textContent;
+  th.contentEditable='true';th.classList.add('thedit');th.focus();
+  try{var rg=document.createRange();rg.selectNodeContents(th);var sl=window.getSelection();sl.removeAllRanges();sl.addRange(rg);}catch(e){}
+  th.onkeydown=function(ev){
+    ev.stopPropagation();
+    if(ev.key==='Enter'){ev.preventDefault();th.blur();}
+    else if(ev.key==='Escape'){ev.preventDefault();th.textContent=TIT_ORIG;th.blur();}
+  };
+  th.onblur=function(){tituloCRMFin(i,th);};
+}
+function tituloCRMFin(i,th){
+  th.onblur=null;th.onkeydown=null;th.contentEditable='false';th.classList.remove('thedit');
+  var v=(th.textContent||'').replace(/[<>]/g,'').trim();
+  if(!v)v=CRM_TIT_DEF[i];
+  th.textContent=v;
+  if(v===CRM_TIT[i])return;
+  CRM_TIT[i]=v;
+  guardarTitulosCRM(true);
+}
+async function guardarTitulosCRM(aviso){
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({crm_titulos:JSON.stringify(CRM_TIT)})});
+  if(d&&d.ok){CFG=d.data;if(aviso)toast('Título de columna actualizado');}
+  else{toast((d&&d.error)||'No se pudo guardar el título');cargarTitulosCRM();renderCRM();}
+}
+async function restaurarTitulosCRM(){
+  if(!puedeTitulosCRM()){toast('Sin permiso');return;}
+  CRM_TIT=CRM_TIT_DEF.slice();
+  await guardarTitulosCRM(false);
+  renderCRM();
+  toast('Títulos restaurados');
+}
 function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
   var nota='';
   var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable"><thead><tr>'+
-    '<th>FECHA</th><th>ORIGEN</th><th>VALIDACIÓN</th><th>ESTATUS FINAL</th><th>ASESOR</th><th>ESTATUS/NOTA</th><th>F. CONTACTO</th><th>PROP/FACT</th><th>COMPAÑÍA</th><th>CONTACTO</th><th>NOTAS VERO</th><th>NOTAS ACTUALIZACIÓN</th><th>SEGUIMIENTO</th><th>TELÉFONO</th><th>MAIL</th><th>MATERIAL</th><th>TIPO</th><th>ACABADO</th><th>PROP. S/IVA</th><th>MONEDA</th><th>FACTURADO</th><th>COTIZACIONES</th></tr></thead><tbody>';
+    thsCRM()+'</tr></thead><tbody>';
   rows.forEach(function(r){
     h+='<tr>'+
       crmCell(r,'fecha_lead',fFecha(r.fecha_lead))+
@@ -3432,6 +3500,46 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
+var CAT_MATERIAL=['Mármol','Granito','Cuarcita','Cuarzo','Piedra sinterizada','Travertino','Ónix','Caliza','Recinto','Piedra volcánica','Porcelánico','Madera de ingeniería'];
+var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
+var CAT_ACABADO=['Pulido','Brillado','Mate','Apomazado','Abujardado','Buzardeado','Flameado','Cepillado','Sandblasteado','Envejecido','Natural','Antiderrapante'];
+var NC_IDS=['ncMat','ncTipo','ncAcab'];
+function catKey(v){
+  var ac='ÁÀÄÂÃÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇ',pl='AAAAAEEEEIIIIOOOOOUUUUNC',o='';
+  var u=String(v==null?'':v).toUpperCase().trim();
+  for(var i=0;i<u.length;i++){var p=ac.indexOf(u.charAt(i));o+=(p>=0?pl.charAt(p):u.charAt(i));}
+  return o;
+}
+function catCombina(campo,base){
+  var m={},out=[];
+  base.forEach(function(x){m[catKey(x)]=x;});
+  (CRM_ROWS||[]).forEach(function(r){
+    var v=(r[campo]==null?'':String(r[campo])).trim();
+    if(v&&v.length<=45){var k=catKey(v);if(!m[k])m[k]=v;}
+  });
+  for(var kk in m)out.push(m[kk]);
+  out.sort(function(a,b){return a.localeCompare(b,'es');});
+  return out;
+}
+function catSelect(id,label,lista,n){
+  var h='<label>'+escT(label)+'</label><select id="'+id+'" onchange="ncOtroTog('+n+')"><option value="">— '+escT(label)+' —</option>';
+  lista.forEach(function(v){h+='<option>'+escT(v)+'</option>';});
+  h+='<option value="__otro__">— Otro (escribir) —</option></select>';
+  h+='<input id="'+id+'Otro" style="display:none;margin-top:.35rem" placeholder="Escribe el '+escT(label.toLowerCase())+'">';
+  return h;
+}
+function ncOtroTog(n){
+  var sel=document.getElementById(NC_IDS[n]),otr=document.getElementById(NC_IDS[n]+'Otro');
+  if(!sel||!otr)return;
+  if(sel.value==='__otro__'){otr.style.display='';otr.focus();}
+  else{otr.style.display='none';otr.value='';}
+}
+function ncPick(n){
+  var sel=document.getElementById(NC_IDS[n]),otr=document.getElementById(NC_IDS[n]+'Otro');
+  if(!sel)return '';
+  if(sel.value==='__otro__')return otr?String(otr.value).trim():'';
+  return String(sel.value).trim();
+}
 function nuevoCliente(){
   var ases={};(CRM_ROWS||[]).forEach(function(r){var a=(r.asesor||'').trim();if(a)ases[a]=1;});
   var aopt='<option value="">— Asesor —</option>';Object.keys(ases).sort().forEach(function(a){aopt+='<option>'+escAttr(a)+'</option>';});
@@ -3444,7 +3552,8 @@ function nuevoCliente(){
     '<div class="g2"><div><label>Empresa</label><input id="ncEmp"></div><div><label>Teléfono</label><input id="ncTel" placeholder="55..."></div></div>'+
     '<div class="g2"><div><label>Correo</label><input id="ncMail" type="email"></div><div><label>Asesor</label><select id="ncAse">'+aopt+'</select></div></div>'+
     '<div class="g2"><div><label>Origen del lead</label><select id="ncOri">'+oopt+'</select></div><div><label>Estatus</label><select id="ncEst">'+eopt+'</select></div></div>'+
-    '<label>Material de interés</label><input id="ncMat">'+
+    '<div class="g2"><div>'+catSelect('ncMat','Material',catCombina('material',CAT_MATERIAL),0)+'</div><div>'+catSelect('ncTipo','Tipo',catCombina('tipo',CAT_TIPO),1)+'</div></div>'+
+    catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),2)+
     '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
     '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarNuevoCliente()">Crear registro</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
   setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();},80);
@@ -3458,7 +3567,9 @@ function guardarNuevoCliente(){
   var ase=val('ncAse');if(ase)body.asesor=ase;
   var ori=val('ncOri');if(ori)body.origen=ori;
   var est=val('ncEst');if(est)body.estatus_nota=est;
-  var mat=val('ncMat');if(mat)body.material=mat;
+  var mat=ncPick(0);if(mat)body.material=mat;
+  var tip=ncPick(1);if(tip)body.tipo=tip;
+  var aca=ncPick(2);if(aca)body.acabado=aca;
   var prop=val('ncProp');if(prop!=='')body.propuesta_antes_iva=parseFloat(prop);
   crearCliente(body, false);
 }
@@ -3528,6 +3639,7 @@ function pintarFiltros(){
     '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
     '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">Duplicados</button>'+
     '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>'+
+    (puedeTitulosCRM()?'<button class="btn sec" onclick="restaurarTitulosCRM()" title="Regresar los encabezados a su nombre original">Títulos por defecto</button>':'')+
     '</div>';
 }
 function pintarResumen(rows){
@@ -3553,7 +3665,7 @@ function limpiarFiltros(){
   renderCRM();
 }
 function exportarCRMCSV(){
-  var cols=[['fecha_lead','FECHA'],['origen','ORIGEN'],['validacion','VALIDACIÓN'],['estatus_final','ESTATUS FINAL'],['asesor','ASESOR'],['estatus_nota','ESTATUS/NOTA'],['fecha_contacto','FECHA CONTACTO'],['propuesta_factura','PROPUESTA/FACTURA'],['empresa','COMPAÑÍA'],['nombre','CONTACTO'],['notas_vero','NOTAS VERO'],['notas_actualizacion','NOTAS ACTUALIZACION'],['notas_seguimiento','SEGUIMIENTO'],['telefono','TELEFONO'],['email','MAIL'],['material','MATERIAL'],['propuesta_antes_iva','PROPUESTA ANTES IVA'],['moneda','MONEDA'],['facturado','FACTURADO']];
+  var cols=CRM_TIT_CAMPOS.map(function(k,i){return [k,CRM_TIT[i]];});
   function esc(v){v=(v==null?'':String(v));return '"'+v.replace(/"/g,'""')+'"';}
   var lines=[cols.map(function(x){return esc(x[1]);}).join(',')];
   CRM_ROWS.forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
