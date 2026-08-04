@@ -1995,6 +1995,7 @@ async function getConfig(env) {
     iva: map.iva != null ? Number(map.iva) : 16,
     crm_titulos: map.crm_titulos || "",
     crm_cols: map.crm_cols || "",
+    crm_layout: map.crm_layout || "",
   };
 }
 const RX_COL = /^col_[a-z0-9_]{1,24}$/;
@@ -2049,9 +2050,9 @@ async function handleConfig(request, env, payload, method) {
   }
   const b = await request.json().catch(() => ({}));
   const _kcfg = Object.keys(b || {});
-  const _soloTitulos = _kcfg.length > 0 && _kcfg.every((k) => k === "crm_titulos");
+  const _soloTitulos = _kcfg.length > 0 && _kcfg.every((k) => k === "crm_titulos" || k === "crm_layout");
   if (!hasRole(payload, "admin") && !(_soloTitulos && hasRole(payload, "gerente"))) return fail("Solo administración puede cambiar la configuración.", 403);
-  const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva", "crm_titulos"];
+  const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva", "crm_titulos", "crm_layout"];
   for (const k of campos) {
     if (k in b && b[k] !== undefined && b[k] !== null) {
       const v = (k === "iva") ? String(Number(b[k]) || 0) : String(b[k]);
@@ -2125,6 +2126,10 @@ async function handleReportesCrmOpciones(request, env, payload) {
     ciudades: await distintos("ciudad"),
     monedas: await distintos("moneda"),
     estatus: await distintos("estatus_nota"),
+    acabados: await distintos("acabado"),
+    formatos: await distintos("formato"),
+    validaciones: await distintos("validacion"),
+    finales: await distintos("estatus_final"),
   });
 }
 
@@ -2143,26 +2148,50 @@ async function handleReportesCrm(request, env, payload, url) {
   function eq(param, col) { const v = q.get(param); if (v) { cond.push(col + " = ?"); args.push(v); } }
   eq("asesor", "asesor"); eq("tipo", "tipo"); eq("origen", "origen");
   eq("ciudad", "ciudad"); eq("moneda", "moneda"); eq("estatus", "estatus_nota");
+  eq("acabado", "acabado"); eq("formato", "formato"); eq("validacion", "validacion");
+  eq("efinal", "estatus_final");
   const material = q.get("material"); if (material) { cond.push("material LIKE ?"); args.push("%" + material + "%"); }
   const qq = q.get("q"); if (qq) { cond.push("(nombre LIKE ? OR empresa LIKE ?)"); args.push("%" + qq + "%", "%" + qq + "%"); }
   const mn = q.get("min"); if (mn !== null && mn !== "") { cond.push("COALESCE(propuesta_antes_iva,0) >= ?"); args.push(Number(mn)); }
   const mx = q.get("max"); if (mx !== null && mx !== "") { cond.push("COALESCE(propuesta_antes_iva,0) <= ?"); args.push(Number(mx)); }
+  const fmn = q.get("fmin"); if (fmn !== null && fmn !== "") { cond.push("COALESCE(facturado,0) >= ?"); args.push(Number(fmn)); }
+  const fmx = q.get("fmax"); if (fmx !== null && fmx !== "") { cond.push("COALESCE(facturado,0) <= ?"); args.push(Number(fmx)); }
   if (q.get("facturado") === "1") cond.push("COALESCE(facturado,0) > 0");
+  if (q.get("facturado") === "0") cond.push("COALESCE(facturado,0) = 0");
+  if (q.get("conprop") === "1") cond.push("COALESCE(propuesta_antes_iva,0) > 0");
   const where = cond.join(" AND ");
 
-  const resumen = await env.DB.prepare("SELECT COUNT(*) AS registros, COALESCE(SUM(propuesta_antes_iva),0) AS suma_propuesta, COALESCE(SUM(facturado),0) AS suma_facturado, COALESCE(AVG(NULLIF(propuesta_antes_iva,0)),0) AS promedio FROM clientes WHERE " + where).bind(...args).first();
-  const porAsesor = (await env.DB.prepare("SELECT COALESCE(asesor,'(sin asesor)') AS asesor, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY asesor ORDER BY monto DESC").bind(...args).all()).results || [];
-  const porEstatus = (await env.DB.prepare("SELECT COALESCE(estatus_nota,'(sin estatus)') AS estatus, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY estatus_nota ORDER BY monto DESC").bind(...args).all()).results || [];
-  const porMaterial = (await env.DB.prepare("SELECT COALESCE(NULLIF(TRIM(material),''),'(sin material)') AS material, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY material ORDER BY monto DESC LIMIT 30").bind(...args).all()).results || [];
-  const porCiudad = (await env.DB.prepare("SELECT COALESCE(NULLIF(TRIM(ciudad),''),'(sin ciudad)') AS ciudad, COUNT(*) AS n, COALESCE(SUM(propuesta_antes_iva),0) AS monto FROM clientes WHERE " + where + " GROUP BY ciudad ORDER BY monto DESC LIMIT 30").bind(...args).all()).results || [];
+  const AGG = "COUNT(*) AS n, COALESCE(SUM(propuesta_inicial),0) AS inicial, COALESCE(SUM(propuesta_antes_iva),0) AS monto, COALESCE(SUM(facturado),0) AS facturado";
+  async function grupo(expr, alias, limite) {
+    const sql = "SELECT " + expr + " AS " + alias + ", " + AGG + " FROM clientes WHERE " + where + " GROUP BY 1 ORDER BY monto DESC" + (limite ? (" LIMIT " + limite) : "");
+    return (await env.DB.prepare(sql).bind(...args).all()).results || [];
+  }
+  const resumen = await env.DB.prepare("SELECT COUNT(*) AS registros, COALESCE(SUM(propuesta_inicial),0) AS suma_inicial, COALESCE(SUM(propuesta_antes_iva),0) AS suma_propuesta, COALESCE(SUM(facturado),0) AS suma_facturado, COALESCE(AVG(NULLIF(propuesta_antes_iva,0)),0) AS promedio, SUM(CASE WHEN COALESCE(propuesta_antes_iva,0)>0 THEN 1 ELSE 0 END) AS con_propuesta, SUM(CASE WHEN COALESCE(facturado,0)>0 THEN 1 ELSE 0 END) AS con_factura FROM clientes WHERE " + where).bind(...args).first();
+  const porAsesor = await grupo("COALESCE(NULLIF(TRIM(asesor),''),'(sin asesor)')", "asesor", 0);
+  const porEstatus = await grupo("COALESCE(NULLIF(TRIM(estatus_nota),''),'(sin estatus)')", "estatus", 0);
+  const porMaterial = await grupo("COALESCE(NULLIF(TRIM(material),''),'(sin material)')", "material", 30);
+  const porAcabado = await grupo("COALESCE(NULLIF(TRIM(acabado),''),'(sin acabado)')", "acabado", 30);
+  const porCiudad = await grupo("COALESCE(NULLIF(TRIM(ciudad),''),'(sin ciudad)')", "ciudad", 30);
+  const porOrigen = await grupo("COALESCE(NULLIF(TRIM(origen),''),'(sin origen)')", "origen", 30);
+  const porMes = (await env.DB.prepare("SELECT COALESCE(substr(date(" + campo + "),1,7),'(sin fecha)') AS mes, " + AGG + " FROM clientes WHERE " + where + " GROUP BY 1 ORDER BY mes DESC LIMIT 36").bind(...args).all()).results || [];
   const LIMITE = 1000;
-  const filasRows = (await env.DB.prepare("SELECT id, nombre, empresa, asesor, tipo, ciudad, material, estatus_nota AS estatus, estatus_final, moneda, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, " + campo + " AS fecha FROM clientes WHERE " + where + " ORDER BY COALESCE(propuesta_antes_iva,0) DESC, id DESC LIMIT " + (LIMITE + 1)).bind(...args).all()).results || [];
+  const SEL = "id, " + campo + " AS fecha, fecha_lead, origen, validacion, estatus_final, asesor, estatus_nota AS estatus, fecha_contacto, propuesta_factura, empresa, nombre, telefono, email, ciudad, material, tipo, acabado, formato, cantidad, moneda, COALESCE(propuesta_inicial,0) AS propuesta_inicial, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, notas_vero, notas_actualizacion, notas_seguimiento";
+  const filasRows = (await env.DB.prepare("SELECT " + SEL + " FROM clientes WHERE " + where + " ORDER BY COALESCE(propuesta_antes_iva,0) DESC, id DESC LIMIT " + (LIMITE + 1)).bind(...args).all()).results || [];
   const truncado = filasRows.length > LIMITE;
   const filas = truncado ? filasRows.slice(0, LIMITE) : filasRows;
 
   return ok({
-    resumen: { registros: resumen ? resumen.registros : 0, suma_propuesta: resumen ? resumen.suma_propuesta : 0, suma_facturado: resumen ? resumen.suma_facturado : 0, promedio: resumen ? resumen.promedio : 0 },
-    por_asesor: porAsesor, por_estatus: porEstatus, por_material: porMaterial, por_ciudad: porCiudad,
+    resumen: {
+      registros: resumen ? resumen.registros : 0,
+      suma_inicial: resumen ? resumen.suma_inicial : 0,
+      suma_propuesta: resumen ? resumen.suma_propuesta : 0,
+      suma_facturado: resumen ? resumen.suma_facturado : 0,
+      promedio: resumen ? resumen.promedio : 0,
+      con_propuesta: resumen ? resumen.con_propuesta : 0,
+      con_factura: resumen ? resumen.con_factura : 0,
+    },
+    por_asesor: porAsesor, por_estatus: porEstatus, por_material: porMaterial,
+    por_acabado: porAcabado, por_ciudad: porCiudad, por_origen: porOrigen, por_mes: porMes,
     filas: filas, truncado: truncado,
   });
 }
@@ -2450,6 +2479,12 @@ function renderApp() {
 .crmtable th.thedit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.30);cursor:text;outline:none;color:var(--gold2,#d8b877)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
+.crmtable td.fx{position:sticky;z-index:3;background:var(--card)}
+.crmtable th.fx{position:sticky;z-index:6;background:var(--thead,#EDE6D6)}
+.crmtable th.fxend,.crmtable td.fxend{border-right:2px solid var(--gold)}
+.crmtable th.drag{opacity:.45}
+.colman td{padding:.3rem .4rem;border-bottom:1px solid var(--bd);vertical-align:middle}
+.colman th{position:static;font-size:.68rem;padding:.35rem .4rem;text-transform:uppercase;letter-spacing:.03em}
 .ficha-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;border-bottom:1px solid var(--bd);padding-bottom:.8rem;margin-top:.3rem}
 .ficha-name{font-family:'Cormorant Garamond',serif;font-size:1.9rem;color:var(--gold);line-height:1.1}
 .ficha-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
@@ -2548,7 +2583,7 @@ td[contenteditable]:focus{outline:1px solid var(--gold);background:rgba(139,109,
 function toggleSide(){if(window.innerWidth<=768){document.getElementById('side').classList.toggle('open');}else{document.body.classList.toggle('side-off');try{localStorage.setItem('aslan_side',document.body.classList.contains('side-off')?'0':'1');}catch(e){}ajustarXls();}}
 if(window.innerWidth>768){try{if(localStorage.getItem('aslan_side')==='0')document.body.classList.add('side-off');}catch(e){}}
 function ajustarXls(){var e=document.querySelector('#content .xls');if(!e)return;var r=e.getBoundingClientRect();var h=window.innerHeight-r.top-16;if(h>180)e.style.maxHeight=h+'px';}
-window.addEventListener('resize',function(){ajustarXls();});
+window.addEventListener('resize',function(){ajustarXls();if(typeof fijarColsCRM==='function')fijarColsCRM();});
 var CRM_FIL_OPEN=true,CRM_KPI_OPEN=true;
 try{CRM_FIL_OPEN=localStorage.getItem('aslan_crm_fil')!=='0';CRM_KPI_OPEN=localStorage.getItem('aslan_crm_kpi')!=='0';}catch(e){}
 function togFiltros(){CRM_FIL_OPEN=!CRM_FIL_OPEN;try{localStorage.setItem('aslan_crm_fil',CRM_FIL_OPEN?'1':'0');}catch(e){}var b=document.getElementById('filBody'),hd=document.getElementById('filHd');if(b)b.style.display=CRM_FIL_OPEN?'':'none';if(hd)hd.classList.toggle('closed',!CRM_FIL_OPEN);ajustarXls();}
@@ -2853,19 +2888,23 @@ function repOptEls(arr,sel){
 }
 async function viewReportesCRM(c){
   document.getElementById('acciones').innerHTML='<button class="btn sec" onclick="exportarCrmCSV()">Exportar CSV</button>';
-  if(!REP_OPC){var o=await api('/api/reportes/crm/opciones');REP_OPC=(o&&o.ok)?o.data:{asesores:[],tipos:[],origenes:[],materiales:[],ciudades:[],monedas:[],estatus:[]};}
-  var O=REP_OPC;
+  if(!REP_OPC){var o=await api('/api/reportes/crm/opciones');REP_OPC=(o&&o.ok)?o.data:{};}
+  var O=REP_OPC||{};
   var h='<div class="card" style="margin-bottom:1rem">';
   h+='<h3 style="color:var(--gold);font-size:1.15rem;margin-bottom:.7rem">Filtros del reporte</h3>';
   h+='<div class="g2"><div><label>Desde</label><input id="fDesde" type="date"></div><div><label>Hasta</label><input id="fHasta" type="date"></div></div>';
   h+='<div class="g2"><div><label>Campo de fecha</label><select id="fCampo"><option value="created_at">Fecha de alta</option><option value="fecha_lead">Fecha lead</option><option value="fecha_contacto">Fecha contacto</option></select></div>';
-  h+='<div><label>Estatus del trato</label><select id="fFinal"><option value="activos">Activos (en pipeline)</option><option value="nv">No vendidos (NV)</option><option value="todos">Todos</option></select></div></div>';
-  h+='<div class="g2"><div><label>Asesor</label><select id="fAsesor">'+repOptEls(O.asesores)+'</select></div><div><label>Tipo de cliente</label><select id="fTipo">'+repOptEls(O.tipos)+'</select></div></div>';
-  h+='<div class="g2"><div><label>Origen</label><select id="fOrigen">'+repOptEls(O.origenes)+'</select></div><div><label>Ciudad</label><select id="fCiudad">'+repOptEls(O.ciudades)+'</select></div></div>';
-  h+='<div class="g2"><div><label>Material</label><select id="fMaterial">'+repOptEls(O.materiales)+'</select></div><div><label>Moneda</label><select id="fMoneda">'+repOptEls(O.monedas)+'</select></div></div>';
-  h+='<div class="g2"><div><label>Estatus / nota</label><select id="fEstatus">'+repOptEls(O.estatus)+'</select></div><div><label>Buscar (nombre / empresa)</label><input id="fQ" type="text" placeholder="texto libre"></div></div>';
-  h+='<div class="g2"><div><label>Monto mínimo (antes IVA)</label><input id="fMin" type="number" step="any" placeholder="0"></div><div><label>Monto máximo (antes IVA)</label><input id="fMax" type="number" step="any" placeholder="sin límite"></div></div>';
-  h+='<div style="margin-top:.7rem"><label style="display:inline-flex;align-items:center;gap:.4rem;margin:0;text-transform:none;letter-spacing:0"><input id="fFact" type="checkbox" style="width:auto"> Solo con monto facturado</label></div>';
+  h+='<div><label>Pipeline</label><select id="fFinal"><option value="activos">Activos (en pipeline)</option><option value="nv">No vendidos (NV)</option><option value="todos">Todos</option></select></div></div>';
+  h+='<div class="g2"><div><label>Asesor</label><select id="fAsesor">'+repOptEls(O.asesores)+'</select></div><div><label>Origen del lead</label><select id="fOrigen">'+repOptEls(O.origenes)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Validación</label><select id="fValid">'+repOptEls(O.validaciones)+'</select></div><div><label>Estatus final</label><select id="fEFinal">'+repOptEls(O.finales)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Estatus / nota</label><select id="fEstatus">'+repOptEls(O.estatus)+'</select></div><div><label>Ciudad</label><select id="fCiudad">'+repOptEls(O.ciudades)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Material</label><select id="fMaterial">'+repOptEls(O.materiales)+'</select></div><div><label>Acabado</label><select id="fAcabado">'+repOptEls(O.acabados)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Tipo</label><select id="fTipo">'+repOptEls(O.tipos)+'</select></div><div><label>Formato</label><select id="fFormato">'+repOptEls(O.formatos)+'</select></div></div>';
+  h+='<div class="g2"><div><label>Moneda</label><select id="fMoneda">'+repOptEls(O.monedas)+'</select></div><div><label>Buscar (nombre / empresa)</label><input id="fQ" type="text" placeholder="texto libre"></div></div>';
+  h+='<div class="g2"><div><label>Propuesta mínima (s/IVA)</label><input id="fMin" type="number" step="any" placeholder="0"></div><div><label>Propuesta máxima (s/IVA)</label><input id="fMax" type="number" step="any" placeholder="sin límite"></div></div>';
+  h+='<div class="g2"><div><label>Facturado mínimo</label><input id="fFMin" type="number" step="any" placeholder="0"></div><div><label>Facturado máximo</label><input id="fFMax" type="number" step="any" placeholder="sin límite"></div></div>';
+  h+='<div class="g2"><div><label>Propuesta</label><select id="fConProp"><option value="">Todas</option><option value="1">Solo con propuesta capturada</option></select></div>';
+  h+='<div><label>Facturación</label><select id="fFact"><option value="">Todas</option><option value="1">Solo facturadas</option><option value="0">Solo sin facturar</option></select></div></div>';
   h+='<div style="height:.8rem"></div><button class="btn" onclick="aplicarCrmReporte()">Aplicar filtros</button> <button class="btn sec" onclick="limpiarCrmReporte()">Limpiar</button>';
   h+='</div><div id="crmResultado"><p class="muted" style="font-size:.9rem">Ajusta los filtros y pulsa «Aplicar filtros».</p></div>';
   c.innerHTML=h;
@@ -2877,37 +2916,59 @@ function crmQS(){
   add('desde',val('fDesde'));add('hasta',val('fHasta'));add('campo',val('fCampo'));
   add('final',val('fFinal'));add('asesor',val('fAsesor'));add('tipo',val('fTipo'));
   add('origen',val('fOrigen'));add('ciudad',val('fCiudad'));add('material',val('fMaterial'));
-  add('moneda',val('fMoneda'));add('estatus',val('fEstatus'));add('q',val('fQ'));
-  add('min',val('fMin'));add('max',val('fMax'));
-  var fc=document.getElementById('fFact');if(fc&&fc.checked)add('facturado','1');
+  add('acabado',val('fAcabado'));add('formato',val('fFormato'));add('validacion',val('fValid'));
+  add('efinal',val('fEFinal'));add('moneda',val('fMoneda'));add('estatus',val('fEstatus'));
+  add('q',val('fQ'));add('min',val('fMin'));add('max',val('fMax'));
+  add('fmin',val('fFMin'));add('fmax',val('fFMax'));
+  add('conprop',val('fConProp'));add('facturado',val('fFact'));
   return p.join('&');
 }
+function repFilaGrupo(x,etq){return [x[etq]||'\u2014',x.n,money(x.inicial),money(x.monto),money(x.facturado)];}
+var REP_GRP=['Registros','Propuesta inicial','Propuesta actual','Facturado'];
 async function aplicarCrmReporte(){
   var box=document.getElementById('crmResultado');box.innerHTML='Cargando…';
   var d=await api('/api/reportes/crm?'+crmQS());
   if(!d||!d.ok){box.innerHTML='<p class="muted">'+((d&&d.error)||'Error')+'</p>';return;}
   REP_CRM=d.data;var r=d.data.resumen;
+  var conv=(Number(r.suma_propuesta)>0)?(Number(r.suma_facturado)/Number(r.suma_propuesta)*100):0;
   var h='<div class="kpis">';
   h+=kpiCard('Registros',r.registros);
-  h+=kpiCard('Propuesta antes IVA',money(r.suma_propuesta));
+  h+=kpiCard('Propuesta inicial',money(r.suma_inicial));
+  h+=kpiCard('Propuesta actual s/IVA',money(r.suma_propuesta));
   h+=kpiCard('Facturado',money(r.suma_facturado));
   h+=kpiCard('Ticket promedio',money(r.promedio));
+  h+=kpiCard('Con propuesta',r.con_propuesta);
+  h+=kpiCard('Con factura',r.con_factura);
+  h+=kpiCard('Conversión prop. a factura',(Math.round(conv*10)/10)+'%');
   h+='</div>';
-  h+=tablaReporte('Por asesor',['Asesor','Registros','Monto'],d.data.por_asesor.map(function(x){return [x.asesor||'—',x.n,money(x.monto)];}));
-  h+=tablaReporte('Por estatus',['Estatus','Registros','Monto'],d.data.por_estatus.map(function(x){return [x.estatus||'—',x.n,money(x.monto)];}));
-  h+=tablaReporte('Por material',['Material','Registros','Monto'],d.data.por_material.map(function(x){return [x.material||'—',x.n,money(x.monto)];}));
-  h+=tablaReporte('Por ciudad',['Ciudad','Registros','Monto'],d.data.por_ciudad.map(function(x){return [x.ciudad||'—',x.n,money(x.monto)];}));
-  h+=tablaReporte('Detalle ('+d.data.filas.length+' registros)',['Cliente','Empresa','Asesor','Tipo','Ciudad','Material','Estatus','Propuesta','Facturado'],d.data.filas.map(function(x){return [x.nombre||'—',x.empresa||'—',x.asesor||'—',x.tipo||'—',x.ciudad||'—',x.material||'—',x.estatus||'—',money(x.propuesta),money(x.facturado)];}));
+  h+=tablaReporte('Propuestas y facturación por periodo',['Periodo'].concat(REP_GRP),(d.data.por_mes||[]).map(function(x){return repFilaGrupo(x,'mes');}));
+  h+=tablaReporte('Por asesor',['Asesor'].concat(REP_GRP),(d.data.por_asesor||[]).map(function(x){return repFilaGrupo(x,'asesor');}));
+  h+=tablaReporte('Por estatus / nota',['Estatus'].concat(REP_GRP),(d.data.por_estatus||[]).map(function(x){return repFilaGrupo(x,'estatus');}));
+  h+=tablaReporte('Por origen del lead',['Origen'].concat(REP_GRP),(d.data.por_origen||[]).map(function(x){return repFilaGrupo(x,'origen');}));
+  h+=tablaReporte('Por material',['Material'].concat(REP_GRP),(d.data.por_material||[]).map(function(x){return repFilaGrupo(x,'material');}));
+  h+=tablaReporte('Por acabado',['Acabado'].concat(REP_GRP),(d.data.por_acabado||[]).map(function(x){return repFilaGrupo(x,'acabado');}));
+  h+=tablaReporte('Por ciudad',['Ciudad'].concat(REP_GRP),(d.data.por_ciudad||[]).map(function(x){return repFilaGrupo(x,'ciudad');}));
+  h+=tablaReporte('Detalle ('+d.data.filas.length+' registros)',REP_DET_TIT,d.data.filas.map(repDetFila));
   if(d.data.truncado)h+='<p class="muted" style="font-size:.82rem">Se muestran los primeros '+d.data.filas.length+' registros. Refina los filtros para acotar.</p>';
   document.getElementById('crmResultado').innerHTML=h;
+}
+var REP_DET_TIT=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','TELÉFONO','MAIL','CIUDAD','MATERIAL','TIPO','ACABADO','FORMATO','CANTIDAD','PROP. INICIAL','PROP. S/IVA','MONEDA','FACTURADO'];
+var REP_DET_CAM=['fecha_lead','origen','validacion','estatus_final','asesor','estatus','fecha_contacto','propuesta_factura','empresa','nombre','telefono','email','ciudad','material','tipo','acabado','formato','cantidad','propuesta_inicial','propuesta','moneda','facturado'];
+function repDetFila(x){
+  return REP_DET_CAM.map(function(k){
+    if(k==='fecha_lead'||k==='fecha_contacto')return fFecha(x[k]);
+    if(k==='propuesta_inicial'||k==='propuesta'||k==='facturado')return money(x[k]);
+    return (x[k]==null||x[k]==='')?'\u2014':x[k];
+  });
 }
 function exportarCrmCSV(){
   if(!REP_CRM){toast('Aplica los filtros primero');return;}
   var nl=String.fromCharCode(10),bom=String.fromCharCode(0xFEFF);
   function q(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
-  var cols=['Cliente','Empresa','Asesor','Tipo','Ciudad','Material','Estatus','EstatusFinal','Moneda','PropuestaAntesIVA','Facturado','Fecha'];
+  var cols=REP_DET_TIT.concat(['NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO']);
+  var cam=REP_DET_CAM.concat(['notas_vero','notas_actualizacion','notas_seguimiento']);
   var L=[cols.map(q).join(',')];
-  REP_CRM.filas.forEach(function(x){L.push([x.nombre,x.empresa,x.asesor,x.tipo,x.ciudad,x.material,x.estatus,x.estatus_final,x.moneda,x.propuesta,x.facturado,x.fecha].map(q).join(','));});
+  REP_CRM.filas.forEach(function(x){L.push(cam.map(function(k){return q(x[k]);}).join(','));});
   var blob=new Blob([bom+L.join(nl)],{type:'text/csv;charset=utf-8'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='reporte_crm_aslan.csv';a.click();
 }
@@ -3188,19 +3249,19 @@ function estadoPill(e){
 var CRM_ROWS=[];
 function fFecha(s){if(!s)return '';s=(''+s).trim();var m=/^([0-9]{4})-([0-9]{2})-([0-9]{2})/.exec(s);return m?m[3]+'-'+m[2]+'-'+m[1]:s;}
 function fFechaISO(s){if(!s)return '';s=(''+s).trim();if(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s))return s;var m=/^([0-9]{1,2})[-/]([0-9]{1,2})[-/]([0-9]{4})$/.exec(s);if(!m)return s;var d=('0'+m[1]).slice(-2),mo=('0'+m[2]).slice(-2);return m[3]+'-'+mo+'-'+d;}
-function crmCell(r,campo,val,num){
-  return '<td tabindex="-1" class="crmc'+(num?' crmnum':'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':(num?String(val):String(val)))+'</td>';
+function crmCell(r,campo,val,num,ex){
+  return '<td tabindex="-1" class="crmc'+(num?' crmnum':'')+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="'+(num?1:0)+'" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
 function celdasExtraCRM(r){
   var h='';
   for(var i=0;i<CRM_COLS.length;i++)h+=crmCell(r,CRM_COLS[i].c,r[CRM_COLS[i].c]);
   return h;
 }
-function crmCellNombre(r){
-  return '<td tabindex="-1" class="crmc" data-id="'+r.id+'" data-campo="nombre" data-num="0" title="Clic derecho para abrir el cardex" oncontextmenu="return cardexLead(event,'+r.id+')" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
+function crmCellNombre(r,ex){
+  return '<td tabindex="-1" class="crmc'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="nombre" data-num="0" title="Clic derecho para abrir el cardex" oncontextmenu="return cardexLead(event,'+r.id+')" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
 }
-function crmCellWide(r,campo,val){
-  return '<td tabindex="-1" class="crmc crmwide" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
+function crmCellWide(r,campo,val,ex){
+  return '<td tabindex="-1" class="crmc crmwide'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
 var CRM_VISTA='tabla';
 var CRM_ESTATUS=['SIN RESPUESTA','SEGUIMIENTO','PRECIO','MATERIAL','OTRO'];
@@ -3354,8 +3415,14 @@ function renderCRM(){
 }
 var CRM_TIT_DEF=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','FORMATO','CANTIDAD','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
 var CRM_TIT_CAMPOS=['fecha_lead','origen','validacion','estatus_final','asesor','estatus_nota','fecha_contacto','propuesta_factura','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','formato','cantidad','propuesta_antes_iva','moneda','facturado'];
+var CRM_KEYS=CRM_TIT_CAMPOS.concat(['__acc']);
+var CRM_WIDE={notas_vero:1,notas_actualizacion:1,notas_seguimiento:1};
+var CRM_NUM={propuesta_antes_iva:1,facturado:1};
+var CRM_FECHAS={fecha_lead:1,fecha_contacto:1};
 var CRM_TIT=CRM_TIT_DEF.slice();
 var CRM_COLS=[];
+var CRM_LAY=[];
+var CRM_DRAG=-1;
 var TIT_ORIG='';
 function escT(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function cargarColsCRM(){
@@ -3370,36 +3437,84 @@ function cargarColsCRM(){
     }
   }catch(e){CRM_COLS=[];}
 }
+function layPropia(k){return /^col_/.test(String(k));}
+function layBase(){
+  var a=[];
+  for(var i=0;i<CRM_KEYS.length;i++)a.push({k:CRM_KEYS[i],t:CRM_TIT_DEF[i],v:1,f:0});
+  for(var j=0;j<CRM_COLS.length;j++)a.push({k:CRM_COLS[j].c,t:CRM_COLS[j].t,v:1,f:0});
+  return a;
+}
+function layIdx(k){for(var i=0;i<CRM_LAY.length;i++)if(CRM_LAY[i].k===k)return i;return -1;}
+function layVisibles(){var n=0;for(var i=0;i<CRM_LAY.length;i++)if(CRM_LAY[i].v!==0)n++;return n;}
+function layOrden(){
+  var fj=[],rs=[];
+  for(var i=0;i<CRM_LAY.length;i++){
+    if(CRM_LAY[i].v===0)continue;
+    if(CRM_LAY[i].f===1)fj.push(i);else rs.push(i);
+  }
+  return fj.concat(rs);
+}
 function cargarTitulosCRM(){
-  CRM_TIT=CRM_TIT_DEF.slice();
   cargarColsCRM();
+  var base=layBase(),mapa={},usado={};
+  base.forEach(function(x){mapa[x.k]=x;});
   try{
-    var raw=(CFG&&CFG.crm_titulos)?CFG.crm_titulos:'';
-    if(!raw)return;
-    var a=JSON.parse(raw);
-    if(!a||typeof a.length!=='number')return;
-    for(var i=0;i<CRM_TIT_DEF.length;i++){
-      var v=(a[i]==null)?'':String(a[i]).replace(/[<>]/g,'').trim();
-      CRM_TIT[i]=v||CRM_TIT_DEF[i];
+    var rt=(CFG&&CFG.crm_titulos)?CFG.crm_titulos:'';
+    if(rt){
+      var t=JSON.parse(rt);
+      if(t&&typeof t.length==='number'){
+        for(var i=0;i<CRM_KEYS.length&&i<t.length;i++){
+          var vv=(t[i]==null)?'':String(t[i]).replace(/[<>]/g,'').trim();
+          if(vv)mapa[CRM_KEYS[i]].t=vv;
+        }
+      }
     }
-  }catch(e){CRM_TIT=CRM_TIT_DEF.slice();}
+  }catch(e){}
+  var out=[];
+  try{
+    var rl=(CFG&&CFG.crm_layout)?CFG.crm_layout:'';
+    if(rl){
+      var L=JSON.parse(rl);
+      if(L&&typeof L.length==='number'){
+        for(var j=0;j<L.length;j++){
+          var e=L[j];
+          if(!e||typeof e.k!=='string')continue;
+          var b=mapa[e.k];
+          if(!b||usado[e.k])continue;
+          usado[e.k]=1;
+          var tt=(e.t==null)?b.t:String(e.t).replace(/[<>]/g,'').trim();
+          out.push({k:e.k,t:tt||b.t,v:(e.v===0?0:1),f:(e.f===1?1:0)});
+        }
+      }
+    }
+  }catch(e){out=[];usado={};}
+  base.forEach(function(x){if(!usado[x.k])out.push({k:x.k,t:x.t,v:1,f:0});});
+  CRM_LAY=out;
+  var ia=layIdx('__acc');
+  if(ia<0){CRM_LAY.push({k:'__acc',t:'COTIZACIONES',v:1,f:0});}
+  else CRM_LAY[ia].v=1;
+  if(!layVisibles())CRM_LAY.forEach(function(x){x.v=1;});
+  CRM_TIT=CRM_LAY.map(function(x){return x.t;});
 }
 function puedeTitulosCRM(){return USER&&(USER.rol==='admin'||USER.rol==='gerente');}
 function thsCRM(){
-  var ed=puedeTitulosCRM(),h='',n=CRM_TIT.length-1;
-  for(var i=0;i<n;i++){
-    h+='<th data-ti="'+i+'"'+(ed?' class="thed" ondblclick="tituloCRMEdit('+i+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[i])+'</th>';
+  var ed=puedeTitulosCRM(),h='',ord=layOrden(),ult=-1;
+  for(var p=0;p<ord.length;p++)if(CRM_LAY[ord[p]].f===1)ult=p;
+  for(var n=0;n<ord.length;n++){
+    var i=ord[n],x=CRM_LAY[i],cl=[];
+    if(x.f===1){cl.push('fx');if(n===ult)cl.push('fxend');}
+    if(x.k==='__acc')cl.push('crmact');
+    if(ed)cl.push('thed');
+    var at=ed?(' draggable="true" ondragstart="crmDragIni(event,'+n+')" ondragover="crmDragSobre(event)" ondrop="crmDragSuelta(event,'+n+')" ondragend="crmDragFin()" ondblclick="tituloCRMEdit('+i+')" title="Arrastra para moverla. Doble clic para renombrarla."'):(' title="'+escT(x.t)+'"');
+    h+='<th data-ti="'+i+'"'+(cl.length?(' class="'+cl.join(' ')+'"'):'')+at+'>'+escT(x.t)+'</th>';
   }
-  for(var j=0;j<CRM_COLS.length;j++){
-    h+='<th title="Columna agregada por ti">'+escT(CRM_COLS[j].t)+'</th>';
-  }
-  h+='<th class="crmact'+(ed?' thed':'')+'" data-ti="'+n+'"'+(ed?' ondblclick="tituloCRMEdit('+n+')" title="Doble clic para renombrar esta columna"':'')+'>'+escT(CRM_TIT[n])+'</th>';
   return h;
 }
 function tituloCRMEdit(i){
   if(!puedeTitulosCRM())return;
   var th=document.querySelector('.crmtable th[data-ti="'+i+'"]');if(!th)return;
   TIT_ORIG=th.textContent;
+  th.setAttribute('draggable','false');
   th.contentEditable='true';th.classList.add('thedit');th.focus();
   try{var rg=document.createRange();rg.selectNodeContents(th);var sl=window.getSelection();sl.removeAllRanges();sl.addRange(rg);}catch(e){}
   th.onkeydown=function(ev){
@@ -3410,62 +3525,138 @@ function tituloCRMEdit(i){
   th.onblur=function(){tituloCRMFin(i,th);};
 }
 function tituloCRMFin(i,th){
-  th.onblur=null;th.onkeydown=null;th.contentEditable='false';th.classList.remove('thedit');
+  th.onblur=null;th.onkeydown=null;th.contentEditable='false';th.classList.remove('thedit');th.setAttribute('draggable','true');
+  var x=CRM_LAY[i];if(!x)return;
   var v=(th.textContent||'').replace(/[<>]/g,'').trim();
-  if(!v)v=CRM_TIT_DEF[i];
+  if(!v){var d=CRM_KEYS.indexOf(x.k);v=(d>=0?CRM_TIT_DEF[d]:x.t);}
   th.textContent=v;
-  if(v===CRM_TIT[i])return;
-  CRM_TIT[i]=v;
-  guardarTitulosCRM(true);
+  if(v===x.t)return;
+  x.t=v;
+  guardarLayoutCRM('Título de columna actualizado');
 }
-async function guardarTitulosCRM(aviso){
-  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({crm_titulos:JSON.stringify(CRM_TIT)})});
-  if(d&&d.ok){CFG=d.data;if(aviso)toast('Título de columna actualizado');}
-  else{toast((d&&d.error)||'No se pudo guardar el título');cargarTitulosCRM();renderCRM();}
+function layPayload(){
+  return CRM_LAY.map(function(x){return {k:x.k,t:x.t,v:(x.v===0?0:1),f:(x.f===1?1:0)};});
+}
+async function guardarLayoutCRM(aviso){
+  CRM_TIT=CRM_LAY.map(function(x){return x.t;});
+  renderCRM();
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({crm_layout:JSON.stringify(layPayload())})});
+  if(d&&d.ok){CFG=d.data;if(aviso)toast(aviso);}
+  else{toast((d&&d.error)||'No se pudieron guardar las columnas');cargarTitulosCRM();renderCRM();}
 }
 async function restaurarTitulosCRM(){
   if(!puedeTitulosCRM()){toast('Sin permiso');return;}
-  CRM_TIT=CRM_TIT_DEF.slice();
-  await guardarTitulosCRM(false);
-  renderCRM();
-  toast('Títulos restaurados');
+  CRM_LAY=layBase();
+  await guardarLayoutCRM('');
+  if(document.getElementById('colManBody'))gestionColumnasCRM();
+  toast('Columnas restauradas');
+}
+function crmDragIni(ev,pos){
+  CRM_DRAG=pos;
+  try{ev.dataTransfer.setData('text/plain',String(pos));ev.dataTransfer.effectAllowed='move';}catch(e){}
+  if(ev&&ev.target&&ev.target.classList)ev.target.classList.add('drag');
+}
+function crmDragSobre(ev){if(ev&&ev.preventDefault)ev.preventDefault();if(ev&&ev.dataTransfer)try{ev.dataTransfer.dropEffect='move';}catch(e){}return false;}
+function crmDragFin(){
+  CRM_DRAG=-1;
+  var ths=document.querySelectorAll('.crmtable th.drag');
+  for(var i=0;i<ths.length;i++)ths[i].classList.remove('drag');
+}
+function crmDragSuelta(ev,pos){
+  if(ev&&ev.preventDefault)ev.preventDefault();
+  var d=CRM_DRAG;CRM_DRAG=-1;
+  var ord=layOrden();
+  if(d<0||d>=ord.length||pos<0||pos>=ord.length||d===pos)return false;
+  var iFrom=ord[d],iTo=ord[pos];
+  var mov=CRM_LAY[iFrom],dest=CRM_LAY[iTo];
+  if(!mov||!dest)return false;
+  var derecha=(iFrom<iTo);
+  CRM_LAY.splice(CRM_LAY.indexOf(mov),1);
+  var iD=CRM_LAY.indexOf(dest);
+  CRM_LAY.splice(derecha?(iD+1):iD,0,mov);
+  mov.f=dest.f;
+  guardarLayoutCRM('');
+  return false;
+}
+function colFijar(i){
+  var x=CRM_LAY[i];if(!x)return;
+  x.f=(x.f===1?0:1);
+  guardarLayoutCRM('');gestionColumnasCRM();
+}
+function colVer(i){
+  var x=CRM_LAY[i];if(!x)return;
+  if(x.k==='__acc'){toast('La columna de acciones no se puede ocultar');return;}
+  if(x.v!==0&&layVisibles()<=1){toast('Debe quedar al menos una columna visible');return;}
+  x.v=(x.v===0?1:0);
+  guardarLayoutCRM('');gestionColumnasCRM();
+}
+function colMover(i,d){
+  var j=i+d;if(j<0||j>=CRM_LAY.length)return;
+  var t=CRM_LAY[i];CRM_LAY[i]=CRM_LAY[j];CRM_LAY[j]=t;
+  guardarLayoutCRM('');gestionColumnasCRM();
+}
+function colArriba(i){colMover(i,-1);}
+function colAbajo(i){colMover(i,1);}
+async function colEliminar(i){
+  var x=CRM_LAY[i];if(!x)return;
+  if(!layPropia(x.k)){toast('Solo se eliminan las columnas que tú creaste. Las de origen se pueden ocultar.');return;}
+  var d=await api('/api/crm/columnas',{method:'POST',body:JSON.stringify({quitar:x.k})});
+  if(!d||!d.ok){toast((d&&d.error)||'No se pudo eliminar la columna');return;}
+  CRM_COLS=d.data||[];
+  CRM_LAY.splice(i,1);
+  await guardarLayoutCRM('');
+  gestionColumnasCRM();
+  toast('Columna eliminada');
+}
+function crmAccBtns(r){
+  return '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> '+
+    '<button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> '+
+    '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button>';
+}
+function crmCeldas(r,ord,ult){
+  var h='';
+  for(var n=0;n<ord.length;n++){
+    var x=CRM_LAY[ord[n]],ex='';
+    if(x.f===1){ex='fx';if(n===ult)ex='fx fxend';}
+    if(x.k==='__acc'){
+      h+='<td class="crmact'+(ex?' '+ex:'')+'" style="white-space:nowrap;text-align:center">'+crmAccBtns(r)+'</td>';
+    }else if(x.k==='nombre'){
+      h+=crmCellNombre(r,ex);
+    }else if(CRM_WIDE[x.k]){
+      h+=crmCellWide(r,x.k,r[x.k],ex);
+    }else if(CRM_NUM[x.k]){
+      h+=crmCell(r,x.k,(r[x.k]==null?'':money(r[x.k])),true,ex);
+    }else if(CRM_FECHAS[x.k]){
+      h+=crmCell(r,x.k,fFecha(r[x.k]),false,ex);
+    }else{
+      h+=crmCell(r,x.k,r[x.k],false,ex);
+    }
+  }
+  return h;
+}
+function fijarColsCRM(){
+  var t=document.querySelector('.crmtable');if(!t)return;
+  var ths=t.querySelectorAll('thead th');
+  var left=0;
+  for(var i=0;i<ths.length;i++){
+    if(!ths[i].classList.contains('fx'))continue;
+    ths[i].style.left=left+'px';
+    var tds=t.querySelectorAll('tbody tr > *:nth-child('+(i+1)+')');
+    for(var j=0;j<tds.length;j++)tds[j].style.left=left+'px';
+    left+=ths[i].offsetWidth;
+  }
 }
 function pintarCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
-  var nota='';
-  var h=nota+'<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable" style="min-width:'+(1980+(CRM_TIT.length-22+CRM_COLS.length)*150)+'px"><thead><tr>'+
+  var ord=layOrden(),ult=-1;
+  for(var p=0;p<ord.length;p++)if(CRM_LAY[ord[p]].f===1)ult=p;
+  var ancho=Math.max(1100,ord.length*110);
+  var h='<div class="card xls" tabindex="0" style="padding:.4rem"><table class="crmtable" style="min-width:'+ancho+'px"><thead><tr>'+
     thsCRM()+'</tr></thead><tbody>';
-  rows.forEach(function(r){
-    h+='<tr>'+
-      crmCell(r,'fecha_lead',fFecha(r.fecha_lead))+
-      crmCell(r,'origen',r.origen)+
-      crmCell(r,'validacion',r.validacion)+
-      crmCell(r,'estatus_final',r.estatus_final)+
-      crmCell(r,'asesor',r.asesor)+
-      crmCell(r,'estatus_nota',r.estatus_nota)+
-      crmCell(r,'fecha_contacto',fFecha(r.fecha_contacto))+
-      crmCell(r,'propuesta_factura',r.propuesta_factura)+
-      crmCell(r,'empresa',r.empresa)+
-      crmCellNombre(r)+
-      crmCellWide(r,'notas_vero',r.notas_vero)+
-      crmCellWide(r,'notas_actualizacion',r.notas_actualizacion)+
-      crmCellWide(r,'notas_seguimiento',r.notas_seguimiento)+
-      crmCell(r,'telefono',r.telefono)+
-      crmCell(r,'email',r.email)+
-      crmCell(r,'material',r.material)+
-      crmCell(r,'tipo',r.tipo)+
-      crmCell(r,'acabado',r.acabado)+
-      crmCell(r,'formato',r.formato)+
-      crmCell(r,'cantidad',r.cantidad)+
-      crmCell(r,'propuesta_antes_iva',(r.propuesta_antes_iva==null?'':money(r.propuesta_antes_iva)),true)+
-      crmCell(r,'moneda',r.moneda)+
-      crmCell(r,'facturado',(r.facturado==null?'':money(r.facturado)),true)+
-      celdasExtraCRM(r)+
-      '<td class="crmact" style="white-space:nowrap;text-align:center"><button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> <button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> <button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button></td>'+
-      '</tr>';
-  });
-  if(!rows.length)h+='<tr><td colspan="'+(CRM_TIT.length+CRM_COLS.length)+'" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
-  h+='</tbody></table></div>';c.innerHTML=h;ajustarXls();
+  rows.forEach(function(r){h+='<tr>'+crmCeldas(r,ord,ult)+'</tr>';});
+  if(!rows.length)h+='<tr><td colspan="'+ord.length+'" class="muted">Sin registros. Crea el primero con «+ Nuevo registro».</td></tr>';
+  h+='</tbody></table></div>';
+  c.innerHTML=h;ajustarXls();fijarColsCRM();setTimeout(fijarColsCRM,120);
 }
 function filtrarCRM(){ renderCRM(); }
 function xlsEditable(el){if(!el)return false;var t=(el.tagName||'').toLowerCase();return t==='input'||t==='textarea'||t==='select'||el.isContentEditable;}
@@ -3611,10 +3802,37 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
-var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CUARZO','PIEDRA SINTERIZADA','ONIX'];
+var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA'];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
-var CAT_ACABADO=['Pulido','Brillado','Mate','Apomazado','Abujardado','Buzardeado','Flameado','Cepillado','Sandblasteado','Envejecido','Natural','Antiderrapante'];
+var CAT_ACAB_MAT={
+  'MARMOL':['PULIDO BRILLADO','PULIDO MATE','CEPILLADO','SANDBLAST','MARTELINADO','BUZARDEADO','AL ACIDO','BAMBOO','FLUTTED','AL CORTE'],
+  'GRANITO':['PULIDO BRILLADO','PULIDO MATE','LEATHER','CEPILLADO','ANTIQUE','FLAMEADO','FLAMEADO + CEPILLADO'],
+  'CUARCITA':['PULIDO BRILLADO','PULIDO MATE','LEATHER'],
+  'CALIZA':['MATE','PULIDO BRILLADO'],
+  'CUARZO':['PULIDO BRILLADO','PULIDO MATE'],
+  'ONIX':['PULIDO BRILLADO'],
+  'SEMIPRECIOSA':['PULIDO BRILLADO']
+};
+function acabTodos(){
+  var m={},o=[];
+  for(var k in CAT_ACAB_MAT)CAT_ACAB_MAT[k].forEach(function(v){if(!m[v]){m[v]=1;o.push(v);}});
+  o.sort(function(a,b){return a.localeCompare(b,'es');});
+  return o;
+}
+function acabadosDe(mat){
+  var k=catKey(mat);
+  if(k&&CAT_ACAB_MAT[k])return CAT_ACAB_MAT[k].slice();
+  return acabTodos();
+}
+function acabOpts(mat,actual){
+  var v=(actual==null?'':String(actual)).trim(),lista=acabadosDe(mat),seen={},h='';
+  if(v){var hay=false;lista.forEach(function(x){if(catKey(x)===catKey(v))hay=true;});if(!hay)lista=[v].concat(lista);}
+  lista.forEach(function(x){var kk=catKey(x);if(seen[kk])return;seen[kk]=1;
+    h+='<option'+(catKey(v)===kk?' selected':'')+'>'+escT(x)+'</option>';});
+  return h;
+}
+var CAT_ACABADO=acabTodos();
 var NC_IDS=['ncMat','ncAcab'];
 function catKey(v){
   var ac='ÁÀÄÂÃÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇ',pl='AAAAAEEEEIIIIOOOOOUUUUNC',o='';
@@ -3633,8 +3851,8 @@ function catCombina(campo,base){
   out.sort(function(a,b){return a.localeCompare(b,'es');});
   return out;
 }
-function catSelect(id,label,lista,n){
-  var h='<label>'+escT(label)+'</label><select id="'+id+'" onchange="ncOtroTog('+n+')"><option value="">— '+escT(label)+' —</option>';
+function catSelect(id,label,lista,n,extra){
+  var h='<label>'+escT(label)+'</label><select id="'+id+'" onchange="'+(extra?extra:('ncOtroTog('+n+')'))+'"><option value="">— '+escT(label)+' —</option>';
   lista.forEach(function(v){h+='<option>'+escT(v)+'</option>';});
   h+='<option value="__otro__">— Otro (escribir) —</option></select>';
   h+='<input id="'+id+'Otro" style="display:none;margin-top:.35rem" placeholder="Escribe el '+escT(label.toLowerCase())+'">';
@@ -3664,12 +3882,21 @@ function nuevoCliente(){
     '<div class="g2"><div><label>Empresa</label><input id="ncEmp"></div><div><label>Teléfono</label><input id="ncTel" placeholder="55..."></div></div>'+
     '<div class="g2"><div><label>Correo</label><input id="ncMail" type="email"></div><div><label>Asesor</label><select id="ncAse">'+aopt+'</select></div></div>'+
     '<div class="g2"><div><label>Origen del lead</label><select id="ncOri">'+oopt+'</select></div><div><label>Estatus</label><select id="ncEst">'+eopt+'</select></div></div>'+
-    '<div class="g2"><div>'+catSelect('ncMat','Material',CAT_MATERIAL,0)+'</div><div>'+catSelect('ncAcab','Acabado',catCombina('acabado',CAT_ACABADO),1)+'</div></div>'+
+    '<div class="g2"><div>'+catSelect('ncMat','Material',CAT_MATERIAL,0,'ncSyncAcab()')+'</div><div>'+catSelect('ncAcab','Acabado',[],1)+'</div></div>'+
     '<div class="g2"><div><label>Tipo</label><input id="ncTipo" placeholder="Ejemplo: Santo Tomás"></div><div><label>Formato</label><input id="ncForm" placeholder="Ejemplo: Plancha 3.20 x 1.80"></div></div>'+
     '<label>Cantidad</label><input id="ncCant" placeholder="Ejemplo: 30 m2 / 2 planchas">'+
     '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
     '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarNuevoCliente()">Crear registro</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
-  setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();},80);
+  setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();ncSyncAcab();},80);
+}
+function ncSyncAcab(){
+  ncOtroTog(0);
+  var sel=document.getElementById('ncAcab');if(!sel)return;
+  var prev=sel.value;
+  var h='<option value="">— Acabado —</option>'+acabOpts(ncPick(0),(prev==='__otro__'?'':prev))+'<option value="__otro__">— Otro (escribir) —</option>';
+  sel.innerHTML=h;
+  if(prev==='__otro__')sel.value='__otro__';
+  ncOtroTog(1);
 }
 function guardarNuevoCliente(){
   var nom=val('ncNom');if(!nom){toast('El nombre es obligatorio');return;}
@@ -3752,7 +3979,7 @@ function pintarFiltros(){
     '<button class="btn sec" id="cvTablero" data-v="tablero" onclick="setVistaCRM(this.dataset.v)">Tablero</button>'+
     '<button class="btn sec" onclick="verDuplicados()" title="Buscar registros repetidos">Duplicados</button>'+
     '<button class="btn sec" onclick="exportarCRMCSV()">Exportar CSV</button>'+
-    (puedeTitulosCRM()?'<button class="btn sec" onclick="gestionColumnasCRM()" title="Agregar o quitar columnas de esta tabla">+ Columna</button>':'')+
+    (puedeTitulosCRM()?'<button class="btn sec" onclick="gestionColumnasCRM()" title="Estaticas, orden, ocultar o eliminar columnas">Columnas</button>':'')+
     '<button class="btn sec" onclick="nuevoCliente()">+ Nuevo registro</button>'+
     '</div>';
 }
@@ -3779,14 +4006,14 @@ function limpiarFiltros(){
   renderCRM();
 }
 var CX_ID=null;
-function cxSel(id,label,lista,actual){
+function cxSel(id,label,lista,actual,onch){
   var v=(actual==null?'':String(actual)).trim(),vis=[],seen={};
   for(var i=0;i<lista.length;i++){
     var x=String(lista[i]).trim();
     if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;vis.push(x);}
   }
   if(v&&!seen[v.toUpperCase()])vis.unshift(v);
-  var h='<label>'+escT(label)+'</label><select id="'+id+'"><option value="">— '+escT(label)+' —</option>';
+  var h='<label>'+escT(label)+'</label><select id="'+id+'"'+(onch?(' onchange="'+onch+'"'):'')+'><option value="">— '+escT(label)+' —</option>';
   for(var j=0;j<vis.length;j++){
     h+='<option'+(vis[j].toUpperCase()===v.toUpperCase()?' selected':'')+'>'+escT(vis[j])+'</option>';
   }
@@ -3815,13 +4042,19 @@ function cardexLead(ev,id){
     '<div class="g2"><div>'+cxIn('cxEmp','Empresa',r.empresa,'')+'</div><div>'+cxIn('cxTel','Teléfono',r.telefono,'55...')+'</div></div>'+
     '<div class="g2"><div>'+cxIn('cxMail','Correo',r.email,'','email')+'</div><div>'+cxSel('cxAse','Asesor',lAse,r.asesor)+'</div></div>'+
     '<div class="g2"><div>'+cxSel('cxOri','Origen del lead',lOri,r.origen)+'</div><div>'+cxSel('cxEst','Estatus',CRM_ESTATUS,r.estatus_nota)+'</div></div>'+
-    '<div class="g2"><div>'+cxSel('cxMat','Material',CAT_MATERIAL,r.material)+'</div><div>'+cxSel('cxAcab','Acabado',catCombina('acabado',CAT_ACABADO),r.acabado)+'</div></div>'+
+    '<div class="g2"><div>'+cxSel('cxMat','Material',CAT_MATERIAL,r.material,'cxSyncAcab()')+'</div><div><label>Acabado</label><select id="cxAcab"><option value="">— Acabado —</option>'+acabOpts(r.material,r.acabado)+'</select></div></div>'+
     '<div class="g2"><div>'+cxIn('cxTipo','Tipo',r.tipo,'Ejemplo: Santo Tomás')+'</div><div>'+cxIn('cxForm','Formato',r.formato,'Ejemplo: Plancha 3.20 x 1.80')+'</div></div>'+
     cxIn('cxCant','Cantidad',r.cantidad,'Ejemplo: 30 m2 / 2 planchas')+
     cxIn('cxProp','Propuesta s/IVA',(r.propuesta_antes_iva==null?'':r.propuesta_antes_iva),'0.00','number')+
     '<div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap"><button class="btn" onclick="guardarCardex()">Guardar cambios</button><button class="btn sec" onclick="cardexFicha()">Abrir ficha completa</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
   openModal(h);
   return false;
+}
+function cxSyncAcab(){
+  var m=document.getElementById('cxMat'),s=document.getElementById('cxAcab');
+  if(!m||!s)return;
+  var prev=s.value;
+  s.innerHTML='<option value="">— Acabado —</option>'+acabOpts(m.value,prev);
 }
 function cardexFicha(){var id=CX_ID;closeModal();if(id)abrirFicha(id);}
 async function guardarCardex(){
@@ -3845,38 +4078,46 @@ async function guardarCardex(){
 }
 function gestionColumnasCRM(){
   var h='<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Columnas del CRM</h3>'+
-    '<p class="muted" style="font-size:.8rem;margin-bottom:.8rem">Agrega las columnas que necesites. Se capturan igual que las demás: doble clic en la celda.</p>'+
-    '<label>Nombre de la nueva columna</label><input id="ncColT" placeholder="Ejemplo: Espesor" maxlength="28">'+
-    '<div style="display:flex;gap:.5rem;margin-top:.7rem"><button class="btn" onclick="agregarColumnaCRM()">Agregar columna</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
-  if(CRM_COLS.length){
-    h+='<div style="margin-top:1.1rem"><label>Columnas agregadas</label><table style="width:100%;font-size:.85rem">';
-    for(var i=0;i<CRM_COLS.length;i++){
-      h+='<tr><td style="padding:.3rem 0">'+escT(CRM_COLS[i].t)+'</td><td style="text-align:right"><button class="btn sec" style="padding:.2rem .55rem;font-size:.72rem" onclick="quitarColumnaCRM('+i+')">Quitar</button></td></tr>';
-    }
-    h+='</table><p class="muted" style="font-size:.75rem;margin-top:.4rem">Quitar solo la esconde de la tabla. La información capturada no se borra.</p></div>';
+    '<p class="muted" style="font-size:.8rem;margin-bottom:.7rem">Estática = se congela a la izquierda y no se mueve al desplazar la tabla. También puedes ocultarlas, reordenarlas con las flechas o arrastrando el encabezado, y eliminar las que tú creaste.</p>'+
+    '<div id="colManBody" style="max-height:44vh;overflow:auto;border:1px solid var(--bd);border-radius:6px">'+
+    '<table class="colman" style="width:100%;font-size:.82rem"><thead><tr>'+
+    '<th style="width:44%">Columna</th><th style="text-align:center">Estática</th><th style="text-align:center">Visible</th><th style="text-align:center">Orden</th><th></th>'+
+    '</tr></thead><tbody>';
+  for(var i=0;i<CRM_LAY.length;i++){
+    var x=CRM_LAY[i],propia=layPropia(x.k),acc=(x.k==='__acc');
+    h+='<tr>'+
+      '<td>'+escT(x.t)+(propia?' <span class="muted" style="font-size:.68rem">(creada por ti)</span>':'')+(acc?' <span class="muted" style="font-size:.68rem">(acciones)</span>':'')+'</td>'+
+      '<td style="text-align:center"><button class="btn'+(x.f===1?'':' sec')+'" style="padding:.18rem .55rem;font-size:.7rem" onclick="colFijar('+i+')">'+(x.f===1?'Sí':'No')+'</button></td>'+
+      '<td style="text-align:center">'+(acc?'<span class="muted" style="font-size:.72rem">Siempre</span>':'<button class="btn'+(x.v===0?' sec':'')+'" style="padding:.18rem .55rem;font-size:.7rem" onclick="colVer('+i+')">'+(x.v===0?'Oculta':'Sí')+'</button>')+'</td>'+
+      '<td style="text-align:center;white-space:nowrap"><button class="btn sec" style="padding:.18rem .45rem;font-size:.7rem" onclick="colArriba('+i+')" title="Subir">\u25b2</button> <button class="btn sec" style="padding:.18rem .45rem;font-size:.7rem" onclick="colAbajo('+i+')" title="Bajar">\u25bc</button></td>'+
+      '<td style="text-align:right">'+(propia?'<button class="btn sec" style="padding:.18rem .55rem;font-size:.7rem" onclick="colEliminar('+i+')">Eliminar</button>':'')+'</td>'+
+      '</tr>';
   }
+  h+='</tbody></table></div>'+
+    '<label style="margin-top:.9rem">Nueva columna</label><input id="ncColT" placeholder="Ejemplo: Espesor" maxlength="28">'+
+    '<div style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap"><button class="btn" onclick="agregarColumnaCRM()">Agregar columna</button><button class="btn sec" onclick="restaurarTitulosCRM()">Restaurar por defecto</button><button class="btn sec" onclick="closeModal()">Cerrar</button></div>';
   openModal(h);
-  setTimeout(function(){var e=document.getElementById('ncColT');if(e)e.focus();},80);
 }
 async function agregarColumnaCRM(){
   var t=val('ncColT');
   if(!t){toast('Escribe el nombre de la columna');return;}
   var d=await api('/api/crm/columnas',{method:'POST',body:JSON.stringify({titulo:t})});
-  if(d&&d.ok){CRM_COLS=d.data||[];closeModal();renderCRM();toast('Columna agregada');}
-  else toast((d&&d.error)||'No se pudo agregar la columna');
-}
-async function quitarColumnaCRM(i){
-  var c=CRM_COLS[i];if(!c)return;
-  var d=await api('/api/crm/columnas',{method:'POST',body:JSON.stringify({quitar:c.c})});
-  if(d&&d.ok){CRM_COLS=d.data||[];renderCRM();gestionColumnasCRM();toast('Columna oculta');}
-  else toast((d&&d.error)||'No se pudo quitar la columna');
+  if(!d||!d.ok){toast((d&&d.error)||'No se pudo agregar la columna');return;}
+  CRM_COLS=d.data||[];
+  for(var i=0;i<CRM_COLS.length;i++){
+    if(layIdx(CRM_COLS[i].c)<0)CRM_LAY.push({k:CRM_COLS[i].c,t:CRM_COLS[i].t,v:1,f:0});
+  }
+  await guardarLayoutCRM('');
+  gestionColumnasCRM();
+  toast('Columna agregada');
 }
 function exportarCRMCSV(){
-  var cols=CRM_TIT_CAMPOS.map(function(k,i){return [k,CRM_TIT[i]];});
-  CRM_COLS.forEach(function(c){cols.push([c.c,c.t]);});
+  var ord=layOrden(),cols=[];
+  ord.forEach(function(i){var x=CRM_LAY[i];if(x.k==='__acc')return;cols.push([x.k,x.t]);});
+  if(!cols.length){toast('No hay columnas visibles');return;}
   function esc(v){v=(v==null?'':String(v));return '"'+v.replace(/"/g,'""')+'"';}
   var lines=[cols.map(function(x){return esc(x[1]);}).join(',')];
-  CRM_ROWS.forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
+  filasCRMFiltradas().forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
   var csv='\\ufeff'+lines.join('\\r\\n');
   var blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='CRM_ASLAN.csv';document.body.appendChild(a);a.click();a.remove();
