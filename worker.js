@@ -510,6 +510,21 @@ async function migrarV4(env) {
 }
 
 
+let MIGRADO_V6 = false;
+async function migrarV6(env) {
+  if (MIGRADO_V6) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v6_seguimiento'").first();
+    if (f && f.valor === "ok") { MIGRADO_V6 = true; return; }
+  } catch (e) { return; }
+  const cols6 = [
+    "ALTER TABLE clientes ADD COLUMN tipo_seguimiento TEXT"
+  ];
+  for (const sql of cols6) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v6_seguimiento','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V6 = true;
+}
+
 let MIGRADO_V5 = false;
 async function migrarV5(env) {
   if (MIGRADO_V5) return;
@@ -875,7 +890,7 @@ async function handleClientes(request, env, payload, method, id) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "cantidad", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "cantidad", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "tipo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
     for (const c of Object.keys(b)) if (RX_COL.test(c) && !campos.includes(c)) { sets.push(c + "=?"); vals.push(b[c]); }
@@ -941,6 +956,16 @@ async function fichaCliente(env, id, payload) {
     ).bind(id).all();
   } catch (e) {}
 
+  let catAses = [], catFin = [];
+  try {
+    const ra = (await env.DB.prepare("SELECT DISTINCT TRIM(asesor) AS v FROM clientes WHERE deleted_at IS NULL AND asesor IS NOT NULL AND TRIM(asesor)<>'' ORDER BY v COLLATE NOCASE").all()).results || [];
+    catAses = ra.map((x) => x.v);
+  } catch (e) {}
+  try {
+    const rf = (await env.DB.prepare("SELECT DISTINCT TRIM(estatus_final) AS v FROM clientes WHERE deleted_at IS NULL AND estatus_final IS NOT NULL AND TRIM(estatus_final)<>'' ORDER BY v COLLATE NOCASE").all()).results || [];
+    catFin = rf.map((x) => x.v).filter((x) => x.length <= 25);
+  } catch (e) {}
+
   const rc = cotis.results || [];
   const totalCotizado = rc.reduce((s, q) => s + (Number(q.total) || 0), 0);
   const totalAceptado = rc.filter((q) => q.estado === "aceptada").reduce((s, q) => s + (Number(q.total) || 0), 0);
@@ -948,6 +973,7 @@ async function fichaCliente(env, id, payload) {
 
   return ok({
     cliente: c,
+    catalogos: { asesores: catAses, finales: catFin },
     contactos: contactos.results || [],
     notas: notas.results || [],
     cotizaciones: rc,
@@ -2206,6 +2232,7 @@ async function handleRequest(request, env) {
   await migrarV3(env);
   await migrarV4(env);
   await migrarV5(env);
+  await migrarV6(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2478,6 +2505,8 @@ function renderApp() {
 .crmtable th.thed:hover{background:rgba(139,109,63,.28)}
 .crmtable th.thedit{box-shadow:inset 0 0 0 2px var(--gold);background:rgba(139,109,63,.30);cursor:text;outline:none;color:var(--gold2,#d8b877)}
 .crmnum{text-align:right;white-space:nowrap;color:var(--gold);font-weight:600}
+.crmlink{color:var(--gold);font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.crmlink:hover{background:rgba(139,109,63,.16)}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
 .crmtable td.fx{position:sticky;z-index:3;background:var(--card)}
 .crmtable th.fx{position:sticky;z-index:6;background:var(--thead,#EDE6D6)}
@@ -2498,6 +2527,8 @@ function renderApp() {
 .fedit:focus{border-color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
 .fedit:empty:before{content:attr(data-ph);color:var(--txt2);opacity:.45}
 .fnum{font-variant-numeric:tabular-nums;color:var(--gold);font-weight:600}
+.ffield select,.ffield input.fdate{background:var(--inset,#0f0f0f);border:1px solid var(--bd);border-radius:8px;padding:.45rem .6rem;font-size:.9rem;color:var(--txt);width:100%;outline:none;font-family:inherit}
+.ffield select:focus,.ffield input.fdate:focus{border-color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
 .flink{color:var(--gold);cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}
 .tl{display:flex;flex-direction:column;gap:.5rem}
 .tl-item{background:var(--inset,#0f0f0f);border-left:2px solid var(--gold);border-radius:6px;padding:.45rem .6rem;font-size:.86rem}
@@ -2523,7 +2554,10 @@ function renderApp() {
 .kpi .l{font-size:.78rem;color:var(--txt2);text-transform:uppercase;letter-spacing:.04em}
 .kpi-click{cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}
 .kpi-click:hover{border-color:var(--gold);transform:translateY(-3px);box-shadow:0 10px 34px rgba(0,0,0,.45)}
-.tablero{display:flex;gap:.7rem;overflow-x:auto;padding:.3rem 0 .8rem}
+.tablero{display:flex;gap:.7rem;overflow:auto;padding:.3rem 0 .8rem;max-height:calc(100vh - 240px);max-height:calc(100dvh - 240px);-webkit-overflow-scrolling:touch}
+.tablero::-webkit-scrollbar{height:14px;width:14px}
+.tablero::-webkit-scrollbar-thumb{background:var(--gold);border-radius:8px;border:3px solid var(--card)}
+.tablero::-webkit-scrollbar-track{background:rgba(139,109,63,.12)}
 .tcol{flex:0 0 250px;min-width:250px;background:var(--card2,#181818);border:1px solid var(--bd);border-radius:10px;padding:.5rem;display:flex;flex-direction:column}
 .tcol h4{font-size:.74rem;letter-spacing:.04em;text-transform:uppercase;padding:.35rem .4rem;margin-bottom:.4rem;border-bottom:2px solid var(--bd);display:flex;justify-content:space-between;align-items:center}
 .tcol .cnt{background:var(--gold);color:#fff;border-radius:99px;font-size:.66rem;padding:.04rem .42rem;font-weight:700}
@@ -2582,7 +2616,7 @@ td[contenteditable]:focus{outline:1px solid var(--gold);background:rgba(139,109,
 <script>
 function toggleSide(){if(window.innerWidth<=768){document.getElementById('side').classList.toggle('open');}else{document.body.classList.toggle('side-off');try{localStorage.setItem('aslan_side',document.body.classList.contains('side-off')?'0':'1');}catch(e){}ajustarXls();}}
 if(window.innerWidth>768){try{if(localStorage.getItem('aslan_side')==='0')document.body.classList.add('side-off');}catch(e){}}
-function ajustarXls(){var e=document.querySelector('#content .xls');if(!e)return;var r=e.getBoundingClientRect();var h=window.innerHeight-r.top-16;if(h>180)e.style.maxHeight=h+'px';}
+function ajustarXls(){var e=document.querySelector('#content .xls')||document.querySelector('#content .tablero');if(!e)return;var r=e.getBoundingClientRect();var h=window.innerHeight-r.top-16;if(h>180)e.style.maxHeight=h+'px';}
 window.addEventListener('resize',function(){ajustarXls();if(typeof fijarColsCRM==='function')fijarColsCRM();});
 var CRM_FIL_OPEN=true,CRM_KPI_OPEN=true;
 try{CRM_FIL_OPEN=localStorage.getItem('aslan_crm_fil')!=='0';CRM_KPI_OPEN=localStorage.getItem('aslan_crm_kpi')!=='0';}catch(e){}
@@ -3258,8 +3292,9 @@ function celdasExtraCRM(r){
   return h;
 }
 function crmCellNombre(r,ex){
-  return '<td tabindex="-1" class="crmc'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="nombre" data-num="0" title="Clic derecho para abrir el cardex" oncontextmenu="return cardexLead(event,'+r.id+')" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
+  return '<td tabindex="-1" class="crmc crmlink'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="nombre" data-num="0" data-noed="1" title="Clic para abrir la ficha del lead. Clic derecho para el cardex." oncontextmenu="return cardexLead(event,'+r.id+')" onclick="abrirFicha('+r.id+')">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
 }
+function celdaBloqueada(td){return !!(td&&td.dataset&&td.dataset.noed==='1');}
 function crmCellWide(r,campo,val,ex){
   return '<td tabindex="-1" class="crmc crmwide'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
@@ -3390,12 +3425,13 @@ function setVistaCRM(v){
 function valFil(id){var e=document.getElementById(id);return e?(''+e.value):'';}
 function filasCRMFiltradas(){
   var q=valFil('crmq').toLowerCase().trim();
-  var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact');
+  var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact'),ef=valFil('fEFin');
   var mn=parseFloat(valFil('fMin')),mx=parseFloat(valFil('fMax'));
   return CRM_ROWS.filter(function(r){
     if(q && JSON.stringify(r).toLowerCase().indexOf(q)<0)return false;
     if(as && (r.asesor||'').trim()!==as)return false;
     if(es){var st=(r.estatus_nota||'').trim().toUpperCase();if(es==='__SIN__'){if(st!=='')return false;}else if(st!==es.toUpperCase())return false;}
+    if(ef){var sf=(r.estatus_final||'').trim().toUpperCase();if(ef==='__SIN__'){if(sf!=='')return false;}else if(sf!==ef.toUpperCase())return false;}
     var fl=(r.fecha_lead||'');
     if(an && fl.slice(0,4)!==an)return false;
     if(me && fl.slice(5,7)!==me)return false;
@@ -3674,6 +3710,7 @@ function xlsSel(td){
 }
 function xlsEditStart(td,ch){
   if(!td)return;
+  if(celdaBloqueada(td)){toast('El nombre se edita en la ficha o en el cardex (clic derecho)');return;}
   if(XLS_CUR!==td){if(XLS_CUR)XLS_CUR.classList.remove('sel');XLS_CUR=td;td.classList.add('sel');}
   XLS_EDIT=true;XLS_ORIG=td.textContent;
   td.classList.add('edit');td.contentEditable='true';
@@ -3736,7 +3773,7 @@ function xlsKey(e){
     else if(k==='Home'){e.preventDefault();xlsMove(-1,0,true);}
     else if(k==='End'){e.preventDefault();xlsMove(1,0,true);}
     else if(k==='Enter'||k==='F2'){e.preventDefault();xlsEditStart(XLS_CUR);}
-    else if(k==='Delete'||k==='Backspace'){e.preventDefault();var prev=XLS_CUR.textContent;XLS_CUR.textContent='';if(prev!=='')guardarCeldaCRM(XLS_CUR);}
+    else if(k==='Delete'||k==='Backspace'){e.preventDefault();if(celdaBloqueada(XLS_CUR)){toast('El nombre se edita en la ficha o en el cardex (clic derecho)');return;}var prev=XLS_CUR.textContent;XLS_CUR.textContent='';if(prev!=='')guardarCeldaCRM(XLS_CUR);}
     else if((e.ctrlKey||e.metaKey)&&(k==='c'||k==='C')){e.preventDefault();try{navigator.clipboard.writeText(XLS_CUR.textContent);toast('Copiado');}catch(err){}}
     else if((e.ctrlKey||e.metaKey)&&(k==='v'||k==='V')){e.preventDefault();try{navigator.clipboard.readText().then(function(tx){if(tx==null||!XLS_CUR)return;XLS_CUR.textContent=(''+tx).trim();guardarCeldaCRM(XLS_CUR);});}catch(err){}}
     else if(k.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();xlsEditStart(XLS_CUR,k);}
@@ -3774,7 +3811,7 @@ function pintarTableroCRM(rows){
     lista.forEach(function(r){h+=tcardCRM(r);});
     h+='</div>';
   });
-  h+='</div>';c.innerHTML=h;
+  h+='</div>';c.innerHTML=h;ajustarXls();
 }
 async function cambiarEstatusCRM(id,valor){
   var d=await api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify({estatus_nota:valor})});
@@ -3786,6 +3823,7 @@ async function cambiarEstatusCRM(id,valor){
   } else if(d){ toast(d.error||'Error al actualizar'); }
 }
 async function guardarCeldaCRM(el){
+  if(celdaBloqueada(el))return;
   var id=el.dataset.id, campo=el.dataset.campo, num=el.dataset.num==='1';
   var raw=el.textContent.trim();
   var body={};
@@ -3804,6 +3842,9 @@ async function guardarCeldaCRM(el){
 var PEND_CLIENTE=null;
 var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA'];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
+var CAT_ORIGEN=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
+var CAT_GESTION=['COTIZACIÓN','NEGOCIACIÓN','GANADO','PERDIDO'];
+var CAT_TIPO_SEG=['LLAMADA','VISITA','MUESTRA'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
 var CAT_ACAB_MAT={
   'MARMOL':['PULIDO BRILLADO','PULIDO MATE','CEPILLADO','SANDBLAST','MARTELINADO','BUZARDEADO','AL ACIDO','BAMBOO','FLUTTED','AL CORTE'],
@@ -3821,9 +3862,11 @@ function acabTodos(){
   return o;
 }
 function acabadosDe(mat){
-  var k=catKey(mat);
-  if(k&&CAT_ACAB_MAT[k])return CAT_ACAB_MAT[k].slice();
-  return acabTodos();
+  var k=catKey(mat),l;
+  if(k&&CAT_ACAB_MAT[k])l=CAT_ACAB_MAT[k].slice();else l=acabTodos();
+  var hay=false;l.forEach(function(x){if(catKey(x)==='N/A')hay=true;});
+  if(!hay)l.push('N/A');
+  return l;
 }
 function acabOpts(mat,actual){
   var v=(actual==null?'':String(actual)).trim(),lista=acabadosDe(mat),seen={},h='';
@@ -3963,11 +4006,14 @@ function pintarFiltros(){
   var meses=[['01','Enero'],['02','Febrero'],['03','Marzo'],['04','Abril'],['05','Mayo'],['06','Junio'],['07','Julio'],['08','Agosto'],['09','Septiembre'],['10','Octubre'],['11','Noviembre'],['12','Diciembre']];
   var mopts='<option value="">Mes: todos</option>';meses.forEach(function(m){mopts+='<option value="'+m[0]+'">'+m[1]+'</option>';});
   var eopts='<option value="">Estatus: todos</option>';CRM_ESTATUS.forEach(function(s){eopts+='<option>'+escAttr(s)+'</option>';});eopts+='<option value="__SIN__">(Sin estatus)</option>';
+  var efs={};CRM_ROWS.forEach(function(r){var v=(r.estatus_final||'').trim();if(v&&v.length<=25)efs[v.toUpperCase()]=v;});
+  var efopts='<option value="">Estatus final: todos</option>';Object.keys(efs).sort().forEach(function(k){efopts+='<option>'+escAttr(efs[k])+'</option>';});efopts+='<option value="__SIN__">(Sin estatus final)</option>';
   box.innerHTML='<div class="colhd'+(CRM_FIL_OPEN?'':' closed')+'" id="filHd" onclick="togFiltros()"><span class="chev">\u25be</span> Filtros</div>'+
     '<div class="card crmfilt" id="filBody" style="'+(CRM_FIL_OPEN?'':'display:none')+'">'+
     '<input id="crmq" placeholder="Buscar texto..." oninput="renderCRM()">'+
     '<select id="fAsesor" onchange="renderCRM()">'+aopts+'</select>'+
     '<select id="fEstatus" onchange="renderCRM()">'+eopts+'</select>'+
+    '<select id="fEFin" onchange="renderCRM()">'+efopts+'</select>'+
     '<select id="fAnio" onchange="renderCRM()">'+yopts+'</select>'+
     '<select id="fMes" onchange="renderCRM()">'+mopts+'</select>'+
     '<select id="fFact" onchange="renderCRM()"><option value="">Facturación: todas</option><option value="con">Con factura</option><option value="sin">Sin factura</option></select>'+
@@ -4002,7 +4048,7 @@ function soloMios(){
 }
 function limpiarFiltros(){
   ['crmq','fMin','fMax'].forEach(function(id){var e=document.getElementById(id);if(e)e.value='';});
-  ['fAsesor','fEstatus','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
+  ['fAsesor','fEstatus','fEFin','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
   renderCRM();
 }
 var CX_ID=null;
@@ -4180,6 +4226,45 @@ function fWide(label,campo,val){
   return '<div class="fwide"><label>'+label+'</label>'+
     '<div class="fedit" contenteditable="true" data-id="'+FICHA.id+'" data-campo="'+campo+'" data-tipo="text" data-ph="'+escAttr(label)+'" onblur="fGuardar(this)">'+escAttr(val==null?'':String(val))+'</div></div>';
 }
+// Campo de la ficha con lista de opciones (no se escribe a mano)
+function fSel(label,campo,valor,lista){
+  var v=(valor==null?'':String(valor)).trim(),seen={},arr=[],i;
+  for(i=0;i<lista.length;i++){var x=String(lista[i]==null?'':lista[i]).trim();if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;arr.push(x);}}
+  if(v&&!seen[v.toUpperCase()]){arr.unshift(v);seen[v.toUpperCase()]=1;}
+  var h='<div class="ffield"><label>'+label+'</label><select data-id="'+FICHA.id+'" data-campo="'+campo+'" onchange="fGuardarSel(this)"><option value="">— '+escT(label)+' —</option>';
+  for(i=0;i<arr.length;i++)h+='<option'+(arr[i].toUpperCase()===v.toUpperCase()?' selected':'')+'>'+escT(arr[i])+'</option>';
+  return h+'</select></div>';
+}
+// Campo de la ficha con calendario
+function fDate(label,campo,valor){
+  var v=(valor==null?'':String(valor)).trim().slice(0,10);
+  if(!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(v))v='';
+  return '<div class="ffield"><label>'+label+'</label><input type="date" class="fdate" data-id="'+FICHA.id+'" data-campo="'+campo+'" value="'+escAttr(v)+'" onchange="fGuardarSel(this)"></div>';
+}
+function fGuardarSel(el){
+  var id=el.dataset.id,campo=el.dataset.campo,v=String(el.value==null?'':el.value).trim();
+  var body={};body[campo]=(v===''?null:v);
+  api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify(body)}).then(function(d){
+    if(d&&d.ok){toast('Guardado');if(FICHA.cliente)FICHA.cliente[campo]=body[campo];}
+    else if(d){toast(d.error||'Error al guardar');}
+  });
+}
+function fCatAsesores(){
+  var m={},o=[];
+  function add(v){v=String(v==null?'':v).trim();if(v&&v.length<=40&&!m[v.toUpperCase()]){m[v.toUpperCase()]=1;o.push(v);}}
+  ((FICHA.catalogos&&FICHA.catalogos.asesores)||[]).forEach(add);
+  (typeof CRM_ROWS!=='undefined'?(CRM_ROWS||[]):[]).forEach(function(r){add(r.asesor);});
+  o.sort(function(a,b){return a.localeCompare(b,'es');});
+  return o;
+}
+function fCatFinales(){
+  var m={},o=[];
+  function add(v){v=String(v==null?'':v).trim();if(v&&v.length<=25&&!m[v.toUpperCase()]){m[v.toUpperCase()]=1;o.push(v);}}
+  add('NV');
+  ((FICHA.catalogos&&FICHA.catalogos.finales)||[]).forEach(add);
+  (typeof CRM_ROWS!=='undefined'?(CRM_ROWS||[]):[]).forEach(function(r){add(r.estatus_final);});
+  return o;
+}
 async function toggleEtapaFicha(){
   var cid=FICHA.id; var c=FICHA.cliente||{};
   var nueva=(c.etapa==='cliente')?'prospecto':'cliente';
@@ -4223,18 +4308,17 @@ function renderFicha(){
      fField('Sitio web','sitio_web',c.sitio_web)+
      fField('Ciudad','ciudad',c.ciudad)+
      fField('RFC','rfc',c.rfc)+
-     fField('Asesor','asesor',c.asesor)+
-     fField('Origen del lead','origen',c.origen)+
+     fSel('Asesor','asesor',c.asesor,fCatAsesores())+
+     fSel('Origen del lead','origen',c.origen,CAT_ORIGEN)+
      fWide('Dirección','direccion',c.direccion)+'</div></div>';
   h+='<div class="fsec"><h3>Comercial y oportunidad</h3><div class="fgrid">'+
-     fField('Validación','validacion',c.validacion)+
-     fField('Estatus','estatus_nota',c.estatus_nota)+
-     fField('Estatus final','estatus_final',c.estatus_final)+
-     fField('Material de interés','material',c.material)+
-     fField('Probabilidad de cierre','probabilidad_cierre',c.probabilidad_cierre)+
-     fField('Cierre estimado','fecha_cierre_estimada',c.fecha_cierre_estimada)+
-     fField('Próximo seguimiento','proximo_seguimiento',c.proximo_seguimiento)+
-     fField('Próxima acción','proxima_accion',c.proxima_accion)+'</div></div>';
+     fSel('Estatus','estatus_nota',c.estatus_nota,CRM_ESTATUS)+
+     fSel('Estatus final','estatus_final',c.estatus_final,fCatFinales())+
+     fSel('Material de interés','material',c.material,CAT_MATERIAL)+
+     fSel('Gestión comercial','probabilidad_cierre',c.probabilidad_cierre,CAT_GESTION)+
+     fDate('Cierre estimado','fecha_cierre_estimada',c.fecha_cierre_estimada)+
+     fSel('Próximo seguimiento','tipo_seguimiento',c.tipo_seguimiento,CAT_TIPO_SEG)+
+     fDate('Fecha del seguimiento','proximo_seguimiento',c.proximo_seguimiento)+'</div></div>';
   var pIni=(c.propuesta_inicial==null?null:Number(c.propuesta_inicial));
   var pAct=(c.propuesta_antes_iva==null?null:Number(c.propuesta_antes_iva));
   var crec=(pIni!=null&&pAct!=null)?(pAct-pIni):null;
