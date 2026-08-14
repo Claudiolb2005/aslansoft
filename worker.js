@@ -227,7 +227,9 @@ CREATE TABLE IF NOT EXISTS cotizaciones (
   estado TEXT DEFAULT 'borrador',
   subtotal REAL DEFAULT 0, descuento_global_pct REAL DEFAULT 0,
   iva_pct REAL DEFAULT 16, total REAL DEFAULT 0,
-  vigencia_dias INTEGER DEFAULT 15, notas TEXT, condiciones TEXT,
+  vigencia_dias INTEGER DEFAULT 7, notas TEXT, condiciones TEXT,
+  entrega_direccion TEXT, entrega_referencias TEXT, entrega_telefono TEXT,
+  cond_pago TEXT, cond_entrega TEXT, cond_no_incluye TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   deleted_at DATETIME
@@ -523,6 +525,26 @@ async function migrarV6(env) {
   for (const sql of cols6) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
   try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v6_seguimiento','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
   MIGRADO_V6 = true;
+}
+
+let MIGRADO_V7 = false;
+async function migrarV7(env) {
+  if (MIGRADO_V7) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v7_cotizaciones'").first();
+    if (f && f.valor === "ok") { MIGRADO_V7 = true; return; }
+  } catch (e) { return; }
+  const cols7 = [
+    "ALTER TABLE cotizaciones ADD COLUMN entrega_direccion TEXT",
+    "ALTER TABLE cotizaciones ADD COLUMN entrega_referencias TEXT",
+    "ALTER TABLE cotizaciones ADD COLUMN entrega_telefono TEXT",
+    "ALTER TABLE cotizaciones ADD COLUMN cond_pago TEXT",
+    "ALTER TABLE cotizaciones ADD COLUMN cond_entrega TEXT",
+    "ALTER TABLE cotizaciones ADD COLUMN cond_no_incluye TEXT"
+  ];
+  for (const sql of cols7) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v7_cotizaciones','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V7 = true;
 }
 
 let MIGRADO_V5 = false;
@@ -1061,7 +1083,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "GET" && id) {
     const c = await env.DB.prepare(
-      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL"
+      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono, cl.asesor AS _asesor, u.nombre AS vendedor, u.email AS vendedor_email, u.telefono AS vendedor_telefono FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id LEFT JOIN usuarios u ON u.id=c.usuario_id WHERE c.id=? AND c.deleted_at IS NULL"
     ).bind(id).first();
     if (!c) return fail("Cotización no encontrada.", 404);
     const _scv = asesorScope(payload);
@@ -1080,10 +1102,12 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     const { lineas, subtotal, total } = calcularTotales(items, b.descuento_global_pct, ivaPct);
     const folio = await siguienteFolio(env, "COT", "cotizaciones");
     const res = await env.DB.prepare(
-      "INSERT INTO cotizaciones (folio,cliente_id,usuario_id,estado,subtotal,descuento_global_pct,iva_pct,total,vigencia_dias,notas,condiciones) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+      "INSERT INTO cotizaciones (folio,cliente_id,usuario_id,estado,subtotal,descuento_global_pct,iva_pct,total,vigencia_dias,notas,condiciones,entrega_direccion,entrega_referencias,entrega_telefono,cond_pago,cond_entrega,cond_no_incluye) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(folio, b.cliente_id, payload.sub, b.estado || "borrador", subtotal,
-           Number(b.descuento_global_pct) || 0, ivaPct, total, Number(b.vigencia_dias) || 15,
-           b.notas || null, b.condiciones || null).run();
+           Number(b.descuento_global_pct) || 0, ivaPct, total, Number(b.vigencia_dias) || 7,
+           b.notas || null, b.condiciones || null,
+           b.entrega_direccion || null, b.entrega_referencias || null, b.entrega_telefono || null,
+           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null).run();
     const cotId = res.meta.last_row_id;
     for (const ln of lineas) {
       await env.DB.prepare(
@@ -1096,6 +1120,10 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
+    const cot = await env.DB.prepare("SELECT c.id, c.usuario_id, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
+    if (!cot) return fail("Cotización no encontrada.", 404);
+    const _scp = asesorScope(payload);
+    if (_scp) { const _ap = (cot._asesor || "").trim().toUpperCase(); if (_ap !== _scp.first && _ap !== _scp.full) return fail("Sin acceso a esta cotización.", 403); }
     // Cambio de estado simple
     if (b.estado && Object.keys(b).length === 1) {
       const validos = ["borrador", "enviada", "aceptada", "rechazada", "expirada"];
@@ -1104,11 +1132,34 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
       await audit(env, payload.sub, "estado", "cotizaciones", id, { estado: b.estado }, request);
       return ok({ id, estado: b.estado });
     }
-    return fail("Para editar líneas, crea una nueva cotización (esta capa solo cambia el estado).");
+    // Edición completa: encabezado + reemplazo de líneas
+    const items = Array.isArray(b.items) ? b.items.filter((it) => it && (it.descripcion || it.producto_id)) : [];
+    if (!items.length) return fail("Agrega al menos una línea de producto.");
+    const ivaPct2 = b.iva_pct !== undefined ? Number(b.iva_pct) : 16;
+    const { lineas, subtotal, total } = calcularTotales(items, b.descuento_global_pct, ivaPct2);
+    await env.DB.prepare(
+      "UPDATE cotizaciones SET cliente_id=COALESCE(?,cliente_id), subtotal=?, descuento_global_pct=?, iva_pct=?, total=?, vigencia_dias=?, notas=?, condiciones=?, entrega_direccion=?, entrega_referencias=?, entrega_telefono=?, cond_pago=?, cond_entrega=?, cond_no_incluye=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+    ).bind(b.cliente_id || null, subtotal, Number(b.descuento_global_pct) || 0, ivaPct2, total,
+           Number(b.vigencia_dias) || 7, b.notas || null, b.condiciones || null,
+           b.entrega_direccion || null, b.entrega_referencias || null, b.entrega_telefono || null,
+           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null, id).run();
+    await env.DB.prepare("DELETE FROM cotizacion_items WHERE cotizacion_id=?").bind(id).run();
+    for (const ln of lineas) {
+      await env.DB.prepare(
+        "INSERT INTO cotizacion_items (cotizacion_id,producto_id,descripcion,cantidad,unidad,precio_unitario,descuento_linea_pct,subtotal_linea) VALUES (?,?,?,?,?,?,?,?)"
+      ).bind(id, ln.producto_id || null, ln.descripcion || "", Number(ln.cantidad) || 0,
+             ln.unidad || "m2", Number(ln.precio_unitario) || 0, Number(ln.descuento_linea_pct) || 0, ln.subtotal_linea).run();
+    }
+    await audit(env, payload.sub, "editar", "cotizaciones", id, { subtotal, total }, request);
+    return ok({ id, subtotal, total });
   }
   if (method === "DELETE" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    const cotDel = await env.DB.prepare("SELECT id, usuario_id, folio FROM cotizaciones WHERE id=? AND deleted_at IS NULL").bind(id).first();
+    if (!cotDel) return fail("Cotización no encontrada.", 404);
+    const propia = Number(cotDel.usuario_id) === Number(payload.sub);
+    if (!hasRole(payload, "admin", "gerente") && !propia) return fail("Solo puedes eliminar tus propias cotizaciones.", 403);
     await env.DB.prepare("UPDATE cotizaciones SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
+    await audit(env, payload.sub, "eliminar", "cotizaciones", id, { folio: cotDel.folio }, request);
     return ok({ id });
   }
   return fail("Método no soportado.", 405);
@@ -2233,6 +2284,7 @@ async function handleRequest(request, env) {
   await migrarV4(env);
   await migrarV5(env);
   await migrarV6(env);
+  await migrarV7(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -3305,7 +3357,7 @@ var ALERTA_ROWS=[];
 function diasDesde(ts){if(!ts)return null;var s=(''+ts).trim();if(s.indexOf('T')<0)s=s.replace(' ','T');if(s.indexOf('Z')<0&&s.indexOf('+')<0)s+='Z';var t=Date.parse(s);if(isNaN(t))return null;var d=Math.floor((Date.now()-t)/86400000);return d<0?0:d;}
 function fechaProg(v){if(!v)return null;var s=(''+v).trim().slice(0,10);var p=s.split('-');if(p.length!==3)return null;var d=new Date(Number(p[0]),Number(p[1])-1,Number(p[2]));return isNaN(d.getTime())?null:d;}
 function calcAlertas(rows){
-  var r={fechas:[],seg:[],sinresp:[],noviable:[],alarmas:0,avisos:0};
+  var r={fechas:[],seg:[],sinresp:[],alarmas:0,avisos:0};
   var hoy=new Date();var hoy0=new Date(hoy.getFullYear(),hoy.getMonth(),hoy.getDate()).getTime();
   (rows||[]).forEach(function(c){
     if(c.deleted_at)return;
@@ -3326,11 +3378,9 @@ function calcAlertas(rows){
     }else if(est==='SIN RESPUESTA'){
       if(dias>=2)r.sinresp.push({c:c,nivel:'alarma',txt:dias+' días sin gestión (límite 2)'});
       else if(dias>=1)r.sinresp.push({c:c,nivel:'aviso',txt:'1 día sin gestión (por vencer, límite 2)'});
-    }else if(est==='PRECIO'||est==='MATERIAL'||est==='PROVEEDOR'||est==='NO VIABLE'){
-      if(dias>=1)r.noviable.push({c:c,nivel:'alarma',txt:dias+(dias===1?' día':' días')+' sin gestión (límite: día siguiente) · '+est});
     }
   });
-  [r.fechas,r.seg,r.sinresp,r.noviable].forEach(function(a){
+  [r.fechas,r.seg,r.sinresp].forEach(function(a){
     a.sort(function(x,y){return (x.nivel===y.nivel)?0:(x.nivel==='alarma'?-1:1);});
     a.forEach(function(i){if(i.nivel==='alarma')r.alarmas++;else r.avisos++;});
   });
@@ -3356,7 +3406,6 @@ function pintarAlertas(){
   h+=alSec('Fechas programadas','Leads con próximo seguimiento agendado: alarma el día programado o ya vencido; aviso 3 días antes.',r.fechas);
   h+=alSec('En seguimiento','Estatus SEGUIMIENTO: alarma a los 8 días sin gestión; aviso desde el día 6.',r.seg);
   h+=alSec('Sin respuesta','Estatus SIN RESPUESTA: alarma a los 2 días sin gestión; aviso al día 1.',r.sinresp);
-  h+=alSec('No viable: precio, proveedor o material','Estatus PRECIO, MATERIAL, PROVEEDOR o NO VIABLE: alarma al día siguiente sin gestión.',r.noviable);
   cont.innerHTML=h;
   actualizarBadgeAlertas(r);
 }
@@ -4289,7 +4338,7 @@ function renderFicha(){
   var content=document.getElementById('content'); if(!content)return;
   var etapaBadge=(c.etapa==='cliente')?'<span class="pill" style="background:var(--ok)">CLIENTE</span>':'<span class="pill" style="background:var(--gold)">PROSPECTO</span>';
   var h='<button class="back" onclick="volverCRM()">‹ Volver al CRM</button>';
-  h+='<div class="ficha-head"><div><div class="ficha-name">'+escAttr(c.nombre||'—')+'</div>'+
+  h+='<div class="ficha-head"><div><div class="ficha-name fedit" contenteditable="true" data-id="'+FICHA.id+'" data-campo="nombre" data-tipo="text" data-ph="Nombre" title="Clic para editar el nombre" onblur="fGuardar(this)">'+escAttr(c.nombre||'')+'</div>'+
      '<div class="muted" style="font-size:.85rem">'+escAttr(c.empresa||'Sin empresa')+(c.industria?(' · '+escAttr(c.industria)):'')+'</div></div>'+
      '<div class="ficha-actions">'+etapaBadge+
      ' <button class="btn" onclick="cotizarClienteFicha()">+ Cotización</button>'+
@@ -4740,7 +4789,7 @@ async function viewCotizaciones(c){
     var conv=(r.estado==='aceptada'&&!r.proyecto_folio)?' <button class="btn" style="padding:.3rem .6rem" onclick="convertirCot('+r.id+')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Proyecto</button>':'';
     var proy=r.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+r.proyecto_folio+'</span>'):'—';
     h+='<tr><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td><td>'+proy+'</td>'+
-       '<td style="white-space:nowrap"><button class="btn sec" style="padding:.3rem .6rem" onclick="pdfCotizacion('+r.id+')">PDF</button>'+conv+'</td></tr>';
+       '<td style="white-space:nowrap"><button class="btn sec" style="padding:.3rem .6rem" onclick="pdfCotizacion('+r.id+')">PDF</button> <button class="btn sec" style="padding:.3rem .6rem" onclick="editarCotizacion('+r.id+')">Editar</button> <button class="btn err" style="padding:.3rem .6rem" onclick="eliminarCot('+r.id+')">Eliminar</button>'+conv+'</td></tr>';
   });
   if(!d.data.length)h+='<tr><td colspan="7" class="muted">Sin cotizaciones. Crea la primera.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
@@ -4756,38 +4805,84 @@ function confirmModalOk(){var cb=_CONFIRM_CB;_CONFIRM_CB=null;if(typeof closeMod
 function convertirCot(id){confirmModal('¿Convertir esta cotización en proyecto? Se creará un proyecto ligado a esta cotización.','Sí, convertir',function(){_convertirCot(id);});}
 async function _convertirCot(id){var d=await api('/api/cotizaciones/'+id+'/convertir',{method:'POST',body:JSON.stringify({})});if(d&&d.ok){toast('Proyecto '+d.data.folio+' creado');go('proyectos');}else if(d){toast(d.error);}}
 
-var COT_PROD=[];var cotSeq=0;
-async function nuevaCotizacion(preselectId){
+var COT_PROD=[];var cotSeq=0;var COT_EDIT=null;
+async function nuevaCotizacion(preselectId){COT_EDIT=null;await formCotizacion(preselectId,null);}
+async function editarCotizacion(id){
+  var d=await api('/api/cotizaciones/'+id);
+  if(!d||!d.ok){toast('No se pudo cargar la cotización');return;}
+  COT_EDIT=d.data;COT_EDIT.id=id;
+  await formCotizacion(d.data.cliente_id,d.data);
+}
+async function formCotizacion(preselectId,ed){
   document.getElementById('acciones').innerHTML='';
-  document.getElementById('titulo').textContent='Nueva cotización';
+  document.getElementById('titulo').textContent=ed?('Editar cotización '+(ed.folio||'')):'Nueva cotización';
   var c=document.getElementById('content');c.innerHTML='Cargando…';
   var dc=await api('/api/clientes');var dp=await api('/api/productos');
   if(!dc||!dp)return;
   COT_PROD=dp.data;
   var cliOpts='<option value="">— Selecciona cliente —</option>';
   dc.data.forEach(function(cl){var sel=(preselectId&&String(cl.id)===String(preselectId))?' selected':'';cliOpts+='<option value="'+cl.id+'"'+sel+'>'+escAttr(cl.nombre)+(cl.empresa?(' · '+escAttr(cl.empresa)):'')+'</option>';});
+  var asesorNom=(ed&&ed.vendedor)?ed.vendedor:((USER&&USER.nombre)?USER.nombre:'—');
+  var vVig=ed?(ed.vigencia_dias||7):7;
+  var vDescG=ed?(ed.descuento_global_pct||0):0;
+  var vIva=(ed&&ed.iva_pct!=null)?ed.iva_pct:((CFG&&CFG.iva!=null)?CFG.iva:16);
+  var vPago=ed?(ed.cond_pago||''):'100% ANTICIPADO';
+  var vEntC=ed?(ed.cond_entrega||''):'';
+  var vNoInc=ed?(ed.cond_no_incluye||''):'NO INCLUYE ENVÍO O DESCARGA DE MATERIAL';
+  var vNotas=ed?(ed.notas||''):'TIEMPO DE ENTREGA DE 3 A 5 DIAS HABILES UNA VEZ ACREDITADO EL ANTICIPO, PRECIO SUJETO A TIPO DE CAMBIO';
+  var vEntDir=ed?(ed.entrega_direccion||''):'';
+  var vEntRef=ed?(ed.entrega_referencias||''):'';
+  var vEntTel=ed?(ed.entrega_telefono||''):'';
   var h='<span class="back" onclick="volverCot()">‹ Volver</span>';
   h+='<div class="card" style="margin-top:.5rem">';
+  h+='<div class="muted" style="font-size:.85rem;margin-bottom:.6rem">Asesor: <strong style="color:var(--gold)">'+escAttr(asesorNom)+'</strong></div>';
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
   h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
   h+='<button class="btn sec" style="margin-top:.6rem" onclick="agregarFila()">+ Agregar línea</button>';
-  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="0" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+((CFG&&CFG.iva!=null)?CFG.iva:16)+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="15"></div></div>';
+  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="'+vDescG+'" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+vIva+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="'+vVig+'"></div></div>';
   h+='<div style="text-align:right;margin-top:1rem"><div>Subtotal: <strong id="cotSub">$0.00</strong></div><div>IVA: <strong id="cotIvaM">$0.00</strong></div><div style="font-size:1.3rem;color:var(--gold);margin-top:.3rem">TOTAL: <strong id="cotTotal">$0.00</strong></div></div>';
-  h+='<label style="margin-top:1rem">Notas</label><textarea id="cotNotas" rows="2" placeholder="Ej: Suministro y corte de cubiertas."></textarea>';
-  h+='<label>Condiciones</label><textarea id="cotCond" rows="2">Precios en MXN. Sujeto a disponibilidad de material. Tiempo de entrega a confirmar.</textarea>';
-  h+='<div style="height:.8rem"></div><button class="btn" onclick="guardarCotizacion()">Guardar cotización</button></div>';
+  h+='<h3 class="serif" style="color:var(--gold);font-size:1.05rem;margin-top:1.1rem">Datos de entrega</h3>';
+  h+='<div class="g2"><div><label>Dirección de entrega</label><input id="cotEntDir" value="'+escAttr(vEntDir)+'"></div><div><label>Referencias</label><input id="cotEntRef" value="'+escAttr(vEntRef)+'"></div><div><label>Teléfono de entrega</label><input id="cotEntTel" value="'+escAttr(vEntTel)+'"></div></div>';
+  h+='<h3 class="serif" style="color:var(--gold);font-size:1.05rem;margin-top:1.1rem">Condiciones</h3>';
+  h+='<div class="g2"><div><label>Pago</label><input id="cotCondPago" value="'+escAttr(vPago)+'"></div><div><label>Entrega</label><input id="cotCondEntrega" value="'+escAttr(vEntC)+'"></div><div><label>No incluye</label><input id="cotCondNoInc" value="'+escAttr(vNoInc)+'"></div></div>';
+  h+='<label style="margin-top:1rem">Notas</label><textarea id="cotNotas" rows="2">'+escAttr(vNotas)+'</textarea>';
+  h+='<div style="height:.8rem"></div><button class="btn" onclick="guardarCotizacion()">'+(ed?'Guardar cambios':'Guardar cotización')+'</button></div>';
   c.innerHTML=h;
-  agregarFila();
+  if(ed&&ed.items&&ed.items.length){
+    ed.items.forEach(function(it){
+      agregarFila();
+      var rows=document.querySelectorAll('#cotBody tr.cotlin');var tr=rows[rows.length-1];
+      var sel=tr.querySelector('select.c-mat');
+      if(it.producto_id!=null){sel.value=String(it.producto_id);}
+      tr.querySelector('.c-desc').value=it.descripcion||'';
+      tr.querySelector('.c-cant').value=(it.cantidad!=null?it.cantidad:1);
+      setUnidad(tr.querySelector('.c-uni'),it.unidad||'m2');
+      tr.querySelector('.c-pu').value=(it.precio_unitario!=null?it.precio_unitario:0);
+      tr.querySelector('.c-dl').value=(it.descuento_linea_pct!=null?it.descuento_linea_pct:0);
+    });
+    recalcCot();
+  }else{agregarFila();}
+}
+function eliminarCot(id){confirmModal('¿Eliminar esta cotización? Se quitará de la lista y ya no será utilizable.','Sí, eliminar',function(){_eliminarCot(id);});}
+async function _eliminarCot(id){var d=await api('/api/cotizaciones/'+id,{method:'DELETE'});if(d&&d.ok){toast('Cotización eliminada');go('cotizaciones');}else if(d){toast(d.error);}}
+function setUnidad(sel,v){
+  var found=false,i;
+  for(i=0;i<sel.options.length;i++){if(sel.options[i].value===v)found=true;}
+  if(!found){var o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);}
+  sel.value=v;
 }
 function agregarFila(){
   cotSeq++;
   var po='<option value="">— libre —</option>';
-  COT_PROD.forEach(function(p){po+='<option value="'+p.id+'" data-precio="'+(p.precio_venta||0)+'" data-unidad="'+(p.unidad||'m2')+'" data-nombre="'+escAttr(p.nombre)+'">'+escAttr(p.nombre)+'</option>';});
+  po+='<optgroup label="Familias de material">';
+  CAT_MATERIAL.forEach(function(m){po+='<option value="fam" data-precio="0" data-unidad="m2" data-nombre="'+escAttr(m)+'">'+escAttr(m)+'</option>';});
+  po+='</optgroup>';
+  if(COT_PROD.length){po+='<optgroup label="Inventario">';COT_PROD.forEach(function(p){po+='<option value="'+p.id+'" data-precio="'+(p.precio_venta||0)+'" data-unidad="'+(p.unidad||'m2')+'" data-nombre="'+escAttr(p.nombre)+'">'+escAttr(p.nombre)+'</option>';});po+='</optgroup>';}
   var tr=document.createElement('tr');tr.className='cotlin';
-  tr.innerHTML='<td><select onchange="autoProd(this)" style="min-width:150px">'+po+'</select></td>'+
+  tr.innerHTML='<td><select class="c-mat" onchange="autoProd(this)" style="min-width:150px">'+po+'</select></td>'+
     '<td><input class="c-desc" placeholder="Descripción" style="min-width:150px"></td>'+
     '<td><input class="c-cant" type="number" step="0.01" value="1" oninput="recalcCot()" style="width:70px"></td>'+
-    '<td><input class="c-uni" value="m2" style="width:60px"></td>'+
+    '<td><select class="c-uni" style="width:70px"><option value="m2">m2</option><option value="ml">ml</option><option value="pza">pza</option></select></td>'+
     '<td><input class="c-pu" type="number" step="0.01" value="0" oninput="recalcCot()" style="width:95px"></td>'+
     '<td><input class="c-dl" type="number" step="0.01" value="0" oninput="recalcCot()" style="width:55px"></td>'+
     '<td class="c-sl" style="white-space:nowrap">$0.00</td>'+
@@ -4796,7 +4891,8 @@ function agregarFila(){
 }
 function autoProd(sel){
   var o=sel.options[sel.selectedIndex];var tr=sel.closest('tr');
-  if(o&&o.value){tr.querySelector('.c-pu').value=o.getAttribute('data-precio')||0;tr.querySelector('.c-uni').value=o.getAttribute('data-unidad')||'m2';var dsc=tr.querySelector('.c-desc');if(!dsc.value)dsc.value=o.getAttribute('data-nombre')||'';}
+  if(o&&o.value==='fam'){var dscF=tr.querySelector('.c-desc');if(!dscF.value)dscF.value=o.getAttribute('data-nombre')||'';}
+  else if(o&&o.value){tr.querySelector('.c-pu').value=o.getAttribute('data-precio')||0;setUnidad(tr.querySelector('.c-uni'),o.getAttribute('data-unidad')||'m2');var dsc=tr.querySelector('.c-desc');if(!dsc.value)dsc.value=o.getAttribute('data-nombre')||'';}
   recalcCot();
 }
 function recalcCot(){
@@ -4819,8 +4915,9 @@ function recalcCot(){
 function recogerLineas(){
   var items=[];
   document.querySelectorAll('#cotBody tr.cotlin').forEach(function(tr){
-    var sel=tr.querySelector('select');
-    items.push({producto_id:sel.value||null,descripcion:tr.querySelector('.c-desc').value,cantidad:tr.querySelector('.c-cant').value,unidad:tr.querySelector('.c-uni').value,precio_unitario:tr.querySelector('.c-pu').value,descuento_linea_pct:tr.querySelector('.c-dl').value});
+    var sel=tr.querySelector('select.c-mat');
+    var pv=sel?sel.value:'';
+    items.push({producto_id:(pv&&pv!=='fam')?pv:null,descripcion:tr.querySelector('.c-desc').value,cantidad:tr.querySelector('.c-cant').value,unidad:tr.querySelector('.c-uni').value,precio_unitario:tr.querySelector('.c-pu').value,descuento_linea_pct:tr.querySelector('.c-dl').value});
   });
   return items.filter(function(it){return it.descripcion||it.producto_id;});
 }
@@ -4829,36 +4926,52 @@ async function guardarCotizacion(){
   if(!cliente){toast('Selecciona un cliente');return;}
   var items=recogerLineas();
   if(!items.length){toast('Agrega al menos una línea');return;}
-  var body={cliente_id:cliente,items:items,descuento_global_pct:document.getElementById('cotDescG').value,iva_pct:document.getElementById('cotIva').value,vigencia_dias:document.getElementById('cotVig').value,notas:document.getElementById('cotNotas').value,condiciones:document.getElementById('cotCond').value};
-  var d=await api('/api/cotizaciones',{method:'POST',body:JSON.stringify(body)});
-  if(d&&d.ok){toast('Cotización '+d.data.folio+' creada');go('cotizaciones');}else if(d){toast(d.error);}
+  var body={cliente_id:cliente,items:items,
+    descuento_global_pct:document.getElementById('cotDescG').value,
+    iva_pct:document.getElementById('cotIva').value,
+    vigencia_dias:document.getElementById('cotVig').value,
+    notas:document.getElementById('cotNotas').value,
+    entrega_direccion:document.getElementById('cotEntDir').value,
+    entrega_referencias:document.getElementById('cotEntRef').value,
+    entrega_telefono:document.getElementById('cotEntTel').value,
+    cond_pago:document.getElementById('cotCondPago').value,
+    cond_entrega:document.getElementById('cotCondEntrega').value,
+    cond_no_incluye:document.getElementById('cotCondNoInc').value};
+  if(COT_EDIT&&COT_EDIT.condiciones)body.condiciones=COT_EDIT.condiciones;
+  if(COT_EDIT&&COT_EDIT.id){
+    var d=await api('/api/cotizaciones/'+COT_EDIT.id,{method:'PUT',body:JSON.stringify(body)});
+    if(d&&d.ok){toast('Cotización '+(COT_EDIT.folio||'')+' actualizada');COT_EDIT=null;go('cotizaciones');}else if(d){toast(d.error);}
+  }else{
+    var d2=await api('/api/cotizaciones',{method:'POST',body:JSON.stringify(body)});
+    if(d2&&d2.ok){toast('Cotización '+d2.data.folio+' creada');go('cotizaciones');}else if(d2){toast(d2.error);}
+  }
 }
 function escAttr(s){return String(s==null?'':s).replace(/"/g,'&quot;');}
 
-var LOGO_ASLAN="data:image/png;base64,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";
 async function pdfCotizacion(id){
   var d=await api('/api/cotizaciones/'+id);if(!d||!d.ok){toast('No se pudo cargar la cotización');return;}
   if(!window.jspdf||!window.jspdf.jsPDF){toast('Generador de PDF no cargó, reintenta');return;}
   var c=d.data;var gold=[139,109,63];var gris=[90,90,90];
   var doc=new window.jspdf.jsPDF();
   var L=14,R=196,W=R-L;
-  // ----- Encabezado: logo + datos de la empresa -----
-  try{ doc.addImage(LOGO_ASLAN,'PNG',L,11,58,20); }catch(e){ doc.setFontSize(24);doc.setTextColor(gold[0],gold[1],gold[2]);doc.text((CFG&&CFG.nombre?CFG.nombre:${JSON.stringify(EMPRESA.nombre)}),L,22); }
-  doc.setFontSize(11);doc.setTextColor(40);
-  doc.text((CFG&&CFG.nombre?CFG.nombre:${JSON.stringify(EMPRESA.nombre)}),L,38);
+  // ----- Encabezado: marca ASLAN + datos de la empresa -----
+  doc.setFont('times','bold');doc.setFontSize(28);doc.setTextColor(gold[0],gold[1],gold[2]);
+  doc.text((CFG&&CFG.nombre?CFG.nombre:${JSON.stringify(EMPRESA.nombre)}),L,22,{charSpace:2.5});
+  doc.setFont('helvetica','normal');
   doc.setFontSize(8.5);doc.setTextColor(gris[0],gris[1],gris[2]);
   var dir=doc.splitTextToSize((CFG&&CFG.direccion?CFG.direccion:${JSON.stringify(EMPRESA.direccion)}),96);
-  doc.text(dir,L,43);
-  var yd=43+dir.length*4;
+  doc.text(dir,L,30);
+  var yd=30+dir.length*4;
   doc.text('Tel. '+(CFG&&CFG.telefono?CFG.telefono:${JSON.stringify(EMPRESA.telefono)}),L,yd);
   doc.text((CFG&&CFG.email?CFG.email:${JSON.stringify(EMPRESA.email)}),L,yd+4.5);
-  // Folio / Fecha / Vigencia (derecha)
+  // Folio / Fecha / Vigencia / Asesor (derecha)
   doc.setFontSize(15);doc.setTextColor(40);doc.text('COTIZACIÓN',R,18,{align:'right'});
   doc.setFontSize(9);doc.setTextColor(60);
-  var hoy=new Date();var vig=new Date(hoy.getTime()+((c.vigencia_dias||15)*86400000));
+  var hoy=new Date();var vig=new Date(hoy.getTime()+((c.vigencia_dias||7)*86400000));
   doc.text('Folio: '+(c.folio||''),R,26,{align:'right'});
   doc.text('Fecha: '+hoy.toLocaleDateString('es-MX').split('/').join('-'),R,31,{align:'right'});
   doc.text('Vigencia: '+vig.toLocaleDateString('es-MX').split('/').join('-'),R,36,{align:'right'});
+  if(c.vendedor){doc.text('Asesor: '+c.vendedor,R,41,{align:'right'});}
   doc.setDrawColor(gold[0],gold[1],gold[2]);doc.setLineWidth(0.5);doc.line(L,55,R,55);
   // ----- Datos de Facturación / Datos de Entrega -----
   var yc=62;var midX=110;
@@ -4871,19 +4984,19 @@ async function pdfCotizacion(id){
   campo('Razón Social:',c.cliente_empresa||'',L,fy+5.5);
   campo('Dirección:',c.cliente_direccion||'',L,fy+11);
   campo('RFC:',c.cliente_rfc||'',L,fy+16.5);
-  campo('Dirección:',c.cliente_direccion||'',midX,fy);
-  campo('Referencias:','',midX,fy+5.5);
-  campo('Teléfono:',c.cliente_telefono||'',midX,fy+11);
+  campo('Dirección:',c.entrega_direccion||c.cliente_direccion||'',midX,fy);
+  campo('Referencias:',c.entrega_referencias||'',midX,fy+5.5);
+  campo('Teléfono:',c.entrega_telefono||c.cliente_telefono||'',midX,fy+11);
   // ----- Tabla de partidas -----
-  var body=(c.items||[]).map(function(it,i){return [String(i+1),it.descripcion||'',String(it.cantidad||0),money(it.precio_unitario),money(it.subtotal_linea)];});
+  var body=(c.items||[]).map(function(it,i){return [String(i+1),it.descripcion||'',String(it.cantidad||0),(it.unidad||'m2'),money(it.precio_unitario),money(it.subtotal_linea)];});
   doc.autoTable({
     startY:fy+24,
-    head:[['PARTIDA','MODELO','METROS','PRECIO UNITARIO','TOTAL']],
-    body:body.length?body:[['','','','','']],
+    head:[['PARTIDA','MODELO','CANT.','UNIDAD','PRECIO UNITARIO','TOTAL']],
+    body:body.length?body:[['','','','','','']],
     theme:'grid',
     headStyles:{fillColor:gold,textColor:255,fontSize:8.5,halign:'center'},
     styles:{fontSize:8.5,textColor:40,cellPadding:2},
-    columnStyles:{0:{cellWidth:18,halign:'center'},1:{cellWidth:'auto'},2:{cellWidth:22,halign:'center'},3:{cellWidth:34,halign:'right'},4:{cellWidth:34,halign:'right'}}
+    columnStyles:{0:{cellWidth:20,halign:'center'},1:{cellWidth:'auto'},2:{cellWidth:15,halign:'center'},3:{cellWidth:17,halign:'center'},4:{cellWidth:30,halign:'right'},5:{cellWidth:30,halign:'right'}}
   });
   var y=(doc.lastAutoTable?doc.lastAutoTable.finalY:90)+8;
   // ----- Totales (derecha) -----
@@ -4897,23 +5010,46 @@ async function pdfCotizacion(id){
   doc.setFontSize(11.5);doc.setTextColor(gold[0],gold[1],gold[2]);doc.setFont(undefined,'bold');
   doc.text('TOTAL',150,y+1,{align:'right'});doc.text(money(c.total),R,y+1,{align:'right'});
   doc.setFont(undefined,'normal');
-  // ----- Condiciones / Notas / Términos / Firmas -----
+  // ----- CONDICIONES / NOTAS / Términos / Firmas (formato original ASLAN) -----
   var yb=Math.max(y+12,(doc.lastAutoTable?doc.lastAutoTable.finalY:90)+14);
-  doc.setFontSize(9.5);doc.setTextColor(gold[0],gold[1],gold[2]);doc.setFont(undefined,'bold');doc.text('CONDICIONES',L,yb);
-  doc.setFont(undefined,'normal');doc.setFontSize(8.5);doc.setTextColor(60);
-  if(c.condiciones){var cc=doc.splitTextToSize(c.condiciones,W);doc.text(cc,L,yb+5);yb=yb+5+cc.length*4;}else{doc.text('Pago:',L,yb+5);doc.text('Entrega:',L,yb+10);doc.text('No incluye:',L,yb+15);yb=yb+20;}
-  if(c.notas){doc.setFontSize(9.5);doc.setTextColor(gold[0],gold[1],gold[2]);doc.setFont(undefined,'bold');doc.text('NOTAS',L,yb+3);doc.setFont(undefined,'normal');doc.setFontSize(8.5);doc.setTextColor(60);var nn=doc.splitTextToSize(c.notas,W);doc.text(nn,L,yb+8);yb=yb+8+nn.length*4;}
+  doc.setFontSize(9.5);doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('CONDICIONES',L,yb);
+  doc.setFont(undefined,'normal');doc.setFontSize(8.5);
+  var cx1=L+28,cx2=L+152,cxm=(cx1+cx2)/2;
+  function condLinea(et,val,yy){
+    doc.setTextColor(40);doc.text(et,L,yy);
+    doc.setTextColor(60);
+    if(val)doc.text(String(val),cxm,yy,{align:'center'});
+    doc.setDrawColor(80);doc.setLineWidth(0.3);doc.line(cx1,yy+1.3,cx2,yy+1.3);
+  }
+  var legacyCond=(!c.cond_pago&&!c.cond_entrega&&!c.cond_no_incluye&&c.condiciones);
+  if(legacyCond){
+    doc.setTextColor(60);var cc=doc.splitTextToSize(String(c.condiciones),W);doc.text(cc,L,yb+6);yb=yb+6+cc.length*4;
+  }else{
+    condLinea('Pago:',c.cond_pago||'',yb+7);
+    condLinea('Entrega',c.cond_entrega||'',yb+13);
+    condLinea('No incluye',c.cond_no_incluye||'',yb+19);
+    yb=yb+23;
+  }
+  var yn=yb+7;
+  doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('NOTAS:',L,yn);
+  doc.setFont(undefined,'normal');doc.setTextColor(60);
+  var nn=c.notas?doc.splitTextToSize(String(c.notas),118):[];
+  if(nn.length)doc.text(nn,cxm,yn,{align:'center'});
+  var ynEnd=yn+(nn.length?(nn.length-1)*4:0)+1.5;
+  doc.setDrawColor(80);doc.setLineWidth(0.3);doc.line(cx1,ynEnd,cx2,ynEnd);
+  yb=ynEnd+5;
   doc.setFontSize(8);doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('Términos y condiciones:',L,yb+5);
+  doc.text('Una vez depositado el anticipo no hay cambios ni cancelaciones',L,yb+9.5);
   doc.setFont(undefined,'normal');doc.setTextColor(90);
-  doc.text('Una vez depositado el anticipo no hay cambios ni cancelaciones.',L,yb+9.5);
-  doc.text('El cliente es responsable por la solicitud del material, color y medidas.',L,yb+13.5);
-  // Firmas
-  var yf=Math.min(yb+34,285);if(yf<yb+24)yf=yb+24;
-  doc.setDrawColor(120);doc.setLineWidth(0.3);
-  doc.line(L+6,yf,L+76,yf);doc.line(midX+6,yf,midX+76,yf);
+  doc.text('El cliente es responsable por la solicitud del material, color y medidas',L,yb+13.5);
+  doc.text('Al ser un material natural existirá cambio de tonalidades y relices naturales',L,yb+17.5);
+  // Firmas: etiqueta arriba y línea abajo, como el formato original
+  var yf=Math.min(yb+28,275);if(yf<yb+24)yf=yb+24;
   doc.setFontSize(8.5);doc.setTextColor(60);
-  doc.text('Firma representante ASLAN',L+41,yf+5,{align:'center'});
-  doc.text('Firma de acuerdo Cliente',midX+41,yf+5,{align:'center'});
+  doc.text('Firma representante ASLAN',L+6,yf);
+  doc.text('Firma de acuerdo Cliente',midX+6,yf);
+  doc.setDrawColor(120);doc.setLineWidth(0.3);
+  doc.line(L+6,yf+12,L+76,yf+12);doc.line(midX+6,yf+12,midX+76,yf+12);
   doc.save((c.folio||'cotizacion')+'.pdf');
 }
 
