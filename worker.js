@@ -337,6 +337,12 @@ CREATE TABLE IF NOT EXISTS proyecto_fotos (
   proyecto_id INTEGER NOT NULL, url_r2 TEXT, etapa TEXT,
   descripcion TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS cliente_archivos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cliente_id INTEGER NOT NULL, url_r2 TEXT NOT NULL,
+  nombre TEXT NOT NULL, categoria TEXT, content_type TEXT, tamano INTEGER,
+  usuario_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, deleted_at DATETIME
+);
 CREATE TABLE IF NOT EXISTS proyecto_materiales (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   proyecto_id INTEGER NOT NULL, producto_id INTEGER,
@@ -525,6 +531,21 @@ async function migrarV6(env) {
   for (const sql of cols6) { try { await env.DB.prepare(sql).run(); } catch (e) {} }
   try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v6_seguimiento','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
   MIGRADO_V6 = true;
+}
+
+let MIGRADO_V8 = false;
+async function migrarV8(env) {
+  if (MIGRADO_V8) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v8_archivos'").first();
+    if (f && f.valor === "ok") { MIGRADO_V8 = true; return; }
+  } catch (e) { return; }
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS cliente_archivos (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, url_r2 TEXT NOT NULL, nombre TEXT NOT NULL, categoria TEXT, content_type TEXT, tamano INTEGER, usuario_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, deleted_at DATETIME)").run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_cliente_archivos_cli ON cliente_archivos(cliente_id)").run();
+  } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v8_archivos','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V8 = true;
 }
 
 let MIGRADO_V7 = false;
@@ -1922,6 +1943,87 @@ async function borrarFotoProyecto(request, env, payload, proyectoId, fotoId) {
   await audit(env, payload.sub, "borrar_foto", "proyecto_fotos", fotoId, null, request);
   return ok({ id: fotoId });
 }
+// ============================================================================
+//  ARCHIVOS Y DOCUMENTOS POR LEAD / CLIENTE  (R2: binding FILES)
+//  Comprobantes de pago, fotos del cliente, material compartido, etc.
+// ============================================================================
+const ARCH_CATEGORIAS = ["Comprobante de pago", "Foto del cliente", "Material compartido", "Cotizacion", "Contrato", "Otro"];
+async function clienteAccesible(env, payload, clienteId) {
+  const c = await env.DB.prepare("SELECT id, asesor FROM clientes WHERE id=? AND deleted_at IS NULL").bind(clienteId).first();
+  if (!c) return null;
+  const _sc = asesorScope(payload);
+  if (_sc) { const _a = (c.asesor || "").trim().toUpperCase(); if (_a !== _sc.first && _a !== _sc.full) return null; }
+  return c;
+}
+async function archivoUrl(archivoId, secret) {
+  const tk = await createJWT({ t: "archivo", aid: archivoId }, secret, 12);
+  return "/media/archivo/" + archivoId + "?k=" + tk;
+}
+async function listarArchivosCliente(env, payload, clienteId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const r = await env.DB.prepare("SELECT a.id,a.nombre,a.categoria,a.content_type,a.tamano,a.usuario_id,a.created_at,u.nombre AS usuario FROM cliente_archivos a LEFT JOIN usuarios u ON u.id=a.usuario_id WHERE a.cliente_id=? AND a.deleted_at IS NULL ORDER BY a.created_at DESC, a.id DESC").bind(clienteId).all();
+  const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+  const out = [];
+  for (const f of (r.results || [])) out.push({ id: f.id, nombre: f.nombre, categoria: f.categoria, content_type: f.content_type, tamano: f.tamano, usuario: f.usuario, usuario_id: f.usuario_id, created_at: f.created_at, url: await archivoUrl(f.id, secret) });
+  return ok(out);
+}
+async function subirArchivoCliente(request, env, payload, clienteId) {
+  if (!env.FILES) return fail("Almacenamiento de archivos no configurado (falta el binding R2 'FILES').", 500);
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.data) return fail("Falta el archivo.");
+  let b64 = String(b.data), ct = b.contentType || "application/octet-stream";
+  const m = /^data:([^;]+);base64,(.*)$/s.exec(b64);
+  if (m) { ct = m[1]; b64 = m[2]; }
+  let bytes;
+  try { bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)); } catch (e) { return fail("Archivo inválido."); }
+  if (!bytes.length) return fail("El archivo está vacío.");
+  if (bytes.length > 10 * 1024 * 1024) return fail("El archivo supera 10 MB.");
+  let nombre = String(b.nombre || "archivo").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 160);
+  const extM = /\.([A-Za-z0-9]{1,8})$/.exec(nombre);
+  const ext = extM ? extM[1].toLowerCase() : "bin";
+  const categoria = ARCH_CATEGORIAS.includes(b.categoria) ? b.categoria : "Otro";
+  const key = "clientes/" + clienteId + "/" + crypto.randomUUID() + "." + ext;
+  await env.FILES.put(key, bytes, { httpMetadata: { contentType: ct } });
+  const res = await env.DB.prepare("INSERT INTO cliente_archivos (cliente_id,url_r2,nombre,categoria,content_type,tamano,usuario_id) VALUES (?,?,?,?,?,?,?)").bind(clienteId, key, nombre, categoria, ct, bytes.length, payload.sub).run();
+  await audit(env, payload.sub, "subir_archivo", "cliente_archivos", res.meta.last_row_id, { cliente_id: clienteId, nombre, categoria }, request);
+  return ok({ id: res.meta.last_row_id });
+}
+async function borrarArchivoCliente(request, env, payload, clienteId, archivoId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const f = await env.DB.prepare("SELECT id, usuario_id FROM cliente_archivos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(archivoId, clienteId).first();
+  if (!f) return fail("Archivo no encontrado.", 404);
+  if (!hasRole(payload, "admin", "gerente") && String(f.usuario_id) !== String(payload.sub)) return fail("Solo quien subió el archivo, gerencia o administración pueden eliminarlo.", 403);
+  // Baja logica: el objeto permanece en R2 y el registro conserva su historial.
+  await env.DB.prepare("UPDATE cliente_archivos SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(archivoId).run();
+  await audit(env, payload.sub, "borrar_archivo", "cliente_archivos", archivoId, { cliente_id: clienteId }, request);
+  return ok({ id: archivoId });
+}
+async function serveArchivo(request, env, path, url) {
+  const m = /^\/media\/archivo\/(\d+)$/.exec(path);
+  if (!m) return new Response("No encontrado", { status: 404 });
+  const id = m[1];
+  const k = url.searchParams.get("k");
+  const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+  const pl = k ? await verifyJWT(k, secret) : null;
+  if (!pl || pl.t !== "archivo" || String(pl.aid) !== String(id)) return new Response("No autorizado", { status: 401 });
+  const f = await env.DB.prepare("SELECT url_r2, nombre, content_type FROM cliente_archivos WHERE id=? AND deleted_at IS NULL").bind(id).first();
+  if (!f || !f.url_r2) return new Response("No encontrado", { status: 404 });
+  if (!env.FILES) return new Response("Almacenamiento no configurado", { status: 500 });
+  const obj = await env.FILES.get(f.url_r2);
+  if (!obj) return new Response("No encontrado", { status: 404 });
+  const headers = new Headers();
+  const ct = (obj.httpMetadata && obj.httpMetadata.contentType) || f.content_type || "application/octet-stream";
+  headers.set("content-type", ct);
+  const inline = /^(image\/|application\/pdf|text\/)/.test(ct);
+  headers.set("content-disposition", (inline ? "inline" : "attachment") + "; filename=\"" + encodeURIComponent(f.nombre || "archivo") + "\"");
+  headers.set("cache-control", "private, max-age=3600");
+  return new Response(obj.body, { headers });
+}
+
 async function serveFoto(request, env, path, url) {
   const m = /^\/media\/foto\/(\d+)$/.exec(path);
   if (!m) return new Response("No encontrado", { status: 404 });
@@ -2073,6 +2175,7 @@ async function getConfig(env) {
     crm_titulos: map.crm_titulos || "",
     crm_cols: map.crm_cols || "",
     crm_layout: map.crm_layout || "",
+    logo_data: map.logo_data || "",
   };
 }
 const RX_COL = /^col_[a-z0-9_]{1,24}$/;
@@ -2129,6 +2232,13 @@ async function handleConfig(request, env, payload, method) {
   const _kcfg = Object.keys(b || {});
   const _soloTitulos = _kcfg.length > 0 && _kcfg.every((k) => k === "crm_titulos" || k === "crm_layout");
   if (!hasRole(payload, "admin") && !(_soloTitulos && hasRole(payload, "gerente"))) return fail("Solo administración puede cambiar la configuración.", 403);
+  if ("logo_data" in b) {
+    const ld = b.logo_data == null ? "" : String(b.logo_data);
+    if (ld && !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+\/=]+$/.test(ld)) return fail("El logo debe ser una imagen PNG o JPG.");
+    if (ld.length > 420000) return fail("El logo supera 300 KB. Usa una imagen más ligera.");
+    await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES ('logo_data',?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(ld).run();
+    delete b.logo_data;
+  }
   const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva", "crm_titulos", "crm_layout"];
   for (const k of campos) {
     if (k in b && b[k] !== undefined && b[k] !== null) {
@@ -2285,6 +2395,7 @@ async function handleRequest(request, env) {
   await migrarV5(env);
   await migrarV6(env);
   await migrarV7(env);
+  await migrarV8(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2327,6 +2438,11 @@ async function handleRequest(request, env) {
     if (m && method === "GET") return await fichaCliente(env, m[1], payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
     if (m && method === "POST") return await agregarNotaCliente(request, env, payload, m[1]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/archivos$/);
+    if (m && method === "GET") return await listarArchivosCliente(env, payload, m[1]);
+    if (m && method === "POST") return await subirArchivoCliente(request, env, payload, m[1]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/archivos\/(\d+)$/);
+    if (m && method === "DELETE") return await borrarArchivoCliente(request, env, payload, m[1], m[2]);
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
     if (m) return await handleClientes(request, env, payload, method, m[1]);
     m = path.match(/^\/api\/cotizaciones\/(\d+)\/convertir$/);
@@ -2395,6 +2511,7 @@ async function handleRequest(request, env) {
   if (path === "/check-in" || path === "/checkin") return html(renderCheckin());
   if (path.startsWith("/m/")) return html(matRedirectPage());
   if (path.startsWith("/media/foto/")) return await serveFoto(request, env, path, url);
+  if (path.startsWith("/media/archivo/")) return await serveArchivo(request, env, path, url);
   if (path === "/webhook/whatsapp") return await whatsappWebhook(request, env, url);
   // Cualquier otra ruta -> SPA interna (en cliente decide: login / dashboard / portal según rol)
   return html(renderApp());
@@ -3076,6 +3193,11 @@ async function viewConfig(c){
   h+='<div class="g2"><div><label>Teléfono</label><input id="cfgTel" value="'+escAttr(cfg.telefono||'')+'"></div><div><label>WhatsApp (solo dígitos)</label><input id="cfgWa" value="'+escAttr(cfg.whatsapp||'')+'"></div></div>';
   h+='<label>Correo</label><input id="cfgEmail" value="'+escAttr(cfg.email||'')+'">';
   h+='<div style="height:.7rem"></div><button class="btn" onclick="guardarConfigEmpresa()">Guardar datos</button></div>';
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Logo de la empresa</h3>';
+  h+='<p class="muted" style="font-size:.82rem;margin-bottom:.6rem">Se imprime en la esquina superior izquierda de la cotización en PDF. PNG o JPG, máximo 300 KB (ideal: PNG con fondo transparente, 1200 px de ancho).</p>';
+  h+='<div id="cfgLogoPrev" style="margin-bottom:.7rem">'+logoPreviewHtml(cfg.logo_data)+'</div>';
+  h+='<input id="cfgLogoFile" type="file" accept="image/png,image/jpeg" style="max-width:380px">';
+  h+='<div style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap"><button class="btn" onclick="subirLogoCfg()">Guardar logo</button>'+(cfg.logo_data?'<button class="btn sec" onclick="quitarLogoCfg()">Quitar logo</button>':'')+'</div></div>';
   h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Parámetros</h3>';
   h+='<div style="max-width:240px"><label>IVA por defecto (%)</label><input id="cfgIva" type="number" step="0.01" value="'+(cfg.iva!=null?cfg.iva:16)+'"></div>';
   h+='<p class="muted" style="font-size:.8rem;margin-top:.4rem">Se aplica al crear una nueva cotización.</p>';
@@ -3091,6 +3213,30 @@ async function viewConfig(c){
 async function guardarConfigEmpresa(){
   var d=await api('/api/config',{method:'PUT',body:JSON.stringify({nombre:val('cfgNombre'),rfc:val('cfgRfc'),direccion:val('cfgDir'),telefono:val('cfgTel'),whatsapp:val('cfgWa'),email:val('cfgEmail')})});
   if(d&&d.ok){CFG=d.data;toast('Datos guardados');}else if(d){toast(d.error||'No se pudo guardar');}
+}
+function logoPreviewHtml(data){
+  if(!data)return '<p class="muted" style="font-size:.82rem">Sin logo cargado. Mientras tanto la cotización imprime el nombre ASLAN en dorado.</p>';
+  return '<div style="background:#fff;padding:.8rem;border-radius:6px;display:inline-block"><img src="'+data+'" alt="Logo" style="max-width:260px;max-height:110px;display:block"></div>';
+}
+function leerArchivoDataURL(file){
+  return new Promise(function(res,rej){var fr=new FileReader();fr.onload=function(){res(fr.result);};fr.onerror=function(){rej(new Error('lectura'));};fr.readAsDataURL(file);});
+}
+async function subirLogoCfg(){
+  var inp=document.getElementById('cfgLogoFile');
+  if(!inp||!inp.files||!inp.files.length){toast('Elige primero el archivo del logo');return;}
+  var f=inp.files[0];
+  if(f.type!=='image/png'&&f.type!=='image/jpeg'){toast('El logo debe ser PNG o JPG');return;}
+  if(f.size>300*1024){toast('El logo supera 300 KB, usa una imagen más ligera');return;}
+  var data;try{data=await leerArchivoDataURL(f);}catch(e){toast('No se pudo leer el archivo');return;}
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({logo_data:data})});
+  if(d&&d.ok){CFG=d.data;toast('Logo guardado, ya sale en las cotizaciones');var pv=document.getElementById('cfgLogoPrev');if(pv)pv.innerHTML=logoPreviewHtml(CFG.logo_data);}
+  else if(d){toast(d.error||'No se pudo guardar el logo');}
+}
+async function quitarLogoCfg(){
+  if(!confirm('Quitar el logo de las cotizaciones?'))return;
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({logo_data:''})});
+  if(d&&d.ok){CFG=d.data;toast('Logo eliminado');var pv=document.getElementById('cfgLogoPrev');if(pv)pv.innerHTML=logoPreviewHtml('');}
+  else if(d){toast(d.error||'No se pudo quitar');}
 }
 async function guardarConfigIva(){
   var d=await api('/api/config',{method:'PUT',body:JSON.stringify({iva:val('cfgIva')})});
@@ -3978,6 +4124,7 @@ function nuevoCliente(){
     '<div class="g2"><div><label>Tipo</label><input id="ncTipo" placeholder="Ejemplo: Santo Tomás"></div><div><label>Formato</label><input id="ncForm" placeholder="Ejemplo: Plancha 3.20 x 1.80"></div></div>'+
     '<label>Cantidad</label><input id="ncCant" placeholder="Ejemplo: 30 m2 / 2 planchas">'+
     '<label>Propuesta s/IVA (opcional)</label><input id="ncProp" type="number" placeholder="0.00">'+
+    '<label>Notas admin</label><textarea id="ncNotasAdm" rows="3" placeholder="Pega aquí lo que te comentó el prospecto: otras opciones, formatos, referencias... Lo verá el asesor en la ficha."></textarea>'+
     '<div style="display:flex;gap:.5rem;margin-top:1rem"><button class="btn" onclick="guardarNuevoCliente()">Crear registro</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
   setTimeout(function(){var n=document.getElementById('ncNom');if(n)n.focus();ncSyncAcab();},80);
 }
@@ -4005,6 +4152,7 @@ function guardarNuevoCliente(){
   var fmt=val('ncForm');if(fmt)body.formato=fmt;
   var cant=val('ncCant');if(cant)body.cantidad=cant;
   var prop=val('ncProp');if(prop!=='')body.propuesta_antes_iva=parseFloat(prop);
+  var nadm=val('ncNotasAdm');if(nadm)body.notas_vero=nadm;
   crearCliente(body, false);
 }
 async function crearCliente(body, force){
@@ -4410,6 +4558,13 @@ function renderFicha(){
       h+='<tr><td>'+(q.folio||'—')+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
     h+='</tbody></table></div>'; }
   h+='</div>';
+  h+='<div class="fsec"><h3>Archivos y documentos</h3>'+
+     '<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Comprobantes de pago, fotos del cliente, material que se le compartió, contratos. Máximo 10 MB por archivo.</p>'+
+     '<div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.7rem">'+
+     '<div style="flex:1;min-width:200px"><label>Categoría</label><select id="faCat"><option>Comprobante de pago</option><option>Foto del cliente</option><option>Material compartido</option><option>Cotizacion</option><option>Contrato</option><option>Otro</option></select></div>'+
+     '<div style="flex:2;min-width:220px"><label>Archivo(s)</label><input id="faFile" type="file" multiple></div>'+
+     '<div><button class="btn" onclick="subirArchivoFicha()">Subir</button></div></div>'+
+     '<div id="faLista"><p class="muted" style="font-size:.83rem">Cargando archivos…</p></div></div>';
   var prys=FICHA.proyectos||[];
   h+='<div class="fsec"><h3>Proyectos y compras</h3>';
   if(!prys.length){ h+='<p class="muted" style="font-size:.83rem">Sin proyectos registrados.</p>'; }
@@ -4427,6 +4582,43 @@ function renderFicha(){
     h+='</tbody></table></div>'; }
   h+='</div>';
   content.innerHTML=h;
+  cargarArchivosFicha();
+}
+function fmtTam(n){n=Number(n||0);if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';return (n/1048576).toFixed(1)+' MB';}
+async function cargarArchivosFicha(){
+  var box=document.getElementById('faLista');if(!box||!FICHA||!FICHA.id)return;
+  var d=await api('/api/clientes/'+FICHA.id+'/archivos');
+  if(!d||!d.ok){box.innerHTML='<p class="muted" style="font-size:.83rem">'+((d&&d.error)||'No se pudieron cargar los archivos.')+'</p>';return;}
+  var lista=d.data||[];FICHA.archivos=lista;
+  if(!lista.length){box.innerHTML='<p class="muted" style="font-size:.83rem">Sin archivos todavía.</p>';return;}
+  var puedeTodo=(USER.rol==='admin'||USER.rol==='gerente');
+  var h='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Archivo</th><th>Categoría</th><th>Tamaño</th><th>Subió</th><th>Fecha</th><th></th></tr></thead><tbody>';
+  lista.forEach(function(a){
+    var mio=String(a.usuario_id)===String(USER.id);
+    h+='<tr><td><a href="'+a.url+'" target="_blank" rel="noopener" style="color:var(--gold)">'+escT(a.nombre)+'</a></td><td>'+escT(a.categoria||'—')+'</td><td style="white-space:nowrap">'+fmtTam(a.tamano)+'</td><td>'+escT(a.usuario||'—')+'</td><td style="white-space:nowrap">'+fmtFechaHora(a.created_at)+'</td>'+
+       '<td style="white-space:nowrap"><a class="btn sec" style="padding:.3rem .6rem;text-decoration:none" href="'+a.url+'" target="_blank" rel="noopener">Abrir</a>'+((puedeTodo||mio)?(' <button class="btn sec" style="padding:.3rem .6rem" onclick="borrarArchivoFicha('+a.id+')">Eliminar</button>'):'')+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  box.innerHTML=h;
+}
+async function subirArchivoFicha(){
+  var inp=document.getElementById('faFile');var cat=val('faCat')||'Otro';
+  if(!inp||!inp.files||!inp.files.length){toast('Elige primero uno o más archivos');return;}
+  var files=Array.prototype.slice.call(inp.files);var okN=0;
+  for(var i=0;i<files.length;i++){
+    var f=files[i];
+    if(f.size>10*1024*1024){toast(f.name+': supera 10 MB, se omite');continue;}
+    var data;try{data=await leerArchivoDataURL(f);}catch(e){toast(f.name+': no se pudo leer');continue;}
+    var d=await api('/api/clientes/'+FICHA.id+'/archivos',{method:'POST',body:JSON.stringify({nombre:f.name,categoria:cat,contentType:f.type||'application/octet-stream',data:data})});
+    if(d&&d.ok)okN++;else if(d)toast(f.name+': '+(d.error||'error'));
+  }
+  if(okN){toast(okN===1?'Archivo guardado':okN+' archivos guardados');inp.value='';}
+  cargarArchivosFicha();
+}
+async function borrarArchivoFicha(id){
+  if(!confirm('Eliminar este archivo de la ficha?'))return;
+  var d=await api('/api/clientes/'+FICHA.id+'/archivos/'+id,{method:'DELETE'});
+  if(d&&d.ok){toast('Archivo eliminado');cargarArchivosFicha();}else if(d){toast(d.error||'No se pudo eliminar');}
 }
 
 var INV_PROD=[];
@@ -4954,14 +5146,27 @@ async function pdfCotizacion(id){
   var c=d.data;var gold=[139,109,63];var gris=[90,90,90];
   var doc=new window.jspdf.jsPDF();
   var L=14,R=196,W=R-L;
-  // ----- Encabezado: marca ASLAN + datos de la empresa -----
-  doc.setFont('times','bold');doc.setFontSize(28);doc.setTextColor(gold[0],gold[1],gold[2]);
-  doc.text((CFG&&CFG.nombre?CFG.nombre:${JSON.stringify(EMPRESA.nombre)}),L,22,{charSpace:2.5});
+  // ----- Encabezado: logo (si esta cargado en Configuracion) o marca ASLAN + datos de la empresa -----
+  var yTxt=30;
+  var logoOk=false;
+  if(CFG&&CFG.logo_data){
+    try{
+      var lp=doc.getImageProperties(CFG.logo_data);
+      var lw=60,lh=lw*lp.height/lp.width;
+      if(lh>22){lh=22;lw=lh*lp.width/lp.height;}
+      doc.addImage(CFG.logo_data,(lp.fileType||'PNG'),L,9,lw,lh);
+      yTxt=9+lh+6;logoOk=true;
+    }catch(e){logoOk=false;}
+  }
+  if(!logoOk){
+    doc.setFont('times','bold');doc.setFontSize(28);doc.setTextColor(gold[0],gold[1],gold[2]);
+    doc.text((CFG&&CFG.nombre?CFG.nombre:${JSON.stringify(EMPRESA.nombre)}),L,22,{charSpace:2.5});
+  }
   doc.setFont('helvetica','normal');
   doc.setFontSize(8.5);doc.setTextColor(gris[0],gris[1],gris[2]);
   var dir=doc.splitTextToSize((CFG&&CFG.direccion?CFG.direccion:${JSON.stringify(EMPRESA.direccion)}),96);
-  doc.text(dir,L,30);
-  var yd=30+dir.length*4;
+  doc.text(dir,L,yTxt);
+  var yd=yTxt+dir.length*4;
   doc.text('Tel. '+(CFG&&CFG.telefono?CFG.telefono:${JSON.stringify(EMPRESA.telefono)}),L,yd);
   doc.text((CFG&&CFG.email?CFG.email:${JSON.stringify(EMPRESA.email)}),L,yd+4.5);
   // Folio / Fecha / Vigencia / Asesor (derecha)
@@ -4971,7 +5176,14 @@ async function pdfCotizacion(id){
   doc.text('Folio: '+(c.folio||''),R,26,{align:'right'});
   doc.text('Fecha: '+hoy.toLocaleDateString('es-MX').split('/').join('-'),R,31,{align:'right'});
   doc.text('Vigencia: '+vig.toLocaleDateString('es-MX').split('/').join('-'),R,36,{align:'right'});
-  if(c.vendedor){doc.text('Asesor: '+c.vendedor,R,41,{align:'right'});}
+  // Atiende: el asesor que genero la cotizacion (nombre, telefono y correo de su usuario)
+  if(c.vendedor){
+    doc.setFont(undefined,'bold');doc.text('Atiende: '+c.vendedor,R,41,{align:'right'});doc.setFont(undefined,'normal');
+    doc.setFontSize(8.2);
+    if(c.vendedor_telefono){doc.text('Tel. '+c.vendedor_telefono,R,45.5,{align:'right'});}
+    if(c.vendedor_email){doc.text(String(c.vendedor_email),R,(c.vendedor_telefono?49.5:45.5),{align:'right'});}
+    doc.setFontSize(9);
+  }
   doc.setDrawColor(gold[0],gold[1],gold[2]);doc.setLineWidth(0.5);doc.line(L,55,R,55);
   // ----- Datos de Facturación / Datos de Entrega -----
   var yc=62;var midX=110;
