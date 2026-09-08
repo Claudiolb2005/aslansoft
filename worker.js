@@ -548,6 +548,18 @@ async function migrarV8(env) {
   MIGRADO_V8 = true;
 }
 
+let MIGRADO_V9 = false;
+async function migrarV9(env) {
+  if (MIGRADO_V9) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v9_fiscal'").first();
+    if (f && f.valor === "ok") { MIGRADO_V9 = true; return; }
+  } catch (e) { return; }
+  try { await env.DB.prepare("ALTER TABLE clientes ADD COLUMN razon_social TEXT").run(); } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v9_fiscal','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V9 = true;
+}
+
 let MIGRADO_V7 = false;
 async function migrarV7(env) {
   if (MIGRADO_V7) return;
@@ -933,7 +945,7 @@ async function handleClientes(request, env, payload, method, id) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "cantidad", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "tipo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
+    const campos = ["nombre", "empresa", "tipo", "etapa", "telefono", "email", "ciudad", "direccion", "rfc", "razon_social", "notas", "empleado_asignado_id", "fecha_lead", "origen", "validacion", "estatus_final", "asesor", "estatus_nota", "fecha_contacto", "propuesta_factura", "notas_vero", "notas_actualizacion", "notas_seguimiento", "material", "acabado", "formato", "cantidad", "propuesta_inicial", "propuesta_antes_iva", "moneda", "facturado", "telefono_alt", "sitio_web", "industria", "tipo_origen_lead", "proximo_seguimiento", "tipo_seguimiento", "condiciones_pago", "linea_credito", "saldo_actual", "riesgo_credito", "probabilidad_cierre", "fecha_cierre_estimada", "proxima_accion", "cumpleanos", "referido_por"];
     const sets = [], vals = [];
     for (const c of campos) if (c in b) { sets.push(c + "=?"); vals.push(b[c]); }
     for (const c of Object.keys(b)) if (RX_COL.test(c) && !campos.includes(c)) { sets.push(c + "=?"); vals.push(b[c]); }
@@ -1104,7 +1116,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "GET" && id) {
     const c = await env.DB.prepare(
-      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono, cl.asesor AS _asesor, u.nombre AS vendedor, u.email AS vendedor_email, u.telefono AS vendedor_telefono FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id LEFT JOIN usuarios u ON u.id=c.usuario_id WHERE c.id=? AND c.deleted_at IS NULL"
+      "SELECT c.*, cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.rfc AS cliente_rfc, cl.razon_social AS cliente_razon, cl.direccion AS cliente_direccion, cl.telefono AS cliente_telefono, cl.asesor AS _asesor, u.nombre AS vendedor, u.email AS vendedor_email, u.telefono AS vendedor_telefono FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id LEFT JOIN usuarios u ON u.id=c.usuario_id WHERE c.id=? AND c.deleted_at IS NULL"
     ).bind(id).first();
     if (!c) return fail("Cotización no encontrada.", 404);
     const _scv = asesorScope(payload);
@@ -2396,6 +2408,7 @@ async function handleRequest(request, env) {
   await migrarV6(env);
   await migrarV7(env);
   await migrarV8(env);
+  await migrarV9(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -3618,6 +3631,27 @@ function setVistaCRM(v){
   renderCRM();
 }
 function valFil(id){var e=document.getElementById(id);return e?(''+e.value):'';}
+var CRM_MESES_NOM=['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+// Al elegir un mes sin año, el filtro mezclaba septiembre de todos los años.
+// Ahora se ancla al año en curso y el año se puede abrir a mano si se quiere el historico.
+function crmMesCambio(){
+  var m=document.getElementById('fMes'),a=document.getElementById('fAnio');
+  if(m&&a&&m.value&&!a.value){
+    var y=String(new Date().getFullYear()),i;
+    for(i=0;i<a.options.length;i++){
+      if(a.options[i].value===y||a.options[i].text===y){a.selectedIndex=i;toast('Filtrando '+y+'. Cambia el año si necesitas otro.');break;}
+    }
+  }
+  renderCRM();
+}
+function crmPeriodoTxt(){
+  var a=valFil('fAnio'),m=valFil('fMes');
+  if(!a&&!m)return '';
+  var nm=m?CRM_MESES_NOM[parseInt(m,10)-1]:'';
+  if(a&&m)return nm+' '+a;
+  if(m)return nm+' de todos los años';
+  return 'año '+a;
+}
 function filasCRMFiltradas(){
   var q=valFil('crmq').toLowerCase().trim();
   var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact'),ef=valFil('fEFin');
@@ -3839,10 +3873,33 @@ async function colEliminar(i){
   gestionColumnasCRM();
   toast('Columna eliminada');
 }
+function puedeBorrarCRM(){return typeof USER!=='undefined'&&USER&&(USER.rol==='admin'||USER.rol==='gerente');}
 function crmAccBtns(r){
   return '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> '+
     '<button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> '+
-    '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button>';
+    '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="cotizarCliente('+r.id+')" title="Crear cotización para este cliente">+ Cotizar</button>'+
+    (puedeBorrarCRM()?(' <button class="btn" style="padding:.25rem .5rem;font-size:.72rem;background:#7a1f1f;border-color:#7a1f1f;color:#fff" onclick="eliminarLead('+r.id+')" title="Eliminar este registro del CRM">Eliminar</button>'):'');
+}
+function nombreLead(id){
+  for(var i=0;i<CRM_ROWS.length;i++)if(String(CRM_ROWS[i].id)===String(id))return CRM_ROWS[i].nombre||'';
+  return '';
+}
+function eliminarLead(id){
+  if(!puedeBorrarCRM()){toast('Solo administración o gerencia puede eliminar registros');return;}
+  var nom=nombreLead(id);
+  confirmModal('¿Eliminar el registro '+escT(nom)+'? Sale del CRM, de los reportes y del pipeline. Queda guardado en la base por si hay que recuperarlo.','Sí, eliminar',function(){_eliminarLead(id);});
+}
+async function _eliminarLead(id){
+  var d=await api('/api/clientes/'+id,{method:'DELETE'});
+  if(!d)return;
+  if(d.ok){
+    var q=[];
+    for(var i=0;i<CRM_ROWS.length;i++)if(String(CRM_ROWS[i].id)!==String(id))q.push(CRM_ROWS[i]);
+    CRM_ROWS=q;
+    if(typeof closeModal==='function')closeModal();
+    toast('Registro eliminado');
+    renderCRM();
+  }else{toast(d.error||'No se pudo eliminar');}
 }
 function crmCeldas(r,ord,ult){
   var h='';
@@ -4035,7 +4092,8 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
-var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA'];
+var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA','INSUMOS'];
+var CAT_SERVICIOS=[['FLETE','pza'],['MANIOBRA','pza'],['INSTALACIÓN','m2']];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
 var CAT_ORIGEN=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
 var CAT_GESTION=['COTIZACIÓN','NEGOCIACIÓN','GANADO','PERDIDO'];
@@ -4187,7 +4245,7 @@ async function verDuplicados(){
     h+='<p class="muted" style="font-size:.84rem;margin-bottom:.7rem">'+grupos.length+' grupo(s). Abre cada ficha para revisar y consolidar.</p>';
     grupos.forEach(function(g){
       h+='<div class="card" style="margin-bottom:.6rem;padding:.6rem .8rem"><div class="muted" style="font-size:.74rem;margin-bottom:.3rem">'+escAttr(g.tipo)+': '+escAttr(g.clave)+'</div>';
-      (g.miembros||[]).forEach(function(x){ h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.25rem 0;border-top:1px solid var(--bd)"><div><strong>'+escAttr(x.nombre||'—')+'</strong>'+(x.empresa?(' · '+escAttr(x.empresa)):'')+(x.asesor?('<span class="muted" style="font-size:.74rem"> · '+escAttr(x.asesor)+'</span>'):'')+'</div><button class="btn sec" style="padding:.25rem .55rem" onclick="abrirFicha('+x.id+')">Abrir</button></div>'; });
+      (g.miembros||[]).forEach(function(x){ h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.25rem 0;border-top:1px solid var(--bd)"><div><strong>'+escAttr(x.nombre||'—')+'</strong>'+(x.empresa?(' · '+escAttr(x.empresa)):'')+(x.asesor?('<span class="muted" style="font-size:.74rem"> · '+escAttr(x.asesor)+'</span>'):'')+'</div><div style="display:flex;gap:.35rem"><button class="btn sec" style="padding:.25rem .55rem" onclick="abrirFicha('+x.id+')">Abrir</button>'+(puedeBorrarCRM()?('<button class="btn" style="padding:.25rem .55rem;background:#7a1f1f;border-color:#7a1f1f;color:#fff" onclick="eliminarLead('+x.id+')">Eliminar</button>'):'')+'</div></div>'; });
       h+='</div>';
     });
   }
@@ -4212,7 +4270,7 @@ function pintarFiltros(){
     '<select id="fEstatus" onchange="renderCRM()">'+eopts+'</select>'+
     '<select id="fEFin" onchange="renderCRM()">'+efopts+'</select>'+
     '<select id="fAnio" onchange="renderCRM()">'+yopts+'</select>'+
-    '<select id="fMes" onchange="renderCRM()">'+mopts+'</select>'+
+    '<select id="fMes" onchange="crmMesCambio()">'+mopts+'</select>'+
     '<select id="fFact" onchange="renderCRM()"><option value="">Facturación: todas</option><option value="con">Con factura</option><option value="sin">Sin factura</option></select>'+
     '<input id="fMin" type="number" placeholder="Monto min" oninput="renderCRM()">'+
     '<input id="fMax" type="number" placeholder="Monto max" oninput="renderCRM()">'+
@@ -4231,7 +4289,8 @@ function pintarResumen(rows){
   var n=rows.length,sumP=0,sumF=0,conF=0;
   rows.forEach(function(r){if(r.propuesta_antes_iva!=null)sumP+=Number(r.propuesta_antes_iva)||0;var f=Number(r.facturado)||0;sumF+=f;if(f>0)conF++;});
   var compacto=n+' reg \u00b7 Prop '+money(sumP)+' \u00b7 Fact '+money(sumF)+' \u00b7 C/fact '+conF;
-  var rh='<div class="colhd'+(CRM_KPI_OPEN?'':' closed')+'" onclick="togKpis()"><span class="chev">\u25be</span> Resumen'+(CRM_KPI_OPEN?'':' \u2014 '+compacto)+'</div>';
+  var per=crmPeriodoTxt();
+  var rh='<div class="colhd'+(CRM_KPI_OPEN?'':' closed')+'" onclick="togKpis()"><span class="chev">\u25be</span> Resumen'+(per?(' \u00b7 '+per):'')+(CRM_KPI_OPEN?'':' \u2014 '+compacto)+'</div>';
   if(CRM_KPI_OPEN)rh+='<div class="kpis crmkpis">'+kpiCard('Registros',n)+kpiCard('Propuesta s/IVA',money(sumP))+kpiCard('Facturado',money(sumF))+kpiCard('Con factura',conF)+'</div>';
   box.innerHTML=rh;
 }
@@ -4363,7 +4422,7 @@ function exportarCRMCSV(){
   filasCRMFiltradas().forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
   var csv='\\ufeff'+lines.join('\\r\\n');
   var blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
-  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='CRM_ASLAN.csv';document.body.appendChild(a);a.click();a.remove();
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='CRM_ASLAN'+(crmPeriodoTxt()?('_'+(valFil('fAnio')||'todos')+(valFil('fMes')?('-'+valFil('fMes')):'')):'')+'.csv';document.body.appendChild(a);a.click();a.remove();
 }
 async function verCotizacionesCliente(id){
   var row=CRM_ROWS.find(function(x){return String(x.id)===String(id);})||{};
@@ -4505,9 +4564,10 @@ function renderFicha(){
      fField('Sitio web','sitio_web',c.sitio_web)+
      fField('Ciudad','ciudad',c.ciudad)+
      fField('RFC','rfc',c.rfc)+
+     fField('Razón social','razon_social',c.razon_social)+
      fSel('Asesor','asesor',c.asesor,fCatAsesores())+
      fSel('Origen del lead','origen',c.origen,CAT_ORIGEN)+
-     fWide('Dirección','direccion',c.direccion)+'</div></div>';
+     fWide('Dirección fiscal','direccion',c.direccion)+'</div></div>';
   h+='<div class="fsec"><h3>Comercial y oportunidad</h3><div class="fgrid">'+
      fSel('Estatus','estatus_nota',c.estatus_nota,CRM_ESTATUS)+
      fSel('Estatus final','estatus_final',c.estatus_final,fCatFinales())+
@@ -5029,7 +5089,7 @@ async function formCotizacion(preselectId,ed){
   h+='<div class="card" style="margin-top:.5rem">';
   h+='<div class="muted" style="font-size:.85rem;margin-bottom:.6rem">Asesor: <strong style="color:var(--gold)">'+escAttr(asesorNom)+'</strong></div>';
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
-  h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
+  h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material / Servicios</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
   h+='<button class="btn sec" style="margin-top:.6rem" onclick="agregarFila()">+ Agregar línea</button>';
   h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="'+vDescG+'" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+vIva+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="'+vVig+'"></div></div>';
   h+='<div style="text-align:right;margin-top:1rem"><div>Subtotal: <strong id="cotSub">$0.00</strong></div><div>IVA: <strong id="cotIvaM">$0.00</strong></div><div style="font-size:1.3rem;color:var(--gold);margin-top:.3rem">TOTAL: <strong id="cotTotal">$0.00</strong></div></div>';
@@ -5069,6 +5129,9 @@ function agregarFila(){
   po+='<optgroup label="Familias de material">';
   CAT_MATERIAL.forEach(function(m){po+='<option value="fam" data-precio="0" data-unidad="m2" data-nombre="'+escAttr(m)+'">'+escAttr(m)+'</option>';});
   po+='</optgroup>';
+  po+='<optgroup label="Servicios">';
+  CAT_SERVICIOS.forEach(function(s){po+='<option value="fam" data-precio="0" data-unidad="'+s[1]+'" data-nombre="'+escAttr(s[0])+'">'+escAttr(s[0])+'</option>';});
+  po+='</optgroup>';
   if(COT_PROD.length){po+='<optgroup label="Inventario">';COT_PROD.forEach(function(p){po+='<option value="'+p.id+'" data-precio="'+(p.precio_venta||0)+'" data-unidad="'+(p.unidad||'m2')+'" data-nombre="'+escAttr(p.nombre)+'">'+escAttr(p.nombre)+'</option>';});po+='</optgroup>';}
   var tr=document.createElement('tr');tr.className='cotlin';
   tr.innerHTML='<td><select class="c-mat" onchange="autoProd(this)" style="min-width:150px">'+po+'</select></td>'+
@@ -5083,7 +5146,7 @@ function agregarFila(){
 }
 function autoProd(sel){
   var o=sel.options[sel.selectedIndex];var tr=sel.closest('tr');
-  if(o&&o.value==='fam'){var dscF=tr.querySelector('.c-desc');if(!dscF.value)dscF.value=o.getAttribute('data-nombre')||'';}
+  if(o&&o.value==='fam'){var dscF=tr.querySelector('.c-desc');if(!dscF.value)dscF.value=o.getAttribute('data-nombre')||'';setUnidad(tr.querySelector('.c-uni'),o.getAttribute('data-unidad')||'m2');}
   else if(o&&o.value){tr.querySelector('.c-pu').value=o.getAttribute('data-precio')||0;setUnidad(tr.querySelector('.c-uni'),o.getAttribute('data-unidad')||'m2');var dsc=tr.querySelector('.c-desc');if(!dsc.value)dsc.value=o.getAttribute('data-nombre')||'';}
   recalcCot();
 }
@@ -5193,8 +5256,8 @@ async function pdfCotizacion(id){
   function campo(et,va,x,y){doc.setTextColor(110);doc.text(et,x,y);doc.setTextColor(30);doc.text(va?String(va):'',x+doc.getTextWidth(et)+2,y);}
   var fy=yc+7;
   campo('Nombre del Cliente:',c.cliente||'',L,fy);
-  campo('Razón Social:',c.cliente_empresa||'',L,fy+5.5);
-  campo('Dirección:',c.cliente_direccion||'',L,fy+11);
+  campo('Razón Social:',c.cliente_razon||c.cliente_empresa||'',L,fy+5.5);
+  campo('Dirección fiscal:',c.cliente_direccion||'',L,fy+11);
   campo('RFC:',c.cliente_rfc||'',L,fy+16.5);
   campo('Dirección:',c.entrega_direccion||c.cliente_direccion||'',midX,fy);
   campo('Referencias:',c.entrega_referencias||'',midX,fy+5.5);
