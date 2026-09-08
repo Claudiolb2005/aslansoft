@@ -560,6 +560,22 @@ async function migrarV9(env) {
   MIGRADO_V9 = true;
 }
 
+let MIGRADO_V10 = false;
+async function migrarV10(env) {
+  if (MIGRADO_V10) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v10_pagos'").first();
+    if (f && f.valor === "ok") { MIGRADO_V10 = true; return; }
+  } catch (e) { return; }
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS cliente_pagos (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, fecha TEXT NOT NULL, monto REAL NOT NULL, tipo TEXT, metodo TEXT, referencia TEXT, notas TEXT, usuario_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, deleted_at DATETIME)").run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_cliente_pagos_cli ON cliente_pagos(cliente_id)").run();
+  } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE cotizaciones ADD COLUMN propuesta_final INTEGER DEFAULT 0").run(); } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v10_pagos','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V10 = true;
+}
+
 let MIGRADO_V7 = false;
 async function migrarV7(env) {
   if (MIGRADO_V7) return;
@@ -986,7 +1002,7 @@ async function fichaCliente(env, id, payload) {
   try { notas = await env.DB.prepare("SELECT n.*, u.nombre AS usuario FROM notas_crm n LEFT JOIN usuarios u ON u.id=n.usuario_id WHERE n.cliente_id=? ORDER BY n.created_at DESC, n.id DESC").bind(id).all(); } catch (e) {}
 
   const cotis = await env.DB.prepare(
-    "SELECT c.id, c.folio, c.estado, c.total, c.created_at, u.nombre AS vendedor," +
+    "SELECT c.id, c.folio, c.estado, c.subtotal, c.total, c.propuesta_final, c.created_at, u.nombre AS vendedor," +
     " (SELECT p.folio FROM proyectos p WHERE p.cotizacion_id=c.id AND p.deleted_at IS NULL LIMIT 1) AS proyecto_folio" +
     " FROM cotizaciones c LEFT JOIN usuarios u ON u.id=c.usuario_id" +
     " WHERE c.cliente_id=? AND c.deleted_at IS NULL ORDER BY c.created_at DESC, c.id DESC"
@@ -1021,6 +1037,9 @@ async function fichaCliente(env, id, payload) {
     catFin = rf.map((x) => x.v).filter((x) => x.length <= 25);
   } catch (e) {}
 
+  let cobranza = { pagos: [], total_pagado: 0, base: 0, base_origen: "sin_base", saldo: 0, moneda: "MXN" };
+  try { cobranza = await pagosResumen(env, id); } catch (e) {}
+
   const rc = cotis.results || [];
   const totalCotizado = rc.reduce((s, q) => s + (Number(q.total) || 0), 0);
   const totalAceptado = rc.filter((q) => q.estado === "aceptada").reduce((s, q) => s + (Number(q.total) || 0), 0);
@@ -1029,6 +1048,8 @@ async function fichaCliente(env, id, payload) {
   return ok({
     cliente: c,
     catalogos: { asesores: catAses, finales: catFin },
+    pagos: cobranza.pagos,
+    cobranza: cobranza,
     contactos: contactos.results || [],
     notas: notas.results || [],
     cotizaciones: rc,
@@ -1039,7 +1060,8 @@ async function fichaCliente(env, id, payload) {
       total_cotizado: +totalCotizado.toFixed(2),
       total_aceptado: +totalAceptado.toFixed(2),
       facturado: Number(c.facturado) || 0,
-      saldo: Number(c.saldo_actual) || 0,
+      total_pagado: cobranza.total_pagado,
+      saldo: cobranza.pagos.length ? cobranza.saldo : (Number(c.saldo_actual) || 0),
       m2_cortados: +m2.toFixed(2)
     }
   });
@@ -1157,6 +1179,13 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     if (!cot) return fail("Cotización no encontrada.", 404);
     const _scp = asesorScope(payload);
     if (_scp) { const _ap = (cot._asesor || "").trim().toUpperCase(); if (_ap !== _scp.first && _ap !== _scp.full) return fail("Sin acceso a esta cotización.", 403); }
+    // Marcar / desmarcar la cotizacion como parte de la propuesta final
+    if ("propuesta_final" in b && Object.keys(b).length === 1) {
+      const pf = (b.propuesta_final === 1 || b.propuesta_final === true || b.propuesta_final === "1") ? 1 : 0;
+      await env.DB.prepare("UPDATE cotizaciones SET propuesta_final=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(pf, id).run();
+      await audit(env, payload.sub, "propuesta_final", "cotizaciones", id, { propuesta_final: pf }, request);
+      return ok({ id, propuesta_final: pf });
+    }
     // Cambio de estado simple
     if (b.estado && Object.keys(b).length === 1) {
       const validos = ["borrador", "enviada", "aceptada", "rechazada", "expirada"];
@@ -2014,6 +2043,83 @@ async function borrarArchivoCliente(request, env, payload, clienteId, archivoId)
   await audit(env, payload.sub, "borrar_archivo", "cliente_archivos", archivoId, { cliente_id: clienteId }, request);
   return ok({ id: archivoId });
 }
+// ============================================================================
+//  PAGOS DEL CLIENTE - historico de abonos con fecha (el cliente paga en partes)
+// ============================================================================
+const PAGO_TIPOS = ["Anticipo", "Pago parcial", "Liquidacion", "Reembolso", "Ajuste"];
+const PAGO_METODOS = ["Transferencia", "Efectivo", "Cheque", "Tarjeta", "Deposito", "Otro"];
+// Monto de referencia contra el que se mide la cobranza: lo facturado y, si no
+// hay factura todavia, la propuesta comercial vigente.
+function baseCobranza(c) {
+  const fact = Number(c && c.facturado) || 0;
+  if (fact > 0) return { base: fact, origen: "facturado" };
+  const prop = Number(c && c.propuesta_antes_iva) || 0;
+  return { base: prop, origen: prop > 0 ? "propuesta" : "sin_base" };
+}
+async function pagosResumen(env, clienteId) {
+  const c = await env.DB.prepare("SELECT id, facturado, propuesta_antes_iva, saldo_actual, moneda FROM clientes WHERE id=?").bind(clienteId).first();
+  let pagos = [];
+  try {
+    const r = await env.DB.prepare("SELECT p.id,p.fecha,p.monto,p.tipo,p.metodo,p.referencia,p.notas,p.usuario_id,p.created_at,u.nombre AS usuario FROM cliente_pagos p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.cliente_id=? AND p.deleted_at IS NULL ORDER BY p.fecha DESC, p.id DESC").bind(clienteId).all();
+    pagos = r.results || [];
+  } catch (e) {}
+  const pagado = pagos.reduce((t, p) => t + (Number(p.monto) || 0), 0);
+  const bc = baseCobranza(c || {});
+  return {
+    pagos: pagos,
+    total_pagado: +pagado.toFixed(2),
+    base: +bc.base.toFixed(2),
+    base_origen: bc.origen,
+    saldo: +(bc.base - pagado).toFixed(2),
+    moneda: (c && c.moneda) || "MXN"
+  };
+}
+// Deja clientes.saldo_actual alineado con el historico de pagos.
+async function sincronizarSaldo(env, clienteId) {
+  const res = await pagosResumen(env, clienteId);
+  try { await env.DB.prepare("UPDATE clientes SET saldo_actual=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(res.saldo, clienteId).run(); } catch (e) {}
+  return res;
+}
+async function listarPagosCliente(env, payload, clienteId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  return ok(await pagosResumen(env, clienteId));
+}
+async function agregarPagoCliente(request, env, payload, clienteId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const b = await request.json().catch(() => ({}));
+  const monto = Number(b.monto);
+  if (!isFinite(monto) || monto === 0) return fail("Captura el monto del pago.");
+  const fecha = String(b.fecha || "").trim().slice(0, 10);
+  if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(fecha)) return fail("La fecha del pago no es valida.");
+  const tipo = PAGO_TIPOS.includes(b.tipo) ? b.tipo : "Pago parcial";
+  const metodo = PAGO_METODOS.includes(b.metodo) ? b.metodo : "Transferencia";
+  const referencia = String(b.referencia || "").trim().slice(0, 120) || null;
+  const notas = String(b.notas || "").trim().slice(0, 400) || null;
+  const res = await env.DB.prepare("INSERT INTO cliente_pagos (cliente_id,fecha,monto,tipo,metodo,referencia,notas,usuario_id) VALUES (?,?,?,?,?,?,?,?)")
+    .bind(clienteId, fecha, +monto.toFixed(2), tipo, metodo, referencia, notas, payload.sub).run();
+  const resumen = await sincronizarSaldo(env, clienteId);
+  await audit(env, payload.sub, "pago", "cliente_pagos", res.meta.last_row_id, { cliente_id: clienteId, fecha, monto, tipo, metodo }, request);
+  return ok({ id: res.meta.last_row_id, resumen });
+}
+async function borrarPagoCliente(request, env, payload, clienteId, pagoId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const p = await env.DB.prepare("SELECT id, usuario_id FROM cliente_pagos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(pagoId, clienteId).first();
+  if (!p) return fail("Pago no encontrado.", 404);
+  if (!hasRole(payload, "admin", "gerente") && String(p.usuario_id) !== String(payload.sub)) return fail("Solo quien registro el pago, gerencia o administracion pueden eliminarlo.", 403);
+  await env.DB.prepare("UPDATE cliente_pagos SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(pagoId).run();
+  const resumen = await sincronizarSaldo(env, clienteId);
+  await audit(env, payload.sub, "borrar_pago", "cliente_pagos", pagoId, { cliente_id: clienteId }, request);
+  return ok({ id: pagoId, resumen });
+}
+async function recalcularSaldoCliente(env, payload, clienteId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const resumen = await sincronizarSaldo(env, clienteId);
+  return ok({ resumen });
+}
 async function serveArchivo(request, env, path, url) {
   const m = /^\/media\/archivo\/(\d+)$/.exec(path);
   if (!m) return new Response("No encontrado", { status: 404 });
@@ -2172,11 +2278,30 @@ async function waEnviar(request, env, payload, id) {
 // ============================================================================
 //  CONFIGURACIÓN (datos de empresa, IVA por defecto) + REPORTES
 // ============================================================================
+const CAT_NOTA_DEF = ["SEGUIMIENTO", "SIN RESPUESTA", "PRECIO", "MATERIAL", "PROVEEDOR", "PRESUPUESTO", "EXISTENCIA", "TIEMPO DE ENTREGA", "VISITA", "CONTACTAR", "STAND BY", "OTRO"];
+const CAT_FINAL_DEF = ["NV", "PERDIDA", "GANADA", "DUPLICADA"];
+function parseCat(v) {
+  try { const a = JSON.parse(v || "null"); if (Array.isArray(a) && a.length) return a.map((x) => String(x)); } catch (e) {}
+  return null;
+}
 async function getConfig(env) {
   const r = await env.DB.prepare("SELECT clave,valor FROM app_config").all();
   const map = {};
   for (const row of (r.results || [])) map[row.clave] = row.valor;
+  // Asesores: se arman solos con los usuarios activos y con los que ya traen leads.
+  const catAsesores = [];
+  try {
+    const vis = {};
+    const ru = (await env.DB.prepare("SELECT DISTINCT TRIM(nombre) AS v FROM usuarios WHERE deleted_at IS NULL AND IFNULL(activo,1)=1 AND rol IN ('empleado','gerente') AND nombre IS NOT NULL AND TRIM(nombre)<>''").all()).results || [];
+    for (const x of ru) { const n = String(x.v).split(/\s+/)[0].toUpperCase().slice(0, 40); if (n && !vis[n]) { vis[n] = 1; catAsesores.push(n); } }
+    const rl = (await env.DB.prepare("SELECT DISTINCT UPPER(TRIM(asesor)) AS v FROM clientes WHERE deleted_at IS NULL AND asesor IS NOT NULL AND TRIM(asesor)<>''").all()).results || [];
+    for (const x of rl) { const n = String(x.v).slice(0, 40); if (n && !vis[n]) { vis[n] = 1; catAsesores.push(n); } }
+    catAsesores.sort();
+  } catch (e) {}
   return {
+    cat_estatus_nota: parseCat(map.cat_estatus_nota) || CAT_NOTA_DEF,
+    cat_estatus_final: parseCat(map.cat_estatus_final) || CAT_FINAL_DEF,
+    cat_asesores: catAsesores,
     nombre: map.nombre || EMPRESA.nombre || "ASLAN",
     direccion: map.direccion || EMPRESA.direccion || "",
     rfc: map.rfc || EMPRESA.rfc || "",
@@ -2250,6 +2375,23 @@ async function handleConfig(request, env, payload, method) {
     if (ld.length > 420000) return fail("El logo supera 300 KB. Usa una imagen más ligera.");
     await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES ('logo_data',?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(ld).run();
     delete b.logo_data;
+  }
+  // Listas de opciones del CRM (estatus y estatus final). Se guardan normalizadas.
+  for (const k of ["cat_estatus_nota", "cat_estatus_final"]) {
+    if (k in b) {
+      let arr = b[k];
+      if (typeof arr === "string") arr = arr.split(",");
+      if (!Array.isArray(arr)) return fail("La lista de opciones no es valida.");
+      const vis = {}, out = [];
+      for (const x of arr) {
+        const v = String(x == null ? "" : x).replace(/[<>"]/g, "").trim().toUpperCase().slice(0, 40);
+        if (v && !vis[v]) { vis[v] = 1; out.push(v); }
+      }
+      if (!out.length) return fail("La lista debe tener al menos una opcion.");
+      if (out.length > 40) return fail("Maximo 40 opciones por lista.");
+      await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(k, JSON.stringify(out)).run();
+      delete b[k];
+    }
   }
   const campos = ["nombre", "direccion", "rfc", "telefono", "whatsapp", "email", "iva", "crm_titulos", "crm_layout"];
   for (const k of campos) {
@@ -2409,6 +2551,7 @@ async function handleRequest(request, env) {
   await migrarV7(env);
   await migrarV8(env);
   await migrarV9(env);
+  await migrarV10(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2456,6 +2599,13 @@ async function handleRequest(request, env) {
     if (m && method === "POST") return await subirArchivoCliente(request, env, payload, m[1]);
     m = path.match(/^\/api\/clientes\/(\d+)\/archivos\/(\d+)$/);
     if (m && method === "DELETE") return await borrarArchivoCliente(request, env, payload, m[1], m[2]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/pagos$/);
+    if (m && method === "GET") return await listarPagosCliente(env, payload, m[1]);
+    if (m && method === "POST") return await agregarPagoCliente(request, env, payload, m[1]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/pagos\/recalcular$/);
+    if (m && method === "POST") return await recalcularSaldoCliente(env, payload, m[1]);
+    m = path.match(/^\/api\/clientes\/(\d+)\/pagos\/(\d+)$/);
+    if (m && method === "DELETE") return await borrarPagoCliente(request, env, payload, m[1], m[2]);
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
     if (m) return await handleClientes(request, env, payload, method, m[1]);
     m = path.match(/^\/api\/cotizaciones\/(\d+)\/convertir$/);
@@ -2690,6 +2840,10 @@ function renderApp() {
 .crmlink{color:var(--gold);font-weight:600;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
 .crmlink:hover{background:rgba(139,109,63,.16)}
 .crmwide{min-width:260px;max-width:360px;white-space:normal;font-size:.76rem;color:var(--txt2)}
+.crmcat{cursor:pointer}
+.crmcat:after{content:"\\25be";color:var(--txt2);font-size:.7em;margin-left:.35rem;opacity:.7}
+.crmcat.selopen:after{content:""}
+.crmcat select{width:100%;padding:.15rem .25rem;font-size:.78rem}
 .crmtable td.fx{position:sticky;z-index:3;background:var(--card)}
 .crmtable th.fx{position:sticky;z-index:6;background:var(--thead,#EDE6D6)}
 .crmtable th.fxend,.crmtable td.fxend{border-right:2px solid var(--gold)}
@@ -3220,6 +3374,12 @@ async function viewConfig(c){
   h+=estadoLinea('Almacenamiento de fotos (R2)',!!sis.fotos_r2);
   h+=estadoLinea('Token de verificación del webhook',!!sis.verify_token);
   h+='<p class="muted" style="font-size:.78rem;margin-top:.5rem">Lo «sin configurar» se activa definiendo las variables del Worker en Cloudflare (WA_TOKEN, WA_PHONE_ID, WA_VERIFY_TOKEN) y el binding R2 FILES.</p></div>';
+  h+='<div class="card" style="margin-bottom:1rem"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Listas del CRM</h3>';
+  h+='<p class="muted" style="font-size:.82rem;margin-bottom:.6rem">Son las opciones que el equipo puede elegir en el CRM. Ya no se escribe a mano: una opcion por renglon. El asesor se arma solo con los usuarios activos y con quienes ya traen leads.</p>';
+  h+='<div class="g2"><div><label>Estatus / nota</label><textarea id="cfgCatNota" rows="12">'+escT(catTxt(cfg.cat_estatus_nota))+'</textarea></div>';
+  h+='<div><label>Estatus final</label><textarea id="cfgCatFinal" rows="12">'+escT(catTxt(cfg.cat_estatus_final))+'</textarea></div></div>';
+  h+='<p class="muted" style="font-size:.78rem;margin-top:.5rem">Asesores detectados: '+escT(((cfg.cat_asesores)||[]).join(', ')||'ninguno')+'.</p>';
+  h+='<div style="height:.6rem"></div><button class="btn" onclick="guardarCatalogosCRM()">Guardar listas</button></div>';
   h+=tarjetaPassword();
   c.innerHTML=h;
 }
@@ -3250,6 +3410,24 @@ async function quitarLogoCfg(){
   var d=await api('/api/config',{method:'PUT',body:JSON.stringify({logo_data:''})});
   if(d&&d.ok){CFG=d.data;toast('Logo eliminado');var pv=document.getElementById('cfgLogoPrev');if(pv)pv.innerHTML=logoPreviewHtml('');}
   else if(d){toast(d.error||'No se pudo quitar');}
+}
+function catTxt(v){
+  var NL=String.fromCharCode(10);
+  if(!v)return '';
+  if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){return String(v);}}
+  return (v&&typeof v.length==='number')?v.join(NL):'';
+}
+function catSplit(t){
+  var NL=String.fromCharCode(10),a=String(t||'').split(NL),o=[],i,j,p,v;
+  for(i=0;i<a.length;i++){ p=a[i].split(','); for(j=0;j<p.length;j++){ v=p[j].trim(); if(v)o.push(v); } }
+  return o;
+}
+async function guardarCatalogosCRM(){
+  var n=catSplit(val('cfgCatNota')),f=catSplit(val('cfgCatFinal'));
+  if(!n.length||!f.length){ toast('Cada lista necesita al menos una opcion'); return; }
+  var d=await api('/api/config',{method:'PUT',body:JSON.stringify({cat_estatus_nota:n,cat_estatus_final:f})});
+  if(d&&d.ok){ CFG=d.data; toast('Listas guardadas'); viewConfig(document.getElementById('content')); }
+  else if(d){ toast(d.error||'No se pudieron guardar las listas'); }
 }
 async function guardarConfigIva(){
   var d=await api('/api/config',{method:'PUT',body:JSON.stringify({iva:val('cfgIva')})});
@@ -3506,6 +3684,61 @@ function crmCellNombre(r,ex){
   return '<td tabindex="-1" class="crmc crmlink'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="nombre" data-num="0" data-noed="1" title="Clic para abrir la ficha del lead. Clic derecho para el cardex." oncontextmenu="return cardexLead(event,'+r.id+')" onclick="abrirFicha('+r.id+')">'+escAttr(r.nombre==null?'':String(r.nombre))+'</td>';
 }
 function celdaBloqueada(td){return !!(td&&td.dataset&&td.dataset.noed==='1');}
+// ---- Campos que NO se escriben a mano: solo se eligen de una lista ----
+var CRM_CAT={estatus_final:1,asesor:1,estatus_nota:1};
+var CAT_NOTA_DEF=['SEGUIMIENTO','SIN RESPUESTA','PRECIO','MATERIAL','PROVEEDOR','PRESUPUESTO','EXISTENCIA','TIEMPO DE ENTREGA','VISITA','CONTACTAR','STAND BY','OTRO'];
+var CAT_FINAL_DEF=['NV','PERDIDA','GANADA','DUPLICADA'];
+function catCFG(k){
+  var v=(CFG&&CFG[k])?CFG[k]:null;
+  if(!v)return null;
+  if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){return null;}}
+  return (v&&typeof v.length==='number'&&v.length)?v:null;
+}
+// Opciones validas de un campo. Siempre incluye el valor que ya trae el registro
+// para no perder lo capturado antes de que existieran las listas.
+function crmOpciones(campo,actual){
+  var base=[];
+  if(campo==='estatus_nota')base=catCFG('cat_estatus_nota')||CAT_NOTA_DEF;
+  else if(campo==='estatus_final')base=catCFG('cat_estatus_final')||CAT_FINAL_DEF;
+  else if(campo==='asesor')base=catCFG('cat_asesores')||[];
+  var seen={},out=[],i,x;
+  for(i=0;i<base.length;i++){x=String(base[i]==null?'':base[i]).trim();if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;out.push(x);}}
+  if(campo==='asesor'&&!out.length){
+    (typeof CRM_ROWS!=='undefined'?(CRM_ROWS||[]):[]).forEach(function(r){
+      var a=String(r.asesor==null?'':r.asesor).trim();
+      if(a&&a.length<=40&&!seen[a.toUpperCase()]){seen[a.toUpperCase()]=1;out.push(a);}
+    });
+    out.sort();
+  }
+  var v=String(actual==null?'':actual).trim();
+  if(v&&!seen[v.toUpperCase()]){out.push(v);seen[v.toUpperCase()]=1;}
+  return out;
+}
+function crmCellSel(r,campo,val,ex){
+  return '<td tabindex="-1" class="crmc crmcat'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" data-cat="1" title="Doble clic para elegir de la lista" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
+}
+function crmSelStart(td){
+  if(!td||td._sel)return;
+  var campo=td.dataset.campo,actual=(td.textContent||'').trim();
+  var ops=crmOpciones(campo,actual),i;
+  var h='<select><option value="">(sin dato)</option>';
+  for(i=0;i<ops.length;i++)h+='<option'+(ops[i].toUpperCase()===actual.toUpperCase()?' selected':'')+'>'+escT(ops[i])+'</option>';
+  td._orig=actual;td._sel=1;td.classList.add('selopen');td.innerHTML=h+'</select>';
+  var sel=td.querySelector('select');
+  if(!sel){crmSelCerrar(td,actual);return;}
+  sel.onchange=function(){crmSelCerrar(td,sel.value);};
+  sel.onblur=function(){if(td._sel)crmSelCerrar(td,td._orig);};
+  sel.onkeydown=function(ev){if(ev.key==='Escape'){ev.preventDefault();crmSelCerrar(td,td._orig);}};
+  try{sel.focus();}catch(e){}
+}
+function crmSelCerrar(td,valor){
+  if(!td||!td._sel)return;
+  var previo=td._orig;
+  td._sel=0;td.classList.remove('selopen');
+  td.textContent=(valor==null?'':String(valor));
+  if(String(valor||'')!==String(previo||''))guardarCeldaCRM(td);
+  try{td.focus({preventScroll:true});}catch(e){}
+}
 function crmCellWide(r,campo,val,ex){
   return '<td tabindex="-1" class="crmc crmwide'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
 }
@@ -3910,6 +4143,8 @@ function crmCeldas(r,ord,ult){
       h+='<td class="crmact'+(ex?' '+ex:'')+'" style="white-space:nowrap;text-align:center">'+crmAccBtns(r)+'</td>';
     }else if(x.k==='nombre'){
       h+=crmCellNombre(r,ex);
+    }else if(CRM_CAT[x.k]){
+      h+=crmCellSel(r,x.k,r[x.k],ex);
     }else if(CRM_WIDE[x.k]){
       h+=crmCellWide(r,x.k,r[x.k],ex);
     }else if(CRM_NUM[x.k]){
@@ -3963,6 +4198,11 @@ function xlsSel(td){
 function xlsEditStart(td,ch){
   if(!td)return;
   if(celdaBloqueada(td)){toast('El nombre se edita en la ficha o en el cardex (clic derecho)');return;}
+  if(td.dataset&&td.dataset.cat==='1'){
+    if(XLS_CUR!==td){if(XLS_CUR)XLS_CUR.classList.remove('sel');XLS_CUR=td;td.classList.add('sel');}
+    crmSelStart(td);
+    return;
+  }
   if(XLS_CUR!==td){if(XLS_CUR)XLS_CUR.classList.remove('sel');XLS_CUR=td;td.classList.add('sel');}
   XLS_EDIT=true;XLS_ORIG=td.textContent;
   td.classList.add('edit');td.contentEditable='true';
@@ -4037,7 +4277,7 @@ function xlsKey(e){
 }
 function tcardCRM(r){
   var opts='<option value="">(Sin estatus)</option>';
-  CRM_ESTATUS.forEach(function(s){opts+='<option value="'+s+'"'+(((r.estatus_nota||'').trim().toUpperCase()===s)?' selected':'')+'>'+s+'</option>';});
+  crmOpciones('estatus_nota',r.estatus_nota).forEach(function(s){opts+='<option value="'+escAttr(s)+'"'+(((r.estatus_nota||'').trim().toUpperCase()===s.toUpperCase())?' selected':'')+'>'+escT(s)+'</option>';});
   var monto=(r.propuesta_antes_iva!=null)?money(r.propuesta_antes_iva):((r.facturado!=null)?money(r.facturado):'');
   var sub=(r.empresa||r.material||'');
   return '<div class="tcard">'+
@@ -4050,10 +4290,11 @@ function tcardCRM(r){
 }
 function pintarTableroCRM(rows){
   var c=document.getElementById('crmBody')||document.getElementById('content');
-  var cols=CRM_ESTATUS.concat(['(Sin estatus)']);
+  var cols=crmOpciones('estatus_nota','').concat(['(Sin estatus)']);
+  var colsU={};cols.forEach(function(k){colsU[k.toUpperCase()]=k;});
   var color={'SIN RESPUESTA':'var(--err)','SEGUIMIENTO':'var(--gold)','PRECIO':'#5B8DEF','MATERIAL':'var(--ok)','OTRO':'#9C7BD6','(Sin estatus)':'#888'};
   var grupos={};cols.forEach(function(k){grupos[k]=[];});
-  rows.forEach(function(r){var s=(r.estatus_nota||'').trim().toUpperCase();var key=(CRM_ESTATUS.indexOf(s)>=0)?s:'(Sin estatus)';grupos[key].push(r);});
+  rows.forEach(function(r){var s=(r.estatus_nota||'').trim().toUpperCase();var key=colsU[s]||'(Sin estatus)';grupos[key].push(r);});
   var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Tablero por estatus: cambia el estatus en el menú de cada tarjeta y el cliente se reacomoda en su columna. Desliza horizontalmente para ver todas las columnas. Registros: '+rows.length+'.</p>';
   var h=nota+'<div class="tablero">';
   cols.forEach(function(k){
@@ -4078,6 +4319,17 @@ async function guardarCeldaCRM(el){
   if(celdaBloqueada(el))return;
   var id=el.dataset.id, campo=el.dataset.campo, num=el.dataset.num==='1';
   var raw=el.textContent.trim();
+  if(CRM_CAT[campo]&&raw!==''){
+    var ops=crmOpciones(campo,''),valido=null,i;
+    for(i=0;i<ops.length;i++)if(ops[i].toUpperCase()===raw.toUpperCase())valido=ops[i];
+    if(!valido){
+      toast('Ese valor no esta en la lista. Elige una de las opciones.');
+      var orig=CRM_ROWS.find(function(x){return String(x.id)===String(id);});
+      el.textContent=(orig&&orig[campo]!=null)?String(orig[campo]):'';
+      return;
+    }
+    raw=valido;
+  }
   var body={};
   if(num){ body[campo]=(raw===''?null:(parseFloat(raw.replace(/[^0-9.-]/g,''))||0)); }
   else if(campo==='fecha_lead'||campo==='fecha_contacto'){ body[campo]=fFechaISO(raw); }
@@ -4555,6 +4807,7 @@ function renderFicha(){
      kpiCard('Total cotizado',money(R.total_cotizado))+
      kpiCard('Total aceptado',money(R.total_aceptado))+
      kpiCard('Facturado',money(R.facturado))+
+     kpiCard('Pagado',money(R.total_pagado))+
      kpiCard('Saldo pendiente',money(R.saldo))+
      kpiCard('m² cortados',(R.m2_cortados||0))+'</div>';
   h+='<div class="fsec"><h3>Datos de contacto</h3><div class="fgrid">'+
@@ -4565,12 +4818,12 @@ function renderFicha(){
      fField('Ciudad','ciudad',c.ciudad)+
      fField('RFC','rfc',c.rfc)+
      fField('Razón social','razon_social',c.razon_social)+
-     fSel('Asesor','asesor',c.asesor,fCatAsesores())+
+     fSel('Asesor','asesor',c.asesor,crmOpciones('asesor',c.asesor))+
      fSel('Origen del lead','origen',c.origen,CAT_ORIGEN)+
      fWide('Dirección fiscal','direccion',c.direccion)+'</div></div>';
   h+='<div class="fsec"><h3>Comercial y oportunidad</h3><div class="fgrid">'+
-     fSel('Estatus','estatus_nota',c.estatus_nota,CRM_ESTATUS)+
-     fSel('Estatus final','estatus_final',c.estatus_final,fCatFinales())+
+     fSel('Estatus','estatus_nota',c.estatus_nota,crmOpciones('estatus_nota',c.estatus_nota))+
+     fSel('Estatus final','estatus_final',c.estatus_final,crmOpciones('estatus_final',c.estatus_final))+
      fSel('Material de interés','material',c.material,CAT_MATERIAL)+
      fSel('Gestión comercial','probabilidad_cierre',c.probabilidad_cierre,CAT_GESTION)+
      fDate('Cierre estimado','fecha_cierre_estimada',c.fecha_cierre_estimada)+
@@ -4591,10 +4844,12 @@ function renderFicha(){
   h+='<div class="fsec"><h3>Financiero</h3><div class="fgrid">'+
      fField('Condiciones de pago','condiciones_pago',c.condiciones_pago)+
      fField('Línea de crédito','linea_credito',c.linea_credito,'num')+
-     fField('Saldo actual','saldo_actual',c.saldo_actual,'num')+
+     '<div class="ffield"><label>Saldo actual</label><span class="fnum" style="color:var(--gold)">'+(c.saldo_actual==null?'\u2014':money(c.saldo_actual))+'</span></div>'+
      fField('Riesgo de crédito','riesgo_credito',c.riesgo_credito)+
      fField('Facturado','facturado',c.facturado,'num')+
-     fField('Moneda','moneda',c.moneda)+'</div></div>';
+     fField('Moneda','moneda',c.moneda)+'</div>'+
+     '<p class="muted" style="font-size:.78rem;margin-top:.4rem">El saldo ya no se escribe a mano: sale de restarle a la base los pagos capturados abajo.</p></div>';
+  h+='<div class="fsec"><h3>Pagos del cliente</h3><div id="fPagosBox">'+fPagosHtml()+'</div></div>';
   h+='<div class="fsec"><h3>Datos personalizados</h3><div class="fgrid">'+
      fField('Cumpleaños','cumpleanos',c.cumpleanos)+
      fField('Referido por','referido_por',c.referido_por)+
@@ -4613,10 +4868,11 @@ function renderFicha(){
   var cots=FICHA.cotizaciones||[];
   h+='<div class="fsec"><h3>Cotizaciones y documentos</h3>';
   if(!cots.length){ h+='<p class="muted" style="font-size:.83rem">Sin cotizaciones ligadas a este cliente.</p>'; }
-  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Folio</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>PDF</th></tr></thead><tbody>';
+  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th title="Marca las cotizaciones que si forman la propuesta final">FINAL</th><th>Folio</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>PDF</th></tr></thead><tbody>';
     cots.forEach(function(q){ var proy=q.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+q.proyecto_folio+'</span>'):'—';
-      h+='<tr><td>'+(q.folio||'—')+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
+      h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(q.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+q.id+',this.checked)"></td><td>'+(q.folio||'—')+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
     h+='</tbody></table></div>'; }
+  h+='<div id="fCotFinal">'+cotFinalHtml()+'</div>';
   h+='</div>';
   h+='<div class="fsec"><h3>Archivos y documentos</h3>'+
      '<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Comprobantes de pago, fotos del cliente, material que se le compartió, contratos. Máximo 10 MB por archivo.</p>'+
@@ -4643,6 +4899,93 @@ function renderFicha(){
   h+='</div>';
   content.innerHTML=h;
   cargarArchivosFicha();
+}
+// ---- PAGOS DEL CLIENTE: historico con fecha (el cliente puede pagar en partes) ----
+var CAT_PAGO_TIPO=['Anticipo','Pago parcial','Liquidacion','Reembolso','Ajuste'];
+var CAT_PAGO_METODO=['Transferencia','Efectivo','Cheque','Tarjeta','Deposito','Otro'];
+function hoyISO(){var d=new Date();return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);}
+function fPagosHtml(){
+  var cb=(FICHA&&FICHA.cobranza)||{},pg=(FICHA&&FICHA.pagos)||[];
+  var base=Number(cb.base||0),pagado=Number(cb.total_pagado||0),saldo=Number(cb.saldo||0);
+  var org=(cb.base_origen==='facturado')?'Base tomada de lo facturado.':((cb.base_origen==='propuesta')?'Base tomada de la propuesta actual, porque todavia no hay factura.':'Aun no hay monto facturado ni propuesta para calcular la base.');
+  var h='<div class="kpis" style="margin:.1rem 0 .7rem">'+kpiCard('Base a cobrar',money(base))+kpiCard('Pagado',money(pagado))+kpiCard('Saldo',money(saldo))+'</div>';
+  h+='<p class="muted" style="font-size:.8rem;margin-bottom:.6rem">'+org+' Cada abono se captura con su fecha y el saldo se recalcula solo.</p>';
+  var to='',mo='',i;
+  for(i=0;i<CAT_PAGO_TIPO.length;i++)to+='<option>'+escT(CAT_PAGO_TIPO[i])+'</option>';
+  for(i=0;i<CAT_PAGO_METODO.length;i++)mo+='<option>'+escT(CAT_PAGO_METODO[i])+'</option>';
+  h+='<div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.8rem">'+
+     '<div style="min-width:150px"><label>Fecha del pago</label><input id="pgFecha" type="date" value="'+hoyISO()+'"></div>'+
+     '<div style="min-width:130px"><label>Monto</label><input id="pgMonto" type="number" step="0.01" placeholder="0.00"></div>'+
+     '<div style="min-width:150px"><label>Tipo</label><select id="pgTipo">'+to+'</select></div>'+
+     '<div style="min-width:150px"><label>Metodo</label><select id="pgMetodo">'+mo+'</select></div>'+
+     '<div style="min-width:160px"><label>Referencia</label><input id="pgRef" placeholder="Folio o transferencia"></div>'+
+     '<div style="flex:1;min-width:180px"><label>Nota</label><input id="pgNota" placeholder="Observaciones"></div>'+
+     '<div><button class="btn" onclick="agregarPagoFicha()">Registrar pago</button></div></div>';
+  if(!pg.length){ h+='<p class="muted" style="font-size:.83rem">Sin pagos registrados todavia.</p>'; }
+  else{
+    var puedeTodo=(USER.rol==='admin'||USER.rol==='gerente'),acum=0;
+    h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Fecha</th><th>Tipo</th><th>Metodo</th><th>Referencia</th><th style="text-align:right">Monto</th><th>Nota</th><th>Capturo</th><th></th></tr></thead><tbody>';
+    pg.forEach(function(p){
+      acum+=Number(p.monto)||0;
+      var mio=String(p.usuario_id)===String(USER.id);
+      h+='<tr><td style="white-space:nowrap">'+fFecha(p.fecha)+'</td><td>'+escT(p.tipo||'\u2014')+'</td><td>'+escT(p.metodo||'\u2014')+'</td><td>'+escT(p.referencia||'\u2014')+'</td>'+
+         '<td class="crmnum">'+money(p.monto)+'</td><td>'+escT(p.notas||'\u2014')+'</td><td style="white-space:nowrap">'+escT(p.usuario||'\u2014')+'</td>'+
+         '<td style="white-space:nowrap">'+((puedeTodo||mio)?('<button class="btn sec" style="padding:.25rem .55rem" onclick="borrarPagoFicha('+p.id+')">Eliminar</button>'):'')+'</td></tr>';
+    });
+    h+='</tbody><tfoot><tr><th colspan="4" style="text-align:right">Total pagado</th><th class="crmnum">'+money(acum)+'</th><th colspan="3"></th></tr></tfoot></table></div>';
+  }
+  h+='<div style="margin-top:.7rem"><button class="btn sec" onclick="recalcularSaldoFicha()">Recalcular saldo</button></div>';
+  return h;
+}
+async function refrescarFicha(){
+  var cid=FICHA.id;
+  var fresh=await api('/api/clientes/'+cid+'/ficha');
+  if(fresh&&fresh.ok){ FICHA=fresh.data; FICHA.id=cid; renderFicha(); }
+}
+async function agregarPagoFicha(){
+  var monto=parseFloat(val('pgMonto'));
+  if(!monto||isNaN(monto)){ toast('Captura el monto del pago'); return; }
+  var body={fecha:val('pgFecha'),monto:monto,tipo:val('pgTipo'),metodo:val('pgMetodo'),referencia:val('pgRef'),notas:val('pgNota')};
+  var d=await api('/api/clientes/'+FICHA.id+'/pagos',{method:'POST',body:JSON.stringify(body)});
+  if(d&&d.ok){ toast('Pago registrado'); await refrescarFicha(); }
+  else if(d){ toast(d.error||'No se pudo registrar el pago'); }
+}
+async function borrarPagoFicha(id){
+  if(!confirm('Eliminar este pago del historial? El saldo se recalcula.'))return;
+  var d=await api('/api/clientes/'+FICHA.id+'/pagos/'+id,{method:'DELETE'});
+  if(d&&d.ok){ toast('Pago eliminado'); await refrescarFicha(); }
+  else if(d){ toast(d.error||'No se pudo eliminar'); }
+}
+async function recalcularSaldoFicha(){
+  var d=await api('/api/clientes/'+FICHA.id+'/pagos/recalcular',{method:'POST',body:JSON.stringify({})});
+  if(d&&d.ok){ toast('Saldo actualizado'); await refrescarFicha(); }
+  else if(d){ toast(d.error||'No se pudo recalcular'); }
+}
+// ---- COTIZACIONES QUE SI FORMAN LA PROPUESTA FINAL ----
+function cotFinalHtml(){
+  var cots=(FICHA&&FICHA.cotizaciones)||[],n=0,sIva=0,sTot=0;
+  cots.forEach(function(q){ if(Number(q.propuesta_final)){ n++; sIva+=Number(q.subtotal)||0; sTot+=Number(q.total)||0; } });
+  if(!n)return '<p class="muted" style="font-size:.8rem;margin-top:.5rem">Marca la casilla FINAL de las cotizaciones que si forman la propuesta real del cliente. Las demas quedan como historial.</p>';
+  return '<div style="margin-top:.7rem;display:flex;gap:.7rem;flex-wrap:wrap;align-items:center">'+
+    '<span style="font-size:.86rem">Propuesta final: <b>'+n+'</b> cotizacion'+(n===1?'':'es')+' \u00b7 '+money(sIva)+' s/IVA \u00b7 '+money(sTot)+' con IVA</span>'+
+    '<button class="btn sec" onclick="aplicarPropuestaFinal()">Usar como propuesta actual</button></div>';
+}
+async function marcarCotFinal(id,ck){
+  var d=await api('/api/cotizaciones/'+id,{method:'PUT',body:JSON.stringify({propuesta_final:ck?1:0})});
+  if(!d||!d.ok){ toast((d&&d.error)||'No se pudo marcar la cotizacion'); return; }
+  var cots=(FICHA&&FICHA.cotizaciones)||[],i;
+  for(i=0;i<cots.length;i++)if(String(cots[i].id)===String(id))cots[i].propuesta_final=(ck?1:0);
+  var box=document.getElementById('fCotFinal');
+  if(box)box.innerHTML=cotFinalHtml();
+  toast(ck?'Cotizacion marcada para la propuesta final':'Cotizacion desmarcada');
+}
+async function aplicarPropuestaFinal(){
+  var cots=(FICHA&&FICHA.cotizaciones)||[],suma=0,n=0;
+  cots.forEach(function(q){ if(Number(q.propuesta_final)){ n++; suma+=Number(q.subtotal)||0; } });
+  if(!n){ toast('Primero marca al menos una cotizacion'); return; }
+  var d=await api('/api/clientes/'+FICHA.id,{method:'PUT',body:JSON.stringify({propuesta_antes_iva:Number(suma.toFixed(2))})});
+  if(d&&d.ok){ toast('Propuesta actual actualizada'); await refrescarFicha(); }
+  else if(d){ toast(d.error||'No se pudo actualizar la propuesta'); }
 }
 function fmtTam(n){n=Number(n||0);if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';return (n/1048576).toFixed(1)+' MB';}
 async function cargarArchivosFicha(){
@@ -5036,14 +5379,14 @@ function volverCot(){go('cotizaciones');}
 async function viewCotizaciones(c){
   document.getElementById('acciones').innerHTML='<button class="btn" onclick="nuevaCotizacion()">+ Nueva cotización</button>';
   var d=await api('/api/cotizaciones');if(!d||!d.ok)return;
-  var h='<div class="card"><table><thead><tr><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>Acciones</th></tr></thead><tbody>';
+  var h='<div class="card"><table><thead><tr><th title="Cotizaciones que forman la propuesta final del cliente">FINAL</th><th>Folio</th><th>Cliente</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>Acciones</th></tr></thead><tbody>';
   d.data.forEach(function(r){
     var conv=(r.estado==='aceptada'&&!r.proyecto_folio)?' <button class="btn" style="padding:.3rem .6rem" onclick="convertirCot('+r.id+')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Proyecto</button>':'';
     var proy=r.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+r.proyecto_folio+'</span>'):'—';
-    h+='<tr><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td><td>'+proy+'</td>'+
+    h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(r.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+r.id+',this.checked)"></td><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td><td>'+proy+'</td>'+
        '<td style="white-space:nowrap"><button class="btn sec" style="padding:.3rem .6rem" onclick="pdfCotizacion('+r.id+')">PDF</button> <button class="btn sec" style="padding:.3rem .6rem" onclick="editarCotizacion('+r.id+')">Editar</button> <button class="btn err" style="padding:.3rem .6rem" onclick="eliminarCot('+r.id+')">Eliminar</button>'+conv+'</td></tr>';
   });
-  if(!d.data.length)h+='<tr><td colspan="7" class="muted">Sin cotizaciones. Crea la primera.</td></tr>';
+  if(!d.data.length)h+='<tr><td colspan="8" class="muted">Sin cotizaciones. Crea la primera.</td></tr>';
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 function estadoCotSel(e,id){
