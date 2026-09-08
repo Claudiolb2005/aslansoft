@@ -576,6 +576,18 @@ async function migrarV10(env) {
   MIGRADO_V10 = true;
 }
 
+let MIGRADO_V11 = false;
+async function migrarV11(env) {
+  if (MIGRADO_V11) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v11_comprobantes'").first();
+    if (f && f.valor === "ok") { MIGRADO_V11 = true; return; }
+  } catch (e) { return; }
+  try { await env.DB.prepare("ALTER TABLE cliente_pagos ADD COLUMN archivo_id INTEGER").run(); } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v11_comprobantes','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V11 = true;
+}
+
 let MIGRADO_V7 = false;
 async function migrarV7(env) {
   if (MIGRADO_V7) return;
@@ -1175,7 +1187,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const cot = await env.DB.prepare("SELECT c.id, c.usuario_id, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
+    const cot = await env.DB.prepare("SELECT c.id, c.usuario_id, c.cliente_id, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
     if (!cot) return fail("Cotización no encontrada.", 404);
     const _scp = asesorScope(payload);
     if (_scp) { const _ap = (cot._asesor || "").trim().toUpperCase(); if (_ap !== _scp.first && _ap !== _scp.full) return fail("Sin acceso a esta cotización.", 403); }
@@ -1183,8 +1195,23 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     if ("propuesta_final" in b && Object.keys(b).length === 1) {
       const pf = (b.propuesta_final === 1 || b.propuesta_final === true || b.propuesta_final === "1") ? 1 : 0;
       await env.DB.prepare("UPDATE cotizaciones SET propuesta_final=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(pf, id).run();
-      await audit(env, payload.sub, "propuesta_final", "cotizaciones", id, { propuesta_final: pf }, request);
-      return ok({ id, propuesta_final: pf });
+      // La suma s/IVA de las cotizaciones marcadas se copia sola a PROP. S/IVA del CRM.
+      // Si no queda ninguna marcada NO se borra el monto capturado a mano.
+      let propNueva = null, marcadas = 0;
+      if (cot.cliente_id) {
+        try {
+          const sm = await env.DB.prepare("SELECT COUNT(*) AS n, IFNULL(SUM(subtotal),0) AS s FROM cotizaciones WHERE cliente_id=? AND propuesta_final=1 AND deleted_at IS NULL").bind(cot.cliente_id).first();
+          marcadas = Number((sm && sm.n) || 0);
+          if (marcadas > 0) {
+            propNueva = +Number((sm && sm.s) || 0).toFixed(2);
+            await env.DB.prepare("UPDATE clientes SET propuesta_antes_iva=?, propuesta_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(propNueva, cot.cliente_id).run();
+            const np = await env.DB.prepare("SELECT COUNT(*) AS n FROM cliente_pagos WHERE cliente_id=? AND deleted_at IS NULL").bind(cot.cliente_id).first();
+            if (np && Number(np.n) > 0) await sincronizarSaldo(env, cot.cliente_id);
+          }
+        } catch (e) {}
+      }
+      await audit(env, payload.sub, "propuesta_final", "cotizaciones", id, { propuesta_final: pf, marcadas, propuesta_antes_iva: propNueva }, request);
+      return ok({ id, propuesta_final: pf, marcadas, propuesta_antes_iva: propNueva });
     }
     // Cambio de estado simple
     if (b.estado && Object.keys(b).length === 1) {
@@ -2060,8 +2087,12 @@ async function pagosResumen(env, clienteId) {
   const c = await env.DB.prepare("SELECT id, facturado, propuesta_antes_iva, saldo_actual, moneda FROM clientes WHERE id=?").bind(clienteId).first();
   let pagos = [];
   try {
-    const r = await env.DB.prepare("SELECT p.id,p.fecha,p.monto,p.tipo,p.metodo,p.referencia,p.notas,p.usuario_id,p.created_at,u.nombre AS usuario FROM cliente_pagos p LEFT JOIN usuarios u ON u.id=p.usuario_id WHERE p.cliente_id=? AND p.deleted_at IS NULL ORDER BY p.fecha DESC, p.id DESC").bind(clienteId).all();
+    const r = await env.DB.prepare("SELECT p.id,p.fecha,p.monto,p.tipo,p.metodo,p.referencia,p.notas,p.usuario_id,p.archivo_id,p.created_at,u.nombre AS usuario,a.nombre AS archivo_nombre FROM cliente_pagos p LEFT JOIN usuarios u ON u.id=p.usuario_id LEFT JOIN cliente_archivos a ON a.id=p.archivo_id AND a.deleted_at IS NULL WHERE p.cliente_id=? AND p.deleted_at IS NULL ORDER BY p.fecha DESC, p.id DESC").bind(clienteId).all();
     pagos = r.results || [];
+    const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
+    for (const p of pagos) {
+      if (p.archivo_id && p.archivo_nombre) { try { p.archivo_url = await archivoUrl(p.archivo_id, secret); } catch (e) {} }
+    }
   } catch (e) {}
   const pagado = pagos.reduce((t, p) => t + (Number(p.monto) || 0), 0);
   const bc = baseCobranza(c || {});
@@ -2085,6 +2116,26 @@ async function listarPagosCliente(env, payload, clienteId) {
   if (!c) return fail("Sin acceso a este lead.", 403);
   return ok(await pagosResumen(env, clienteId));
 }
+// Valida que el comprobante exista y sea de ESTE cliente antes de ligarlo al pago.
+async function archivoDelCliente(env, clienteId, archivoId) {
+  if (!archivoId) return null;
+  try {
+    const a = await env.DB.prepare("SELECT id FROM cliente_archivos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(archivoId, clienteId).first();
+    return a ? a.id : null;
+  } catch (e) { return null; }
+}
+async function ligarComprobantePago(request, env, payload, clienteId, pagoId) {
+  const c = await clienteAccesible(env, payload, clienteId);
+  if (!c) return fail("Sin acceso a este lead.", 403);
+  const p = await env.DB.prepare("SELECT id FROM cliente_pagos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(pagoId, clienteId).first();
+  if (!p) return fail("Pago no encontrado.", 404);
+  const b = await request.json().catch(() => ({}));
+  const archivoId = await archivoDelCliente(env, clienteId, b.archivo_id);
+  if (!archivoId) return fail("El comprobante no es valido para este cliente.");
+  await env.DB.prepare("UPDATE cliente_pagos SET archivo_id=? WHERE id=?").bind(archivoId, pagoId).run();
+  await audit(env, payload.sub, "comprobante_pago", "cliente_pagos", pagoId, { cliente_id: clienteId, archivo_id: archivoId }, request);
+  return ok({ id: pagoId, resumen: await pagosResumen(env, clienteId) });
+}
 async function agregarPagoCliente(request, env, payload, clienteId) {
   const c = await clienteAccesible(env, payload, clienteId);
   if (!c) return fail("Sin acceso a este lead.", 403);
@@ -2097,8 +2148,9 @@ async function agregarPagoCliente(request, env, payload, clienteId) {
   const metodo = PAGO_METODOS.includes(b.metodo) ? b.metodo : "Transferencia";
   const referencia = String(b.referencia || "").trim().slice(0, 120) || null;
   const notas = String(b.notas || "").trim().slice(0, 400) || null;
-  const res = await env.DB.prepare("INSERT INTO cliente_pagos (cliente_id,fecha,monto,tipo,metodo,referencia,notas,usuario_id) VALUES (?,?,?,?,?,?,?,?)")
-    .bind(clienteId, fecha, +monto.toFixed(2), tipo, metodo, referencia, notas, payload.sub).run();
+  const archivoId = await archivoDelCliente(env, clienteId, b.archivo_id);
+  const res = await env.DB.prepare("INSERT INTO cliente_pagos (cliente_id,fecha,monto,tipo,metodo,referencia,notas,usuario_id,archivo_id) VALUES (?,?,?,?,?,?,?,?,?)")
+    .bind(clienteId, fecha, +monto.toFixed(2), tipo, metodo, referencia, notas, payload.sub, archivoId).run();
   const resumen = await sincronizarSaldo(env, clienteId);
   await audit(env, payload.sub, "pago", "cliente_pagos", res.meta.last_row_id, { cliente_id: clienteId, fecha, monto, tipo, metodo }, request);
   return ok({ id: res.meta.last_row_id, resumen });
@@ -2552,6 +2604,7 @@ async function handleRequest(request, env) {
   await migrarV8(env);
   await migrarV9(env);
   await migrarV10(env);
+  await migrarV11(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2605,6 +2658,7 @@ async function handleRequest(request, env) {
     m = path.match(/^\/api\/clientes\/(\d+)\/pagos\/recalcular$/);
     if (m && method === "POST") return await recalcularSaldoCliente(env, payload, m[1]);
     m = path.match(/^\/api\/clientes\/(\d+)\/pagos\/(\d+)$/);
+    if (m && method === "PUT") return await ligarComprobantePago(request, env, payload, m[1], m[2]);
     if (m && method === "DELETE") return await borrarPagoCliente(request, env, payload, m[1], m[2]);
     m = path.match(/^\/api\/clientes(?:\/(\d+))?$/);
     if (m) return await handleClientes(request, env, payload, method, m[1]);
@@ -4841,15 +4895,15 @@ function renderFicha(){
      '<div class="ffield"><label>Crecimiento vs inicial</label><span class="fnum" style="color:'+crecColor+'">'+crecTxt+'</span></div>'+
      '<div class="ffield"><label>\u00daltima actualizaci\u00f3n</label><span style="color:var(--txt2);font-size:.85rem">'+(c.propuesta_updated_at?fmtFechaHora(c.propuesta_updated_at):'Sin cambios desde el inicial')+'</span></div>'+
      '</div><p class="muted" style="font-size:.78rem;margin-top:.4rem">El valor inicial queda congelado del primer contacto. La propuesta actual es la que suma al pipeline; al editarla se guarda sola la fecha del cambio.</p></div>';
-  h+='<div class="fsec"><h3>Financiero</h3><div class="fgrid">'+
+  h+='<div class="fsec"><h3>Financiero y pagos</h3><div class="fgrid">'+
      fField('Condiciones de pago','condiciones_pago',c.condiciones_pago)+
      fField('Línea de crédito','linea_credito',c.linea_credito,'num')+
      '<div class="ffield"><label>Saldo actual</label><span class="fnum" style="color:var(--gold)">'+(c.saldo_actual==null?'\u2014':money(c.saldo_actual))+'</span></div>'+
      fField('Riesgo de crédito','riesgo_credito',c.riesgo_credito)+
      fField('Facturado','facturado',c.facturado,'num')+
      fField('Moneda','moneda',c.moneda)+'</div>'+
-     '<p class="muted" style="font-size:.78rem;margin-top:.4rem">El saldo ya no se escribe a mano: sale de restarle a la base los pagos capturados abajo.</p></div>';
-  h+='<div class="fsec"><h3>Pagos del cliente</h3><div id="fPagosBox">'+fPagosHtml()+'</div></div>';
+     '<p class="muted" style="font-size:.78rem;margin:.4rem 0 .9rem">El saldo ya no se escribe a mano: sale de restarle a la base los pagos capturados aqui mismo.</p>'+
+     '<div id="fPagosBox">'+fPagosHtml()+'</div></div>';
   h+='<div class="fsec"><h3>Datos personalizados</h3><div class="fgrid">'+
      fField('Cumpleaños','cumpleanos',c.cumpleanos)+
      fField('Referido por','referido_por',c.referido_por)+
@@ -4920,22 +4974,47 @@ function fPagosHtml(){
      '<div style="min-width:150px"><label>Metodo</label><select id="pgMetodo">'+mo+'</select></div>'+
      '<div style="min-width:160px"><label>Referencia</label><input id="pgRef" placeholder="Folio o transferencia"></div>'+
      '<div style="flex:1;min-width:180px"><label>Nota</label><input id="pgNota" placeholder="Observaciones"></div>'+
+     '<div style="min-width:220px"><label>Comprobante</label><input id="pgComp" type="file"></div>'+
      '<div><button class="btn" onclick="agregarPagoFicha()">Registrar pago</button></div></div>';
   if(!pg.length){ h+='<p class="muted" style="font-size:.83rem">Sin pagos registrados todavia.</p>'; }
   else{
     var puedeTodo=(USER.rol==='admin'||USER.rol==='gerente'),acum=0;
-    h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Fecha</th><th>Tipo</th><th>Metodo</th><th>Referencia</th><th style="text-align:right">Monto</th><th>Nota</th><th>Capturo</th><th></th></tr></thead><tbody>';
+    h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Fecha</th><th>Tipo</th><th>Metodo</th><th>Referencia</th><th style="text-align:right">Monto</th><th>Nota</th><th>Capturo</th><th>Comprobante</th><th></th></tr></thead><tbody>';
     pg.forEach(function(p){
       acum+=Number(p.monto)||0;
       var mio=String(p.usuario_id)===String(USER.id);
       h+='<tr><td style="white-space:nowrap">'+fFecha(p.fecha)+'</td><td>'+escT(p.tipo||'\u2014')+'</td><td>'+escT(p.metodo||'\u2014')+'</td><td>'+escT(p.referencia||'\u2014')+'</td>'+
          '<td class="crmnum">'+money(p.monto)+'</td><td>'+escT(p.notas||'\u2014')+'</td><td style="white-space:nowrap">'+escT(p.usuario||'\u2014')+'</td>'+
+         '<td style="white-space:nowrap">'+compPagoHtml(p)+'</td>'+
          '<td style="white-space:nowrap">'+((puedeTodo||mio)?('<button class="btn sec" style="padding:.25rem .55rem" onclick="borrarPagoFicha('+p.id+')">Eliminar</button>'):'')+'</td></tr>';
     });
-    h+='</tbody><tfoot><tr><th colspan="4" style="text-align:right">Total pagado</th><th class="crmnum">'+money(acum)+'</th><th colspan="3"></th></tr></tfoot></table></div>';
+    h+='</tbody><tfoot><tr><th colspan="4" style="text-align:right">Total pagado</th><th class="crmnum">'+money(acum)+'</th><th colspan="4"></th></tr></tfoot></table></div>';
   }
   h+='<div style="margin-top:.7rem"><button class="btn sec" onclick="recalcularSaldoFicha()">Recalcular saldo</button></div>';
   return h;
+}
+function compPagoHtml(p){
+  if(p.archivo_url)return '<a class="btn sec" style="padding:.25rem .55rem;text-decoration:none" href="'+p.archivo_url+'" target="_blank" rel="noopener">Ver</a>';
+  return '<input type="file" id="pgF'+p.id+'" style="width:140px;padding:.2rem;font-size:.68rem"> <button class="btn sec" style="padding:.25rem .55rem" onclick="subirComprobantePago('+p.id+')">Subir</button>';
+}
+// Sube el comprobante al mismo almacen de archivos del cliente y devuelve su id
+async function subirComprobanteArchivo(f){
+  if(f.size>10*1024*1024){ toast('El comprobante supera 10 MB'); return null; }
+  var data;
+  try{ data=await leerArchivoDataURL(f); }catch(e){ toast('No se pudo leer el comprobante'); return null; }
+  var d=await api('/api/clientes/'+FICHA.id+'/archivos',{method:'POST',body:JSON.stringify({nombre:f.name,categoria:'Comprobante de pago',contentType:f.type||'application/octet-stream',data:data})});
+  if(d&&d.ok&&d.data&&d.data.id)return d.data.id;
+  toast((d&&d.error)||'No se pudo subir el comprobante');
+  return null;
+}
+async function subirComprobantePago(id){
+  var inp=document.getElementById('pgF'+id);
+  if(!inp||!inp.files||!inp.files.length){ toast('Elige primero el archivo del comprobante'); return; }
+  var aid=await subirComprobanteArchivo(inp.files[0]);
+  if(!aid)return;
+  var d=await api('/api/clientes/'+FICHA.id+'/pagos/'+id,{method:'PUT',body:JSON.stringify({archivo_id:aid})});
+  if(d&&d.ok){ toast('Comprobante guardado'); await refrescarFicha(); }
+  else if(d){ toast(d.error||'No se pudo guardar el comprobante'); }
 }
 async function refrescarFicha(){
   var cid=FICHA.id;
@@ -4945,7 +5024,9 @@ async function refrescarFicha(){
 async function agregarPagoFicha(){
   var monto=parseFloat(val('pgMonto'));
   if(!monto||isNaN(monto)){ toast('Captura el monto del pago'); return; }
-  var body={fecha:val('pgFecha'),monto:monto,tipo:val('pgTipo'),metodo:val('pgMetodo'),referencia:val('pgRef'),notas:val('pgNota')};
+  var comp=document.getElementById('pgComp'),aid=null;
+  if(comp&&comp.files&&comp.files.length){ aid=await subirComprobanteArchivo(comp.files[0]); if(!aid)return; }
+  var body={fecha:val('pgFecha'),monto:monto,tipo:val('pgTipo'),metodo:val('pgMetodo'),referencia:val('pgRef'),notas:val('pgNota'),archivo_id:aid};
   var d=await api('/api/clientes/'+FICHA.id+'/pagos',{method:'POST',body:JSON.stringify(body)});
   if(d&&d.ok){ toast('Pago registrado'); await refrescarFicha(); }
   else if(d){ toast(d.error||'No se pudo registrar el pago'); }
@@ -4965,27 +5046,26 @@ async function recalcularSaldoFicha(){
 function cotFinalHtml(){
   var cots=(FICHA&&FICHA.cotizaciones)||[],n=0,sIva=0,sTot=0;
   cots.forEach(function(q){ if(Number(q.propuesta_final)){ n++; sIva+=Number(q.subtotal)||0; sTot+=Number(q.total)||0; } });
-  if(!n)return '<p class="muted" style="font-size:.8rem;margin-top:.5rem">Marca la casilla FINAL de las cotizaciones que si forman la propuesta real del cliente. Las demas quedan como historial.</p>';
-  return '<div style="margin-top:.7rem;display:flex;gap:.7rem;flex-wrap:wrap;align-items:center">'+
-    '<span style="font-size:.86rem">Propuesta final: <b>'+n+'</b> cotizacion'+(n===1?'':'es')+' \u00b7 '+money(sIva)+' s/IVA \u00b7 '+money(sTot)+' con IVA</span>'+
-    '<button class="btn sec" onclick="aplicarPropuestaFinal()">Usar como propuesta actual</button></div>';
+  if(!n)return '<p class="muted" style="font-size:.8rem;margin-top:.5rem">Marca la casilla FINAL de las cotizaciones que si forman la propuesta real del cliente. La suma pasa sola a PROP. S/IVA en el CRM; las demas quedan como historial.</p>';
+  return '<div style="margin-top:.7rem"><span style="font-size:.86rem">Propuesta final: <b>'+n+'</b> cotizacion'+(n===1?'':'es')+' \u00b7 '+money(sIva)+' s/IVA \u00b7 '+money(sTot)+' con IVA</span>'+
+    '<div class="muted" style="font-size:.78rem;margin-top:.25rem">Esa suma s/IVA ya quedo en PROP. S/IVA del CRM.</div></div>';
 }
 async function marcarCotFinal(id,ck){
   var d=await api('/api/cotizaciones/'+id,{method:'PUT',body:JSON.stringify({propuesta_final:ck?1:0})});
   if(!d||!d.ok){ toast((d&&d.error)||'No se pudo marcar la cotizacion'); return; }
-  var cots=(FICHA&&FICHA.cotizaciones)||[],i;
-  for(i=0;i<cots.length;i++)if(String(cots[i].id)===String(id))cots[i].propuesta_final=(ck?1:0);
-  var box=document.getElementById('fCotFinal');
-  if(box)box.innerHTML=cotFinalHtml();
+  var prop=(d.data&&d.data.propuesta_antes_iva!=null)?d.data.propuesta_antes_iva:null;
+  // Si el CRM esta cargado, la casilla PROP. S/IVA se actualiza en pantalla al momento
+  if(prop!=null&&typeof CRM_ROWS!=='undefined'&&CRM_ROWS){
+    var cli=null,i;
+    for(i=0;i<CRM_ROWS.length;i++)if(FICHA&&String(CRM_ROWS[i].id)===String(FICHA.id))cli=CRM_ROWS[i];
+    if(cli)cli.propuesta_antes_iva=prop;
+  }
+  if(document.getElementById('fCotFinal')&&FICHA&&FICHA.id){
+    toast(prop!=null?('PROP. S/IVA actualizada: '+money(prop)):'Cotizacion desmarcada');
+    await refrescarFicha();
+    return;
+  }
   toast(ck?'Cotizacion marcada para la propuesta final':'Cotizacion desmarcada');
-}
-async function aplicarPropuestaFinal(){
-  var cots=(FICHA&&FICHA.cotizaciones)||[],suma=0,n=0;
-  cots.forEach(function(q){ if(Number(q.propuesta_final)){ n++; suma+=Number(q.subtotal)||0; } });
-  if(!n){ toast('Primero marca al menos una cotizacion'); return; }
-  var d=await api('/api/clientes/'+FICHA.id,{method:'PUT',body:JSON.stringify({propuesta_antes_iva:Number(suma.toFixed(2))})});
-  if(d&&d.ok){ toast('Propuesta actual actualizada'); await refrescarFicha(); }
-  else if(d){ toast(d.error||'No se pudo actualizar la propuesta'); }
 }
 function fmtTam(n){n=Number(n||0);if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';return (n/1048576).toFixed(1)+' MB';}
 async function cargarArchivosFicha(){
