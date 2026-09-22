@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS cotizaciones (
   iva_pct REAL DEFAULT 16, total REAL DEFAULT 0,
   vigencia_dias INTEGER DEFAULT 7, notas TEXT, condiciones TEXT,
   entrega_direccion TEXT, entrega_referencias TEXT, entrega_telefono TEXT,
-  cond_pago TEXT, cond_entrega TEXT, cond_no_incluye TEXT,
+  cond_pago TEXT, cond_entrega TEXT, cond_no_incluye TEXT, moneda TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   deleted_at DATETIME
@@ -586,6 +586,21 @@ async function migrarV11(env) {
   try { await env.DB.prepare("ALTER TABLE cliente_pagos ADD COLUMN archivo_id INTEGER").run(); } catch (e) {}
   try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v11_comprobantes','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
   MIGRADO_V11 = true;
+}
+
+let MIGRADO_V12 = false;
+async function migrarV12(env) {
+  if (MIGRADO_V12) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v12_cot_moneda'").first();
+    if (f && f.valor === "ok") { MIGRADO_V12 = true; return; }
+  } catch (e) { return; }
+  try {
+    const c = await env.DB.prepare("SELECT name FROM pragma_table_info('cotizaciones') WHERE name='moneda'").first();
+    if (!c) await env.DB.prepare("ALTER TABLE cotizaciones ADD COLUMN moneda TEXT").run();
+  } catch (e) {}
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v12_cot_moneda','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V12 = true;
 }
 
 let MIGRADO_V7 = false;
@@ -1092,6 +1107,20 @@ async function agregarNotaCliente(request, env, payload, id) {
   return ok({ id: res.meta.last_row_id });
 }
 
+// Moneda de la cotizacion: solo MXN o USD
+function monedaCot(v) { return (String(v || "").trim().toUpperCase() === "USD") ? "USD" : "MXN"; }
+
+// Historial (bitacora) de todos los leads visibles para el usuario: se usa al exportar el CRM
+async function historialClientes(env, payload) {
+  const _sch = scopeClienteSQL(payload, "n.cliente_id");
+  let rows = [];
+  try {
+    const r = await env.DB.prepare("SELECT n.cliente_id, n.nota, n.created_at, u.nombre AS usuario FROM notas_crm n LEFT JOIN usuarios u ON u.id=n.usuario_id WHERE 1=1" + _sch.cond + " ORDER BY n.cliente_id ASC, n.created_at ASC, n.id ASC").bind(..._sch.bind).all();
+    rows = r.results || [];
+  } catch (e) { rows = []; }
+  return ok(rows);
+}
+
 // Detecta posibles duplicados (telefono, correo o nombre) y los agrupa
 async function duplicadosClientes(env, payload) {
   const _scq = scopeClienteSQL(payload, "id");
@@ -1169,12 +1198,12 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     const { lineas, subtotal, total } = calcularTotales(items, b.descuento_global_pct, ivaPct);
     const folio = await siguienteFolio(env, "COT", "cotizaciones");
     const res = await env.DB.prepare(
-      "INSERT INTO cotizaciones (folio,cliente_id,usuario_id,estado,subtotal,descuento_global_pct,iva_pct,total,vigencia_dias,notas,condiciones,entrega_direccion,entrega_referencias,entrega_telefono,cond_pago,cond_entrega,cond_no_incluye) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      "INSERT INTO cotizaciones (folio,cliente_id,usuario_id,estado,subtotal,descuento_global_pct,iva_pct,total,vigencia_dias,notas,condiciones,entrega_direccion,entrega_referencias,entrega_telefono,cond_pago,cond_entrega,cond_no_incluye,moneda) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ).bind(folio, b.cliente_id, payload.sub, b.estado || "borrador", subtotal,
            Number(b.descuento_global_pct) || 0, ivaPct, total, Number(b.vigencia_dias) || 7,
            b.notas || null, b.condiciones || null,
            b.entrega_direccion || null, b.entrega_referencias || null, b.entrega_telefono || null,
-           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null).run();
+           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null, monedaCot(b.moneda)).run();
     const cotId = res.meta.last_row_id;
     for (const ln of lineas) {
       await env.DB.prepare(
@@ -1227,11 +1256,11 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     const ivaPct2 = b.iva_pct !== undefined ? Number(b.iva_pct) : 16;
     const { lineas, subtotal, total } = calcularTotales(items, b.descuento_global_pct, ivaPct2);
     await env.DB.prepare(
-      "UPDATE cotizaciones SET cliente_id=COALESCE(?,cliente_id), subtotal=?, descuento_global_pct=?, iva_pct=?, total=?, vigencia_dias=?, notas=?, condiciones=?, entrega_direccion=?, entrega_referencias=?, entrega_telefono=?, cond_pago=?, cond_entrega=?, cond_no_incluye=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+      "UPDATE cotizaciones SET cliente_id=COALESCE(?,cliente_id), subtotal=?, descuento_global_pct=?, iva_pct=?, total=?, vigencia_dias=?, notas=?, condiciones=?, entrega_direccion=?, entrega_referencias=?, entrega_telefono=?, cond_pago=?, cond_entrega=?, cond_no_incluye=?, moneda=?, updated_at=CURRENT_TIMESTAMP WHERE id=?"
     ).bind(b.cliente_id || null, subtotal, Number(b.descuento_global_pct) || 0, ivaPct2, total,
            Number(b.vigencia_dias) || 7, b.notas || null, b.condiciones || null,
            b.entrega_direccion || null, b.entrega_referencias || null, b.entrega_telefono || null,
-           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null, id).run();
+           b.cond_pago || null, b.cond_entrega || null, b.cond_no_incluye || null, monedaCot(b.moneda), id).run();
     await env.DB.prepare("DELETE FROM cotizacion_items WHERE cotizacion_id=?").bind(id).run();
     for (const ln of lineas) {
       await env.DB.prepare(
@@ -2331,7 +2360,7 @@ async function waEnviar(request, env, payload, id) {
 //  CONFIGURACIÓN (datos de empresa, IVA por defecto) + REPORTES
 // ============================================================================
 const CAT_NOTA_DEF = ["SEGUIMIENTO", "SIN RESPUESTA", "PRECIO", "MATERIAL", "PROVEEDOR", "PRESUPUESTO", "EXISTENCIA", "TIEMPO DE ENTREGA", "VISITA", "CONTACTAR", "STAND BY", "OTRO"];
-const CAT_FINAL_DEF = ["NV", "PERDIDA", "GANADA", "DUPLICADA"];
+const CAT_FINAL_DEF = ["VIABLE", "NV"];
 function parseCat(v) {
   try { const a = JSON.parse(v || "null"); if (Array.isArray(a) && a.length) return a.map((x) => String(x)); } catch (e) {}
   return null;
@@ -2605,6 +2634,7 @@ async function handleRequest(request, env) {
   await migrarV9(env);
   await migrarV10(env);
   await migrarV11(env);
+  await migrarV12(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2643,6 +2673,7 @@ async function handleRequest(request, env) {
 
     let m;
     if (path === "/api/clientes/duplicados" && method === "GET") return await duplicadosClientes(env, payload);
+    if (path === "/api/clientes/historial" && method === "GET") return await historialClientes(env, payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/ficha$/);
     if (m && method === "GET") return await fichaCliente(env, m[1], payload);
     m = path.match(/^\/api\/clientes\/(\d+)\/notas$/);
@@ -2898,6 +2929,9 @@ function renderApp() {
 .crmcat:after{content:"\\25be";color:var(--txt2);font-size:.7em;margin-left:.35rem;opacity:.7}
 .crmcat.selopen:after{content:""}
 .crmcat select{width:100%;padding:.15rem .25rem;font-size:.78rem}
+.crmcatsel{cursor:default}
+.crmcatsel:after{content:""}
+.crmcatsel select.crmsel{min-width:120px;cursor:pointer;background:transparent;border:1px solid var(--bd);border-radius:4px}
 .crmtable td.fx{position:sticky;z-index:3;background:var(--card)}
 .crmtable th.fx{position:sticky;z-index:6;background:var(--thead,#EDE6D6)}
 .crmtable th.fxend,.crmtable td.fxend{border-right:2px solid var(--gold)}
@@ -3739,9 +3773,10 @@ function crmCellNombre(r,ex){
 }
 function celdaBloqueada(td){return !!(td&&td.dataset&&td.dataset.noed==='1');}
 // ---- Campos que NO se escriben a mano: solo se eligen de una lista ----
-var CRM_CAT={estatus_final:1,asesor:1,estatus_nota:1};
+var CRM_CAT={estatus_final:1,asesor:1,estatus_nota:1,validacion:1};
+var CRM_CAT_INLINE={estatus_final:1,estatus_nota:1,validacion:1};
 var CAT_NOTA_DEF=['SEGUIMIENTO','SIN RESPUESTA','PRECIO','MATERIAL','PROVEEDOR','PRESUPUESTO','EXISTENCIA','TIEMPO DE ENTREGA','VISITA','CONTACTAR','STAND BY','OTRO'];
-var CAT_FINAL_DEF=['NV','PERDIDA','GANADA','DUPLICADA'];
+var CAT_FINAL_DEF=['VIABLE','NV'];
 function catCFG(k){
   var v=(CFG&&CFG[k])?CFG[k]:null;
   if(!v)return null;
@@ -3754,6 +3789,7 @@ function crmOpciones(campo,actual){
   var base=[];
   if(campo==='estatus_nota')base=catCFG('cat_estatus_nota')||CAT_NOTA_DEF;
   else if(campo==='estatus_final')base=catCFG('cat_estatus_final')||CAT_FINAL_DEF;
+  else if(campo==='validacion')base=['VIABLE','NV'];
   else if(campo==='asesor')base=catCFG('cat_asesores')||[];
   var seen={},out=[],i,x;
   for(i=0;i<base.length;i++){x=String(base[i]==null?'':base[i]).trim();if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;out.push(x);}}
@@ -3769,10 +3805,28 @@ function crmOpciones(campo,actual){
   return out;
 }
 function crmCellSel(r,campo,val,ex){
+  if(CRM_CAT_INLINE[campo]){
+    var actual=(val==null?'':String(val)).trim(),ops=crmOpciones(campo,actual),i,h='<select class="crmsel" onchange="crmSelInline(this)" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()"><option value="">(sin dato)</option>';
+    for(i=0;i<ops.length;i++)h+='<option'+(ops[i].toUpperCase()===actual.toUpperCase()?' selected':'')+'>'+escT(ops[i])+'</option>';
+    return '<td tabindex="-1" class="crmc crmcat crmcatsel'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" data-cat="2" title="Elige de la lista y se guarda al instante" onclick="xlsSel(this)">'+h+'</select></td>';
+  }
   return '<td tabindex="-1" class="crmc crmcat'+(ex?' '+ex:'')+'" data-id="'+r.id+'" data-campo="'+campo+'" data-num="0" data-cat="1" title="Doble clic para elegir de la lista" onclick="xlsSel(this)" ondblclick="xlsEditStart(this)">'+escAttr(val==null?'':String(val))+'</td>';
+}
+async function crmSelInline(sel){
+  var td=sel.parentNode;if(!td||!td.dataset)return;
+  var id=td.dataset.id,campo=td.dataset.campo,v=String(sel.value||'').trim();
+  var body={};body[campo]=v;
+  var d=await api('/api/clientes/'+id,{method:'PUT',body:JSON.stringify(body)});
+  if(d&&d.ok){
+    var row=CRM_ROWS.find(function(x){return String(x.id)===String(id);});
+    if(row)row[campo]=v;
+    toast('Guardado');
+    if(campo==='estatus_final'||campo==='estatus_nota')pintarFiltros();
+  }else if(d){toast(d.error||'Error al guardar');}
 }
 function crmSelStart(td){
   if(!td||td._sel)return;
+  if(td.dataset&&td.dataset.cat==='2'){var ps=td.querySelector('select.crmsel');if(ps){try{ps.focus();}catch(e){}}return;}
   var campo=td.dataset.campo,actual=(td.textContent||'').trim();
   var ops=crmOpciones(campo,actual),i;
   var h='<select><option value="">(sin dato)</option>';
@@ -3897,7 +3951,19 @@ async function pintarAlertasDash(){
   }
   box.innerHTML=h;
 }
-async function refrescarBadgeAlertas(){try{var d=await api('/api/clientes');if(d&&d.ok)actualizarBadgeAlertas(calcAlertas(d.data));}catch(e){}}
+async function refrescarBadgeAlertas(){try{var d=await api('/api/clientes');if(d&&d.ok){var r=calcAlertas(d.data);actualizarBadgeAlertas(r);avisoSeguimientosHoy(r);}}catch(e){}}
+function avisoSeguimientosHoy(r){
+  var hoyA=0,venc=0;
+  (r.fechas||[]).forEach(function(i){if(i.nivel!=='alarma')return;if(i.txt&&i.txt.indexOf('HOY')>=0)hoyA++;else venc++;});
+  if(!hoyA&&!venc)return;
+  var k='aviso_seg_'+hoyISO()+'_'+((typeof USER!=='undefined'&&USER&&USER.id)?USER.id:'');
+  try{if(localStorage.getItem(k))return;localStorage.setItem(k,'1');}catch(e){}
+  var txt='';
+  if(hoyA)txt+=hoyA+(hoyA===1?' seguimiento programado para hoy':' seguimientos programados para hoy');
+  if(venc)txt+=(txt?' y ':'')+venc+(venc===1?' seguimiento vencido':' seguimientos vencidos');
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.3rem;margin-bottom:.5rem">Seguimientos pendientes</h3><p style="font-size:.92rem;line-height:1.5;margin-bottom:1.1rem">Tienes '+txt+'.</p><div style="display:flex;gap:.5rem"><button class="btn" onclick="irAlertasAviso()">Ver alertas</button><button class="btn sec" onclick="closeModal()">Después</button></div>');
+}
+function irAlertasAviso(){if(typeof closeModal==='function')closeModal();go('alertas');}
 
 async function viewClientes(c){
   document.getElementById('acciones').innerHTML='';
@@ -3918,6 +3984,7 @@ function setVistaCRM(v){
   renderCRM();
 }
 function valFil(id){var e=document.getElementById(id);return e?(''+e.value):'';}
+function sumaDiasISO(iso,n){var p=iso.split('-');var d=new Date(Number(p[0]),Number(p[1])-1,Number(p[2])+n);return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);}
 var CRM_MESES_NOM=['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
 // Al elegir un mes sin año, el filtro mezclaba septiembre de todos los años.
 // Ahora se ancla al año en curso y el año se puede abrir a mano si se quiere el historico.
@@ -3940,11 +4007,18 @@ function crmPeriodoTxt(){
   return 'año '+a;
 }
 function filasCRMFiltradas(){
-  var q=valFil('crmq').toLowerCase().trim();
-  var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact'),ef=valFil('fEFin');
+  var q=catKey(valFil('crmq'));
+  var as=valFil('fAsesor'),es=valFil('fEstatus'),an=valFil('fAnio'),me=valFil('fMes'),fa=valFil('fFact'),ef=valFil('fEFin'),sg=valFil('fSeg');
+  var hoyS=hoyISO(),lim7=sumaDiasISO(hoyS,7);
   var mn=parseFloat(valFil('fMin')),mx=parseFloat(valFil('fMax'));
   return CRM_ROWS.filter(function(r){
-    if(q && JSON.stringify(r).toLowerCase().indexOf(q)<0)return false;
+    if(q && catKey(JSON.stringify(r)).indexOf(q)<0)return false;
+    if(sg){var ps=(r.proximo_seguimiento==null?'':String(r.proximo_seguimiento)).trim().slice(0,10);var okp=/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(ps);
+      if(sg==='con'&&!okp)return false;
+      if(sg==='sin'&&okp)return false;
+      if(sg==='hoy'&&!(okp&&ps===hoyS))return false;
+      if(sg==='venc'&&!(okp&&ps<hoyS))return false;
+      if(sg==='prox'&&!(okp&&ps>=hoyS&&ps<=lim7))return false;}
     if(as && (r.asesor||'').trim()!==as)return false;
     if(es){var st=(r.estatus_nota||'').trim().toUpperCase();if(es==='__SIN__'){if(st!=='')return false;}else if(st!==es.toUpperCase())return false;}
     if(ef){var sf=(r.estatus_final||'').trim().toUpperCase();if(ef==='__SIN__'){if(sf!=='')return false;}else if(sf!==ef.toUpperCase())return false;}
@@ -4252,7 +4326,7 @@ function xlsSel(td){
 function xlsEditStart(td,ch){
   if(!td)return;
   if(celdaBloqueada(td)){toast('El nombre se edita en la ficha o en el cardex (clic derecho)');return;}
-  if(td.dataset&&td.dataset.cat==='1'){
+  if(td.dataset&&(td.dataset.cat==='1'||td.dataset.cat==='2')){
     if(XLS_CUR!==td){if(XLS_CUR)XLS_CUR.classList.remove('sel');XLS_CUR=td;td.classList.add('sel');}
     crmSelStart(td);
     return;
@@ -4398,11 +4472,11 @@ async function guardarCeldaCRM(el){
   } else if(d){ toast(d.error||'Error al guardar'); }
 }
 var PEND_CLIENTE=null;
-var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA','INSUMOS'];
+var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA','CANTERA','INSUMOS'];
 var CAT_SERVICIOS=[['FLETE','pza'],['MANIOBRA','pza'],['INSTALACIÓN','m2']];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
 var CAT_ORIGEN=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
-var CAT_GESTION=['COTIZACIÓN','NEGOCIACIÓN','GANADO','PERDIDO'];
+var CAT_GESTION=['COTIZACIÓN','FACTURA'];
 var CAT_TIPO_SEG=['LLAMADA','VISITA','MUESTRA'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
 var CAT_ACAB_MAT={
@@ -4412,7 +4486,8 @@ var CAT_ACAB_MAT={
   'CALIZA':['MATE','PULIDO BRILLADO'],
   'CUARZO':['PULIDO BRILLADO','PULIDO MATE'],
   'ONIX':['PULIDO BRILLADO'],
-  'SEMIPRECIOSA':['PULIDO BRILLADO']
+  'SEMIPRECIOSA':['PULIDO BRILLADO'],
+  'CANTERA':['AL CORTE','CEPILLADO','MARTELINADO','BUZARDEADO','SANDBLAST','MATE']
 };
 function acabTodos(){
   var m={},o=[];
@@ -4578,6 +4653,7 @@ function pintarFiltros(){
     '<select id="fAnio" onchange="renderCRM()">'+yopts+'</select>'+
     '<select id="fMes" onchange="crmMesCambio()">'+mopts+'</select>'+
     '<select id="fFact" onchange="renderCRM()"><option value="">Facturación: todas</option><option value="con">Con factura</option><option value="sin">Sin factura</option></select>'+
+    '<select id="fSeg" onchange="renderCRM()" title="Fecha del seguimiento"><option value="">Seguimiento: todos</option><option value="hoy">Hoy</option><option value="venc">Vencidos</option><option value="prox">Próximos 7 días</option><option value="con">Con fecha</option><option value="sin">Sin fecha</option></select>'+
     '<input id="fMin" type="number" placeholder="Monto min" oninput="renderCRM()">'+
     '<input id="fMax" type="number" placeholder="Monto max" oninput="renderCRM()">'+
     '<button class="btn sec" onclick="limpiarFiltros()">Limpiar</button>'+
@@ -4610,7 +4686,7 @@ function soloMios(){
 }
 function limpiarFiltros(){
   ['crmq','fMin','fMax'].forEach(function(id){var e=document.getElementById(id);if(e)e.value='';});
-  ['fAsesor','fEstatus','fEFin','fAnio','fMes','fFact'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
+  ['fAsesor','fEstatus','fEFin','fAnio','fMes','fFact','fSeg'].forEach(function(id){var e=document.getElementById(id);if(e)e.selectedIndex=0;});
   renderCRM();
 }
 var CX_ID=null;
@@ -4719,13 +4795,18 @@ async function agregarColumnaCRM(){
   gestionColumnasCRM();
   toast('Columna agregada');
 }
-function exportarCRMCSV(){
-  var ord=layOrden(),cols=[];
-  ord.forEach(function(i){var x=CRM_LAY[i];if(x.k==='__acc')return;cols.push([x.k,x.t]);});
+async function exportarCRMCSV(){
+  var ord=layOrden(),cols=[],tiene={};
+  ord.forEach(function(i){var x=CRM_LAY[i];if(x.k==='__acc')return;cols.push([x.k,x.t]);tiene[x.k]=1;});
   if(!cols.length){toast('No hay columnas visibles');return;}
+  if(!tiene.notas_seguimiento)cols.push(['notas_seguimiento','NOTAS DEL ASESOR']);
+  if(!tiene.notas)cols.push(['notas','NOTAS GENERALES']);
+  cols.push(['__hist','HISTORIAL']);
+  var hist={};
+  try{var dh=await api('/api/clientes/historial');if(dh&&dh.ok){(dh.data||[]).forEach(function(n){var k=String(n.cliente_id);var lin=fmtFechaHora(n.created_at)+(n.usuario?(' · '+n.usuario):'')+': '+(n.nota||'');hist[k]=hist[k]?(hist[k]+' | '+lin):lin;});}}catch(e){}
   function esc(v){v=(v==null?'':String(v));return '"'+v.replace(/"/g,'""')+'"';}
   var lines=[cols.map(function(x){return esc(x[1]);}).join(',')];
-  filasCRMFiltradas().forEach(function(r){lines.push(cols.map(function(x){return esc(r[x[0]]);}).join(','));});
+  filasCRMFiltradas().forEach(function(r){lines.push(cols.map(function(x){return esc(x[0]==='__hist'?(hist[String(r.id)]||''):r[x[0]]);}).join(','));});
   var csv='\\ufeff'+lines.join('\\r\\n');
   var blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='CRM_ASLAN'+(crmPeriodoTxt()?('_'+(valFil('fAnio')||'todos')+(valFil('fMes')?('-'+valFil('fMes')):'')):'')+'.csv';document.body.appendChild(a);a.click();a.remove();
@@ -4822,7 +4903,7 @@ function fCatAsesores(){
 function fCatFinales(){
   var m={},o=[];
   function add(v){v=String(v==null?'':v).trim();if(v&&v.length<=25&&!m[v.toUpperCase()]){m[v.toUpperCase()]=1;o.push(v);}}
-  add('NV');
+  add('VIABLE');add('NV');
   ((FICHA.catalogos&&FICHA.catalogos.finales)||[]).forEach(add);
   (typeof CRM_ROWS!=='undefined'?(CRM_ROWS||[]):[]).forEach(function(r){add(r.estatus_final);});
   return o;
@@ -5463,7 +5544,7 @@ async function viewCotizaciones(c){
   d.data.forEach(function(r){
     var conv=(r.estado==='aceptada'&&!r.proyecto_folio)?' <button class="btn" style="padding:.3rem .6rem" onclick="convertirCot('+r.id+')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:.3rem"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Proyecto</button>':'';
     var proy=r.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+r.proyecto_folio+'</span>'):'—';
-    h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(r.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+r.id+',this.checked)"></td><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td><td>'+proy+'</td>'+
+    h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(r.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+r.id+',this.checked)"></td><td>'+(r.folio||'—')+'</td><td>'+(r.cliente||'—')+'</td><td>'+money(r.total)+(r.moneda==='USD'?' USD':'')+'</td><td>'+estadoCotSel(r.estado,r.id)+'</td><td>'+(r.vendedor||'—')+'</td><td>'+proy+'</td>'+
        '<td style="white-space:nowrap"><button class="btn sec" style="padding:.3rem .6rem" onclick="pdfCotizacion('+r.id+')">PDF</button> <button class="btn sec" style="padding:.3rem .6rem" onclick="editarCotizacion('+r.id+')">Editar</button> <button class="btn err" style="padding:.3rem .6rem" onclick="eliminarCot('+r.id+')">Eliminar</button>'+conv+'</td></tr>';
   });
   if(!d.data.length)h+='<tr><td colspan="8" class="muted">Sin cotizaciones. Crea la primera.</td></tr>';
@@ -5508,13 +5589,14 @@ async function formCotizacion(preselectId,ed){
   var vEntDir=ed?(ed.entrega_direccion||''):'';
   var vEntRef=ed?(ed.entrega_referencias||''):'';
   var vEntTel=ed?(ed.entrega_telefono||''):'';
+  var vMon=(ed&&ed.moneda&&String(ed.moneda).toUpperCase()==='USD')?'USD':'MXN';
   var h='<span class="back" onclick="volverCot()">‹ Volver</span>';
   h+='<div class="card" style="margin-top:.5rem">';
   h+='<div class="muted" style="font-size:.85rem;margin-bottom:.6rem">Asesor: <strong style="color:var(--gold)">'+escAttr(asesorNom)+'</strong></div>';
   h+='<label>Cliente</label><select id="cotCliente">'+cliOpts+'</select>';
   h+='<div style="overflow-x:auto;margin-top:1rem"><table><thead><tr><th>Material / Servicios</th><th>Descripción</th><th>Cant.</th><th>Unidad</th><th>P. Unit.</th><th>Desc%</th><th>Importe</th><th></th></tr></thead><tbody id="cotBody"></tbody></table></div>';
   h+='<button class="btn sec" style="margin-top:.6rem" onclick="agregarFila()">+ Agregar línea</button>';
-  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="'+vDescG+'" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+vIva+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="'+vVig+'"></div></div>';
+  h+='<div class="g2" style="margin-top:1rem;max-width:430px;margin-left:auto"><div><label>Descuento global %</label><input id="cotDescG" type="number" value="'+vDescG+'" oninput="recalcCot()"></div><div><label>IVA %</label><input id="cotIva" type="number" value="'+vIva+'" oninput="recalcCot()"></div><div><label>Vigencia (días)</label><input id="cotVig" type="number" value="'+vVig+'"></div><div><label>Moneda</label><select id="cotMoneda" onchange="recalcCot()"><option value="MXN"'+(vMon==='MXN'?' selected':'')+'>MXN (pesos)</option><option value="USD"'+(vMon==='USD'?' selected':'')+'>USD (dólares)</option></select></div></div>';
   h+='<div style="text-align:right;margin-top:1rem"><div>Subtotal: <strong id="cotSub">$0.00</strong></div><div>IVA: <strong id="cotIvaM">$0.00</strong></div><div style="font-size:1.3rem;color:var(--gold);margin-top:.3rem">TOTAL: <strong id="cotTotal">$0.00</strong></div></div>';
   h+='<h3 class="serif" style="color:var(--gold);font-size:1.05rem;margin-top:1.1rem">Datos de entrega</h3>';
   h+='<div class="g2"><div><label>Dirección de entrega</label><input id="cotEntDir" value="'+escAttr(vEntDir)+'"></div><div><label>Referencias</label><input id="cotEntRef" value="'+escAttr(vEntRef)+'"></div><div><label>Teléfono de entrega</label><input id="cotEntTel" value="'+escAttr(vEntTel)+'"></div></div>';
@@ -5586,9 +5668,10 @@ function recalcCot(){
   var dg=parseFloat(document.getElementById('cotDescG').value)||0;
   var iva=parseFloat(document.getElementById('cotIva').value)||0;
   var base=sub*(1-dg/100),ivaM=base*iva/100,total=base+ivaM;
-  document.getElementById('cotSub').textContent=money(sub);
-  document.getElementById('cotIvaM').textContent=money(ivaM);
-  document.getElementById('cotTotal').textContent=money(total);
+  var monS=(document.getElementById('cotMoneda')||{}).value||'MXN';
+  document.getElementById('cotSub').textContent=money(sub)+' '+monS;
+  document.getElementById('cotIvaM').textContent=money(ivaM)+' '+monS;
+  document.getElementById('cotTotal').textContent=money(total)+' '+monS;
 }
 function recogerLineas(){
   var items=[];
@@ -5608,6 +5691,7 @@ async function guardarCotizacion(){
     descuento_global_pct:document.getElementById('cotDescG').value,
     iva_pct:document.getElementById('cotIva').value,
     vigencia_dias:document.getElementById('cotVig').value,
+    moneda:(document.getElementById('cotMoneda')||{}).value||'MXN',
     notas:document.getElementById('cotNotas').value,
     entrega_direccion:document.getElementById('cotEntDir').value,
     entrega_referencias:document.getElementById('cotEntRef').value,
@@ -5662,6 +5746,7 @@ async function pdfCotizacion(id){
   doc.text('Folio: '+(c.folio||''),R,26,{align:'right'});
   doc.text('Fecha: '+hoy.toLocaleDateString('es-MX').split('/').join('-'),R,31,{align:'right'});
   doc.text('Vigencia: '+vig.toLocaleDateString('es-MX').split('/').join('-'),R,36,{align:'right'});
+  var monP=(c.moneda&&String(c.moneda).toUpperCase()==='USD')?'USD':'MXN';
   // Atiende: el asesor que genero la cotizacion (nombre, telefono y correo de su usuario)
   if(c.vendedor){
     doc.setFont(undefined,'bold');doc.text('Atiende: '+c.vendedor,R,41,{align:'right'});doc.setFont(undefined,'normal');
@@ -5689,7 +5774,7 @@ async function pdfCotizacion(id){
   var body=(c.items||[]).map(function(it,i){return [String(i+1),it.descripcion||'',String(it.cantidad||0),(it.unidad||'m2'),money(it.precio_unitario),money(it.subtotal_linea)];});
   doc.autoTable({
     startY:fy+24,
-    head:[['PARTIDA','MODELO','CANT.','UNIDAD','PRECIO UNITARIO','TOTAL']],
+    head:[['PARTIDA','MODELO','CANT.','UNIDAD','PRECIO UNITARIO ('+monP+')','TOTAL ('+monP+')']],
     body:body.length?body:[['','','','','','']],
     theme:'grid',
     headStyles:{fillColor:gold,textColor:255,fontSize:8.5,halign:'center'},
@@ -5706,8 +5791,9 @@ async function pdfCotizacion(id){
   tot('IVA ('+(c.iva_pct||16)+'%)',money(ivaM),false);
   doc.setDrawColor(gold[0],gold[1],gold[2]);doc.setLineWidth(0.3);doc.line(120,y-3.5,R,y-3.5);
   doc.setFontSize(11.5);doc.setTextColor(gold[0],gold[1],gold[2]);doc.setFont(undefined,'bold');
-  doc.text('TOTAL',150,y+1,{align:'right'});doc.text(money(c.total),R,y+1,{align:'right'});
+  doc.text('TOTAL '+monP,150,y+1,{align:'right'});doc.text(money(c.total),R,y+1,{align:'right'});
   doc.setFont(undefined,'normal');
+  if(monP==='USD'){doc.setFontSize(8);doc.setTextColor(90);doc.text('Importes expresados en dólares americanos (USD).',R,y+6,{align:'right'});y+=5;}
   // ----- CONDICIONES / NOTAS / Términos / Firmas (formato original ASLAN) -----
   var yb=Math.max(y+12,(doc.lastAutoTable?doc.lastAutoTable.finalY:90)+14);
   doc.setFontSize(9.5);doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('CONDICIONES',L,yb);
