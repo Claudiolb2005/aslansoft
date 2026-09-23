@@ -2597,7 +2597,7 @@ async function handleReportesCrm(request, env, payload, url) {
   const porOrigen = await grupo("COALESCE(NULLIF(TRIM(origen),''),'(sin origen)')", "origen", 30);
   const porMes = (await env.DB.prepare("SELECT COALESCE(substr(date(" + campo + "),1,7),'(sin fecha)') AS mes, " + AGG + " FROM clientes WHERE " + where + " GROUP BY 1 ORDER BY mes DESC LIMIT 36").bind(...args).all()).results || [];
   const LIMITE = 1000;
-  const SEL = "id, " + campo + " AS fecha, fecha_lead, origen, validacion, estatus_final, asesor, estatus_nota AS estatus, fecha_contacto, propuesta_factura, empresa, nombre, telefono, email, ciudad, material, tipo, acabado, formato, cantidad, moneda, COALESCE(propuesta_inicial,0) AS propuesta_inicial, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, notas_vero, notas_actualizacion, notas_seguimiento";
+  const SEL = "id, " + campo + " AS fecha, fecha_lead, origen, validacion, estatus_final, asesor, estatus_nota AS estatus, fecha_contacto, probabilidad_cierre AS propuesta_factura, empresa, nombre, telefono, email, ciudad, material, tipo, acabado, formato, cantidad, moneda, COALESCE(propuesta_inicial,0) AS propuesta_inicial, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, notas_vero, notas_actualizacion, notas_seguimiento";
   const filasRows = (await env.DB.prepare("SELECT " + SEL + " FROM clientes WHERE " + where + " ORDER BY COALESCE(propuesta_antes_iva,0) DESC, id DESC LIMIT " + (LIMITE + 1)).bind(...args).all()).results || [];
   const truncado = filasRows.length > LIMITE;
   const filas = truncado ? filasRows.slice(0, LIMITE) : filasRows;
@@ -3773,8 +3773,8 @@ function crmCellNombre(r,ex){
 }
 function celdaBloqueada(td){return !!(td&&td.dataset&&td.dataset.noed==='1');}
 // ---- Campos que NO se escriben a mano: solo se eligen de una lista ----
-var CRM_CAT={estatus_final:1,asesor:1,estatus_nota:1,validacion:1};
-var CRM_CAT_INLINE={estatus_final:1,estatus_nota:1,validacion:1};
+var CRM_CAT={estatus_final:1,asesor:1,estatus_nota:1,validacion:1,probabilidad_cierre:1};
+var CRM_CAT_INLINE={estatus_final:1,estatus_nota:1,validacion:1,probabilidad_cierre:1};
 var CAT_NOTA_DEF=['SEGUIMIENTO','SIN RESPUESTA','PRECIO','MATERIAL','PROVEEDOR','PRESUPUESTO','EXISTENCIA','TIEMPO DE ENTREGA','VISITA','CONTACTAR','STAND BY','OTRO'];
 var CAT_FINAL_DEF=['VIABLE','NV'];
 function catCFG(k){
@@ -3790,6 +3790,7 @@ function crmOpciones(campo,actual){
   if(campo==='estatus_nota')base=catCFG('cat_estatus_nota')||CAT_NOTA_DEF;
   else if(campo==='estatus_final')base=catCFG('cat_estatus_final')||CAT_FINAL_DEF;
   else if(campo==='validacion')base=['VIABLE','NV'];
+  else if(campo==='probabilidad_cierre')base=CAT_GESTION;
   else if(campo==='asesor')base=catCFG('cat_asesores')||[];
   var seen={},out=[],i,x;
   for(i=0;i<base.length;i++){x=String(base[i]==null?'':base[i]).trim();if(x&&!seen[x.toUpperCase()]){seen[x.toUpperCase()]=1;out.push(x);}}
@@ -4039,8 +4040,8 @@ function renderCRM(){
   pintarResumen(rows);
   if(CRM_VISTA==='tablero')pintarTableroCRM(rows);else pintarCRM(rows);
 }
-var CRM_TIT_DEF=['FECHA','ORIGEN','VALIDACIÓN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','F. CONTACTO','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','FORMATO','CANTIDAD','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
-var CRM_TIT_CAMPOS=['fecha_lead','origen','validacion','estatus_final','asesor','estatus_nota','fecha_contacto','propuesta_factura','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','formato','cantidad','propuesta_antes_iva','moneda','facturado'];
+var CRM_TIT_DEF=['FECHA','ORIGEN','ESTATUS FINAL','ASESOR','ESTATUS/NOTA','PROP/FACT','COMPAÑÍA','CONTACTO','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO','TELÉFONO','MAIL','MATERIAL','TIPO','ACABADO','FORMATO','CANTIDAD','PROP. S/IVA','MONEDA','FACTURADO','COTIZACIONES'];
+var CRM_TIT_CAMPOS=['fecha_lead','origen','estatus_final','asesor','estatus_nota','probabilidad_cierre','empresa','nombre','notas_vero','notas_actualizacion','notas_seguimiento','telefono','email','material','tipo','acabado','formato','cantidad','propuesta_antes_iva','moneda','facturado'];
 var CRM_KEYS=CRM_TIT_CAMPOS.concat(['__acc']);
 var CRM_WIDE={notas_vero:1,notas_actualizacion:1,notas_seguimiento:1};
 var CRM_NUM={propuesta_antes_iva:1,facturado:1};
@@ -4105,6 +4106,7 @@ function cargarTitulosCRM(){
         for(var j=0;j<L.length;j++){
           var e=L[j];
           if(!e||typeof e.k!=='string')continue;
+          if(e.k==='propuesta_factura')e.k='probabilidad_cierre';
           var b=mapa[e.k];
           if(!b||usado[e.k])continue;
           usado[e.k]=1;
