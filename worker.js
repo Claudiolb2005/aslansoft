@@ -944,7 +944,7 @@ async function handleClientes(request, env, payload, method, id) {
     const _bind = [];
     if (_sc) { _wh += " AND UPPER(TRIM(IFNULL(c.asesor,''))) IN (?,?)"; _bind.push(_sc.first, _sc.full); }
     const r = await env.DB.prepare(
-      "SELECT c.*, u.nombre AS empleado_nombre, (SELECT COUNT(*) FROM cotizaciones q WHERE q.cliente_id=c.id AND q.deleted_at IS NULL) AS num_cotizaciones FROM clientes c LEFT JOIN usuarios u ON u.id=c.empleado_asignado_id " + _wh + " ORDER BY c.id DESC"
+      "SELECT c.*, u.nombre AS empleado_nombre, (SELECT COUNT(*) FROM cotizaciones q WHERE q.cliente_id=c.id AND q.deleted_at IS NULL) AS num_cotizaciones, (SELECT GROUP_CONCAT(q.folio, ' + ') FROM cotizaciones q WHERE q.cliente_id=c.id AND q.propuesta_final=1 AND q.deleted_at IS NULL) AS cot_final FROM clientes c LEFT JOIN usuarios u ON u.id=c.empleado_asignado_id " + _wh + " ORDER BY c.id DESC"
     ).bind(..._bind).all();
     return ok(r.results || []);
   }
@@ -1216,7 +1216,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
   }
   if (method === "PUT" && id) {
     const b = await request.json().catch(() => ({}));
-    const cot = await env.DB.prepare("SELECT c.id, c.usuario_id, c.cliente_id, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
+    const cot = await env.DB.prepare("SELECT c.id, c.usuario_id, c.cliente_id, c.propuesta_final, cl.asesor AS _asesor FROM cotizaciones c LEFT JOIN clientes cl ON cl.id=c.cliente_id WHERE c.id=? AND c.deleted_at IS NULL").bind(id).first();
     if (!cot) return fail("Cotización no encontrada.", 404);
     const _scp = asesorScope(payload);
     if (_scp) { const _ap = (cot._asesor || "").trim().toUpperCase(); if (_ap !== _scp.first && _ap !== _scp.full) return fail("Sin acceso a esta cotización.", 403); }
@@ -1228,16 +1228,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
       // Si no queda ninguna marcada NO se borra el monto capturado a mano.
       let propNueva = null, marcadas = 0;
       if (cot.cliente_id) {
-        try {
-          const sm = await env.DB.prepare("SELECT COUNT(*) AS n, IFNULL(SUM(subtotal),0) AS s FROM cotizaciones WHERE cliente_id=? AND propuesta_final=1 AND deleted_at IS NULL").bind(cot.cliente_id).first();
-          marcadas = Number((sm && sm.n) || 0);
-          if (marcadas > 0) {
-            propNueva = +Number((sm && sm.s) || 0).toFixed(2);
-            await env.DB.prepare("UPDATE clientes SET propuesta_antes_iva=?, propuesta_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(propNueva, cot.cliente_id).run();
-            const np = await env.DB.prepare("SELECT COUNT(*) AS n FROM cliente_pagos WHERE cliente_id=? AND deleted_at IS NULL").bind(cot.cliente_id).first();
-            if (np && Number(np.n) > 0) await sincronizarSaldo(env, cot.cliente_id);
-          }
-        } catch (e) {}
+        try { const sp = await sincronizarPropFinal(env, cot.cliente_id); marcadas = sp.marcadas; propNueva = sp.prop; } catch (e) {}
       }
       await audit(env, payload.sub, "propuesta_final", "cotizaciones", id, { propuesta_final: pf, marcadas, propuesta_antes_iva: propNueva }, request);
       return ok({ id, propuesta_final: pf, marcadas, propuesta_antes_iva: propNueva });
@@ -1269,15 +1260,25 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
              ln.unidad || "m2", Number(ln.precio_unitario) || 0, Number(ln.descuento_linea_pct) || 0, ln.subtotal_linea).run();
     }
     await audit(env, payload.sub, "editar", "cotizaciones", id, { subtotal, total }, request);
-    return ok({ id, subtotal, total });
+    let propCli = null;
+    if (Number(cot.propuesta_final) === 1) {
+      try {
+        const nuevoCli = b.cliente_id ? Number(b.cliente_id) : Number(cot.cliente_id);
+        const sp = await sincronizarPropFinal(env, nuevoCli);
+        propCli = sp.prop;
+        if (cot.cliente_id && Number(cot.cliente_id) !== nuevoCli) await sincronizarPropFinal(env, cot.cliente_id);
+      } catch (e) {}
+    }
+    return ok({ id, subtotal, total, propuesta_antes_iva: propCli });
   }
   if (method === "DELETE" && id) {
-    const cotDel = await env.DB.prepare("SELECT id, usuario_id, folio FROM cotizaciones WHERE id=? AND deleted_at IS NULL").bind(id).first();
+    const cotDel = await env.DB.prepare("SELECT id, usuario_id, folio, cliente_id, propuesta_final FROM cotizaciones WHERE id=? AND deleted_at IS NULL").bind(id).first();
     if (!cotDel) return fail("Cotización no encontrada.", 404);
     const propia = Number(cotDel.usuario_id) === Number(payload.sub);
     if (!hasRole(payload, "admin", "gerente") && !propia) return fail("Solo puedes eliminar tus propias cotizaciones.", 403);
     await env.DB.prepare("UPDATE cotizaciones SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
     await audit(env, payload.sub, "eliminar", "cotizaciones", id, { folio: cotDel.folio }, request);
+    if (Number(cotDel.propuesta_final) === 1 && cotDel.cliente_id) { try { await sincronizarPropFinal(env, cotDel.cliente_id); } catch (e) {} }
     return ok({ id });
   }
   return fail("Método no soportado.", 405);
@@ -2135,6 +2136,21 @@ async function pagosResumen(env, clienteId) {
   };
 }
 // Deja clientes.saldo_actual alineado con el historico de pagos.
+// PROP. S/IVA del CRM = suma s/IVA de las cotizaciones marcadas FINAL del cliente.
+// Si no queda ninguna marcada NO se borra el monto capturado a mano.
+async function sincronizarPropFinal(env, clienteId) {
+  if (!clienteId) return { marcadas: 0, prop: null };
+  const sm = await env.DB.prepare("SELECT COUNT(*) AS n, IFNULL(SUM(subtotal),0) AS s FROM cotizaciones WHERE cliente_id=? AND propuesta_final=1 AND deleted_at IS NULL").bind(clienteId).first();
+  const marcadas = Number((sm && sm.n) || 0);
+  if (marcadas === 0) return { marcadas: 0, prop: null };
+  const prop = +Number((sm && sm.s) || 0).toFixed(2);
+  await env.DB.prepare("UPDATE clientes SET propuesta_antes_iva=?, propuesta_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(prop, clienteId).run();
+  try {
+    const np = await env.DB.prepare("SELECT COUNT(*) AS n FROM cliente_pagos WHERE cliente_id=? AND deleted_at IS NULL").bind(clienteId).first();
+    if (np && Number(np.n) > 0) await sincronizarSaldo(env, clienteId);
+  } catch (e) {}
+  return { marcadas, prop };
+}
 async function sincronizarSaldo(env, clienteId) {
   const res = await pagosResumen(env, clienteId);
   try { await env.DB.prepare("UPDATE clientes SET saldo_actual=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(res.saldo, clienteId).run(); } catch (e) {}
@@ -2597,7 +2613,7 @@ async function handleReportesCrm(request, env, payload, url) {
   const porOrigen = await grupo("COALESCE(NULLIF(TRIM(origen),''),'(sin origen)')", "origen", 30);
   const porMes = (await env.DB.prepare("SELECT COALESCE(substr(date(" + campo + "),1,7),'(sin fecha)') AS mes, " + AGG + " FROM clientes WHERE " + where + " GROUP BY 1 ORDER BY mes DESC LIMIT 36").bind(...args).all()).results || [];
   const LIMITE = 1000;
-  const SEL = "id, " + campo + " AS fecha, fecha_lead, origen, validacion, estatus_final, asesor, estatus_nota AS estatus, fecha_contacto, probabilidad_cierre AS propuesta_factura, empresa, nombre, telefono, email, ciudad, material, tipo, acabado, formato, cantidad, moneda, COALESCE(propuesta_inicial,0) AS propuesta_inicial, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, notas_vero, notas_actualizacion, notas_seguimiento";
+  const SEL = "id, " + campo + " AS fecha, fecha_lead, origen, validacion, estatus_final, asesor, estatus_nota AS estatus, fecha_contacto, probabilidad_cierre AS propuesta_factura, empresa, nombre, telefono, email, ciudad, material, tipo, acabado, formato, cantidad, moneda, COALESCE(propuesta_inicial,0) AS propuesta_inicial, COALESCE(propuesta_antes_iva,0) AS propuesta, COALESCE(facturado,0) AS facturado, notas_vero, notas_actualizacion, notas_seguimiento, (SELECT GROUP_CONCAT(q.folio, ' + ') FROM cotizaciones q WHERE q.cliente_id=clientes.id AND q.propuesta_final=1 AND q.deleted_at IS NULL) AS cot_final";
   const filasRows = (await env.DB.prepare("SELECT " + SEL + " FROM clientes WHERE " + where + " ORDER BY COALESCE(propuesta_antes_iva,0) DESC, id DESC LIMIT " + (LIMITE + 1)).bind(...args).all()).results || [];
   const truncado = filasRows.length > LIMITE;
   const filas = truncado ? filasRows.slice(0, LIMITE) : filasRows;
@@ -3423,8 +3439,8 @@ function exportarCrmCSV(){
   if(!REP_CRM){toast('Aplica los filtros primero');return;}
   var nl=String.fromCharCode(10),bom=String.fromCharCode(0xFEFF);
   function q(x){return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}
-  var cols=REP_DET_TIT.concat(['NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO']);
-  var cam=REP_DET_CAM.concat(['notas_vero','notas_actualizacion','notas_seguimiento']);
+  var cols=REP_DET_TIT.concat(['COT. ELEGIDA','NOTAS VERO','NOTAS ACTUALIZACIÓN','SEGUIMIENTO']);
+  var cam=REP_DET_CAM.concat(['cot_final','notas_vero','notas_actualizacion','notas_seguimiento']);
   var L=[cols.map(q).join(',')];
   REP_CRM.filas.forEach(function(x){L.push(cam.map(function(k){return q(x[k]);}).join(','));});
   var blob=new Blob([bom+L.join(nl)],{type:'text/csv;charset=utf-8'});
@@ -4477,7 +4493,7 @@ var PEND_CLIENTE=null;
 var CAT_MATERIAL=['MARMOL','GRANITO','CUARCITA','CALIZA','CUARZO','PIEDRA SINTERIZADA','ONIX','SEMIPRECIOSA','CANTERA','INSUMOS'];
 var CAT_SERVICIOS=[['FLETE','pza'],['MANIOBRA','pza'],['INSTALACIÓN','m2']];
 var CAT_FORMATO=['Plancha','Media plancha','Bloque','Loseta','Duela','Tira','Mosaico','Formato especial'];
-var CAT_ORIGEN=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
+var CAT_ORIGEN=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','En frío','Otro'];
 var CAT_GESTION=['COTIZACIÓN','FACTURA'];
 var CAT_TIPO_SEG=['LLAMADA','VISITA','MUESTRA'];
 var CAT_TIPO=['Nacional','Importado','Santo Tomás','Carrara','Calacatta','Crema Marfil','Negro Marquina','Negro Monterrey','Travertino Veracruz','Travertino Puebla','Travertino Fiorito','Taj Mahal','Cosmos','Tundra','Galarza','Alpina'];
@@ -4552,7 +4568,7 @@ function ncPick(n){
 function nuevoCliente(){
   var ases={};(CRM_ROWS||[]).forEach(function(r){var a=(r.asesor||'').trim();if(a)ases[a]=1;});
   var aopt='<option value="">— Asesor —</option>';Object.keys(ases).sort().forEach(function(a){aopt+='<option>'+escAttr(a)+'</option>';});
-  var origenes=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
+  var origenes=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','En frío','Otro'];
   var oopt='<option value="">— Origen —</option>';origenes.forEach(function(o){oopt+='<option>'+o+'</option>';});
   var eopt='<option value="">— Estatus —</option>';CRM_ESTATUS.forEach(function(s){eopt+='<option>'+escAttr(s)+'</option>';});
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.2rem">Nuevo registro</h3>'+
@@ -4716,7 +4732,7 @@ function cardexLead(ev,id){
   CX_ID=r.id;
   var ases={};CRM_ROWS.forEach(function(x){var a=(x.asesor||'').trim();if(a)ases[a]=1;});
   var lAse=Object.keys(ases).sort();
-  var lOri=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','Otro'];
+  var lOri=['WhatsApp','Llamada','Correo','Propio','Redes','Campaña','Oficina','En frío','Otro'];
   var sub=[];
   if(r.fecha_lead)sub.push('Lead '+fFecha(r.fecha_lead));
   if(r.estatus_final)sub.push('Final: '+r.estatus_final);
@@ -4803,6 +4819,7 @@ async function exportarCRMCSV(){
   if(!cols.length){toast('No hay columnas visibles');return;}
   if(!tiene.notas_seguimiento)cols.push(['notas_seguimiento','NOTAS DEL ASESOR']);
   if(!tiene.notas)cols.push(['notas','NOTAS GENERALES']);
+  cols.push(['cot_final','COT. ELEGIDA']);
   cols.push(['__hist','HISTORIAL']);
   var hist={};
   try{var dh=await api('/api/clientes/historial');if(dh&&dh.ok){(dh.data||[]).forEach(function(n){var k=String(n.cliente_id);var lin=fmtFechaHora(n.created_at)+(n.usuario?(' · '+n.usuario):'')+': '+(n.nota||'');hist[k]=hist[k]?(hist[k]+' | '+lin):lin;});}}catch(e){}
@@ -5005,9 +5022,9 @@ function renderFicha(){
   var cots=FICHA.cotizaciones||[];
   h+='<div class="fsec"><h3>Cotizaciones y documentos</h3>';
   if(!cots.length){ h+='<p class="muted" style="font-size:.83rem">Sin cotizaciones ligadas a este cliente.</p>'; }
-  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th title="Marca las cotizaciones que si forman la propuesta final">FINAL</th><th>Folio</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>PDF</th></tr></thead><tbody>';
+  else { h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th title="Marca las cotizaciones que si forman la propuesta final">FINAL</th><th>Folio</th><th>S/IVA</th><th>Total</th><th>Estado</th><th>Vendedor</th><th>Proyecto</th><th>PDF</th></tr></thead><tbody>';
     cots.forEach(function(q){ var proy=q.proyecto_folio?('<span class="pill" style="background:var(--ok)">'+q.proyecto_folio+'</span>'):'—';
-      h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(q.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+q.id+',this.checked)"></td><td>'+(q.folio||'—')+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
+      h+='<tr><td style="text-align:center"><input type="checkbox"'+(Number(q.propuesta_final)?' checked':'')+' onchange="marcarCotFinal('+q.id+',this.checked)"></td><td>'+(q.folio||'—')+'</td><td>'+money(q.subtotal)+'</td><td>'+money(q.total)+'</td><td>'+estadoPill(q.estado)+'</td><td>'+escAttr(q.vendedor||'—')+'</td><td>'+proy+'</td><td><button class="btn sec" style="padding:.2rem .5rem" onclick="pdfCotizacion('+q.id+')">PDF</button></td></tr>'; });
     h+='</tbody></table></div>'; }
   h+='<div id="fCotFinal">'+cotFinalHtml()+'</div>';
   h+='</div>';
