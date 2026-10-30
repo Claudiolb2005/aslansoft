@@ -5818,29 +5818,37 @@ async function pdfCotizacion(id){
   doc.setFontSize(9.5);doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('CONDICIONES',L,yb);
   doc.setFont(undefined,'normal');doc.setFontSize(8.5);
   var cx1=L+28,cx2=L+152,cxm=(cx1+cx2)/2;
+  // Si el bloque ya no cabe en la hoja, sigue en una nueva
+  function espacio(yy,alto){if(yy+alto>285){doc.addPage();return 20;}return yy;}
+  // El valor largo baja de renglon dentro del ancho de la linea; regresa el "y" del siguiente renglon
   function condLinea(et,val,yy){
+    var ls=val?doc.splitTextToSize(String(val),cx2-cx1):[];
+    yy=espacio(yy,(ls.length||1)*4+2);
     doc.setTextColor(40);doc.text(et,L,yy);
     doc.setTextColor(60);
-    if(val)doc.text(String(val),cxm,yy,{align:'center'});
-    doc.setDrawColor(80);doc.setLineWidth(0.3);doc.line(cx1,yy+1.3,cx2,yy+1.3);
+    if(ls.length)doc.text(ls,cxm,yy,{align:'center'});
+    var yl=yy+(ls.length>1?(ls.length-1)*4:0)+1.3;
+    doc.setDrawColor(80);doc.setLineWidth(0.3);doc.line(cx1,yl,cx2,yl);
+    return yl+4.7;
   }
   var legacyCond=(!c.cond_pago&&!c.cond_entrega&&!c.cond_no_incluye&&c.condiciones);
   if(legacyCond){
     doc.setTextColor(60);var cc=doc.splitTextToSize(String(c.condiciones),W);doc.text(cc,L,yb+6);yb=yb+6+cc.length*4;
   }else{
-    condLinea('Pago:',c.cond_pago||'',yb+7);
-    condLinea('Entrega',c.cond_entrega||'',yb+13);
-    condLinea('No incluye',c.cond_no_incluye||'',yb+19);
-    yb=yb+23;
+    var ycl=condLinea('Pago:',c.cond_pago||'',yb+7);
+    ycl=condLinea('Entrega',c.cond_entrega||'',ycl);
+    ycl=condLinea('No incluye',c.cond_no_incluye||'',ycl);
+    yb=ycl-2;
   }
   var yn=yb+7;
+  var nn=c.notas?doc.splitTextToSize(String(c.notas),118):[];
+  yn=espacio(yn,(nn.length||1)*4+2);
   doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('NOTAS:',L,yn);
   doc.setFont(undefined,'normal');doc.setTextColor(60);
-  var nn=c.notas?doc.splitTextToSize(String(c.notas),118):[];
   if(nn.length)doc.text(nn,cxm,yn,{align:'center'});
   var ynEnd=yn+(nn.length?(nn.length-1)*4:0)+1.5;
   doc.setDrawColor(80);doc.setLineWidth(0.3);doc.line(cx1,ynEnd,cx2,ynEnd);
-  yb=ynEnd+5;
+  yb=espacio(ynEnd+5,40);
   doc.setFontSize(8);doc.setTextColor(40);doc.setFont(undefined,'bold');doc.text('Términos y condiciones:',L,yb+5);
   doc.text('Una vez depositado el anticipo no hay cambios ni cancelaciones',L,yb+9.5);
   doc.setFont(undefined,'normal');doc.setTextColor(90);
