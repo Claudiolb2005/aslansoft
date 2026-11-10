@@ -163,6 +163,89 @@ function hasRole(payload, ...roles) {
 }
 
 // ---------------------------------------------------------------------------
+//  PERMISOS POR USUARIO
+//  usuarios.permisos = NULL -> comportamiento estandar del rol (legado).
+//  usuarios.permisos = JSON -> permisos personalizados por modulo y accion
+//  { mods: { clientes: { ver, editar, eliminar, columnas }, ... }, alcance }
+//  alcance: "propios" (solo su cartera, campo clientes.asesor) | "todos".
+//  El rol admin siempre tiene acceso total.
+// ---------------------------------------------------------------------------
+const PERM_MODULOS = [
+  { id: "dashboard", acciones: ["ver"] },
+  { id: "alertas", acciones: ["ver"] },
+  { id: "clientes", acciones: ["ver", "editar", "eliminar", "columnas"] },
+  { id: "cotizaciones", acciones: ["ver", "editar", "eliminar"] },
+  { id: "inventario", acciones: ["ver", "editar", "eliminar"] },
+  { id: "proyectos", acciones: ["ver", "editar"] },
+  { id: "cortes", acciones: ["ver", "editar", "eliminar"] },
+  { id: "trazabilidad", acciones: ["ver"] },
+  { id: "empleados", acciones: ["ver", "editar"] },
+  { id: "whatsapp", acciones: ["ver", "editar"] },
+  { id: "reportes", acciones: ["ver"] },
+  { id: "config", acciones: ["ver", "editar"] },
+];
+function normalizarPermisos(raw) {
+  let o = raw;
+  if (typeof o === "string") { try { o = JSON.parse(o); } catch (e) { return null; } }
+  if (!o || typeof o !== "object") return null;
+  const src = (o.mods && typeof o.mods === "object") ? o.mods : {};
+  const mods = {};
+  for (const m of PERM_MODULOS) {
+    const s = (src[m.id] && typeof src[m.id] === "object") ? src[m.id] : {};
+    const r = {};
+    for (const a of m.acciones) r[a] = !!s[a];
+    if (r.editar || r.eliminar || r.columnas) r.ver = true;
+    mods[m.id] = r;
+  }
+  return { mods, alcance: o.alcance === "todos" ? "todos" : "propios" };
+}
+function plantillaPermisos(tipo) {
+  const mods = {};
+  if (tipo === "gerente") {
+    for (const m of PERM_MODULOS) { mods[m.id] = {}; for (const a of m.acciones) mods[m.id][a] = true; }
+    mods.config = { ver: true, editar: false };
+    return normalizarPermisos({ mods, alcance: "todos" });
+  }
+  return normalizarPermisos({
+    mods: {
+      dashboard: { ver: true }, alertas: { ver: true }, clientes: { ver: true, editar: true },
+      cotizaciones: { ver: true, editar: true }, inventario: { ver: true }, proyectos: { ver: true, editar: true },
+      whatsapp: { ver: true, editar: true }, config: { ver: true },
+    },
+    alcance: "propios",
+  });
+}
+// Verifica un permiso. Usuarios sin permisos personalizados usan su rol (rolesLegado).
+function permite(payload, modulo, accion, ...rolesLegado) {
+  if (!payload) return false;
+  if (payload.rol === "admin") return true;
+  if (payload._perm) { const m = payload._perm.mods[modulo]; return !!(m && m[accion]); }
+  return rolesLegado.includes(payload.rol);
+}
+// Puerta general por ruta (solo para usuarios con permisos personalizados).
+// Devuelve una lista de [modulo, accion]; basta con cumplir una.
+function permisoRuta(path, method) {
+  const lee = method === "GET";
+  const v = (mods) => mods.map((m) => [m, "ver"]);
+  const e = (mods) => mods.map((m) => [m, "editar"]);
+  if (path.startsWith("/api/dashboard/")) return v(["dashboard"]);
+  if (path.startsWith("/api/clientes")) return lee ? v(["clientes", "alertas", "cotizaciones", "proyectos"]) : e(["clientes"]);
+  if (path.startsWith("/api/cotizaciones")) return lee ? v(["cotizaciones", "clientes", "proyectos", "cortes"]) : e(["cotizaciones"]);
+  if (path.startsWith("/api/productos") || path === "/api/movimientos" || path.startsWith("/api/proveedores")) return lee ? v(["inventario", "cotizaciones", "cortes", "proyectos"]) : e(["inventario"]);
+  if (path.startsWith("/api/admin/proyectos")) return lee ? v(["proyectos"]) : e(["proyectos"]);
+  if (path.startsWith("/api/proyectos")) return lee ? v(["proyectos", "clientes", "cortes"]) : e(["proyectos"]);
+  if (path.startsWith("/api/cortes")) return lee ? v(["cortes", "trazabilidad"]) : e(["cortes"]);
+  if (path === "/api/trazabilidad") return v(["trazabilidad"]);
+  if (path === "/api/empleados") return lee ? v(["empleados", "cortes", "proyectos"]) : e(["empleados"]);
+  if (path.startsWith("/api/empleados/") || path.startsWith("/api/geofencing") || path === "/api/checkins") return lee ? v(["empleados"]) : e(["empleados"]);
+  if (path.startsWith("/api/whatsapp")) return lee ? v(["whatsapp"]) : e(["whatsapp"]);
+  if (path.startsWith("/api/reportes")) return v(["reportes"]);
+  if (path === "/api/crm/columnas") return [["clientes", "columnas"]];
+  if (path === "/api/config") return lee ? null : [["config", "editar"], ["clientes", "columnas"]];
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 //  AUDITORÍA
 // ---------------------------------------------------------------------------
 async function audit(env, usuarioId, accion, modulo, registroId, datos, request) {
@@ -191,6 +274,7 @@ CREATE TABLE IF NOT EXISTS usuarios (
   cargo TEXT, area TEXT, telefono TEXT, foto_url TEXT,
   activo INTEGER NOT NULL DEFAULT 1,
   password_debe_cambiar INTEGER NOT NULL DEFAULT 0,
+  permisos TEXT,
   ultimo_acceso DATETIME,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -588,6 +672,23 @@ async function migrarV11(env) {
   MIGRADO_V11 = true;
 }
 
+let MIGRADO_V13 = false;
+async function migrarV13(env) {
+  if (MIGRADO_V13) return;
+  try {
+    const f = await env.DB.prepare("SELECT valor FROM app_config WHERE clave='schema_v13_permisos'").first();
+    if (f && f.valor === "ok") { MIGRADO_V13 = true; return; }
+  } catch (e) { return; }
+  try {
+    const c = await env.DB.prepare("SELECT name FROM pragma_table_info('usuarios') WHERE name='permisos'").first();
+    if (!c) await env.DB.prepare("ALTER TABLE usuarios ADD COLUMN permisos TEXT").run();
+    const c2 = await env.DB.prepare("SELECT name FROM pragma_table_info('usuarios') WHERE name='permisos'").first();
+    if (!c2) return;
+  } catch (e) { return; }
+  try { await env.DB.prepare("INSERT INTO app_config (clave,valor) VALUES ('schema_v13_permisos','ok') ON CONFLICT(clave) DO UPDATE SET valor='ok'").run(); } catch (e) {}
+  MIGRADO_V13 = true;
+}
+
 let MIGRADO_V12 = false;
 async function migrarV12(env) {
   if (MIGRADO_V12) return;
@@ -841,6 +942,7 @@ async function handleLogin(request, env) {
     token,
     usuario: {
       id: u.id, nombre: u.nombre, email: u.email, rol: u.rol, cargo: u.cargo,
+      permisos: (u.rol !== "admin" && u.permisos) ? normalizarPermisos(u.permisos) : null,
       debe_cambiar: !!u.password_debe_cambiar,
       destino: esCliente ? "portal" : "interno",
     },
@@ -926,7 +1028,9 @@ async function dashboardCharts(env, payload) {
 // Alcance de asesor: admin/gerente ven todo (null). Empleado solo ve SUS leads
 // (match por el campo de texto "asesor" contra su nombre/primer nombre).
 function asesorScope(payload) {
-  if (!payload || payload.rol !== "empleado") return null;
+  if (!payload || payload.rol === "admin") return null;
+  if (payload._perm) { if (payload._perm.alcance === "todos") return null; }
+  else if (payload.rol !== "empleado") return null;
   var full = (payload.nombre || "").trim();
   var first = full.split(/\s+/)[0] || "";
   return { full: full.toUpperCase(), first: first.toUpperCase() };
@@ -958,7 +1062,7 @@ async function handleClientes(request, env, payload, method, id) {
   if (method === "POST") {
     const b = await request.json().catch(() => ({}));
     if (!b.nombre) return fail("El nombre es obligatorio.");
-    if (payload && payload.rol === "empleado") b.asesor = (payload.nombre || "").trim().split(/\s+/)[0];
+    if (asesorScope(payload)) b.asesor = (payload.nombre || "").trim().split(/\s+/)[0];
     if (!b.force) {
       const dcond = [], dbind = [];
       const dnom = (b.nombre || "").trim();
@@ -1000,7 +1104,7 @@ async function handleClientes(request, env, payload, method, id) {
     return ok({ id });
   }
   if (method === "DELETE" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    if (!permite(payload, "clientes", "eliminar", "admin", "gerente")) return fail("Sin permiso.", 403);
     await env.DB.prepare("UPDATE clientes SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
     await audit(env, payload.sub, "eliminar", "clientes", id, null, request);
     return ok({ id });
@@ -1275,7 +1379,7 @@ async function handleCotizaciones(request, env, payload, method, id, url) {
     const cotDel = await env.DB.prepare("SELECT id, usuario_id, folio, cliente_id, propuesta_final FROM cotizaciones WHERE id=? AND deleted_at IS NULL").bind(id).first();
     if (!cotDel) return fail("Cotización no encontrada.", 404);
     const propia = Number(cotDel.usuario_id) === Number(payload.sub);
-    if (!hasRole(payload, "admin", "gerente") && !propia) return fail("Solo puedes eliminar tus propias cotizaciones.", 403);
+    if (!permite(payload, "cotizaciones", "eliminar", "admin", "gerente") && !propia) return fail("Solo puedes eliminar tus propias cotizaciones.", 403);
     await env.DB.prepare("UPDATE cotizaciones SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
     await audit(env, payload.sub, "eliminar", "cotizaciones", id, { folio: cotDel.folio }, request);
     if (Number(cotDel.propuesta_final) === 1 && cotDel.cliente_id) { try { await sincronizarPropFinal(env, cotDel.cliente_id); } catch (e) {} }
@@ -1317,7 +1421,7 @@ async function handleProductos(request, env, payload, method, id) {
     return ok(r.results || []);
   }
   if (method === "POST") {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente da de alta productos.", 403);
+    if (!permite(payload, "inventario", "editar", "admin", "gerente")) return fail("No tienes permiso para dar de alta productos.", 403);
     const b = await request.json().catch(() => ({}));
     if (!b.nombre) return fail("El nombre es obligatorio.");
     const sku = b.sku || await siguienteSku(env, b.categoria);
@@ -1330,7 +1434,7 @@ async function handleProductos(request, env, payload, method, id) {
     return ok({ id: res.meta.last_row_id, sku });
   }
   if (method === "PUT" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente edita productos.", 403);
+    if (!permite(payload, "inventario", "editar", "admin", "gerente")) return fail("No tienes permiso para editar productos.", 403);
     const b = await request.json().catch(() => ({}));
     const campos = ["sku", "nombre", "categoria", "acabado", "dimensiones", "procedencia", "stock_actual", "stock_minimo", "unidad", "ubicacion_almacen", "precio_costo", "precio_venta", "notas_tecnicas", "estado"];
     const sets = [], vals = [];
@@ -1342,7 +1446,7 @@ async function handleProductos(request, env, payload, method, id) {
     return ok({ id });
   }
   if (method === "DELETE" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    if (!permite(payload, "inventario", "eliminar", "admin", "gerente")) return fail("Sin permiso.", 403);
     await env.DB.prepare("UPDATE productos SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(id).run();
     return ok({ id });
   }
@@ -1418,7 +1522,8 @@ async function movimientosGlobal(env, url) {
 //  Inventario(material) → Corte → Cotización → Cliente → Asesor/Cortador
 // ============================================================================
 async function handleCortes(request, env, payload, method, id, url) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  const _accC = method === "GET" ? "ver" : (method === "DELETE" ? "eliminar" : "editar");
+  if (!permite(payload, "cortes", _accC, "admin", "gerente") && !(method === "GET" && permite(payload, "trazabilidad", "ver"))) return fail("No tienes permiso en Cortes.", 403);
   const SEL = "SELECT c.*, p.nombre AS material, p.sku AS material_sku, p.unidad AS material_unidad, p.stock_actual AS material_stock," +
     " co.folio AS cotizacion_folio, pr.folio AS proyecto_folio," +
     " cl.nombre AS cliente, cl.empresa AS cliente_empresa, cl.asesor AS asesor," +
@@ -1530,7 +1635,7 @@ async function handleProveedores(request, env, payload, method, id) {
     return ok(r.results || []);
   }
   if (method === "POST") {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    if (!permite(payload, "inventario", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
     const b = await request.json().catch(() => ({}));
     if (!b.nombre) return fail("El nombre es obligatorio.");
     const res = await env.DB.prepare(
@@ -1539,7 +1644,7 @@ async function handleProveedores(request, env, payload, method, id) {
     return ok({ id: res.meta.last_row_id });
   }
   if (method === "PUT" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    if (!permite(payload, "inventario", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
     const b = await request.json().catch(() => ({}));
     const campos = ["nombre", "pais", "contacto", "telefono", "email", "tiempo_entrega_dias", "notas", "activo"];
     const sets = [], vals = [];
@@ -1550,7 +1655,7 @@ async function handleProveedores(request, env, payload, method, id) {
     return ok({ id });
   }
   if (method === "DELETE" && id) {
-    if (!hasRole(payload, "admin")) return fail("Solo admin elimina proveedores.", 403);
+    if (!permite(payload, "inventario", "eliminar", "admin")) return fail("No tienes permiso para eliminar proveedores.", 403);
     await env.DB.prepare("DELETE FROM proveedores WHERE id=?").bind(id).run();
     return ok({ id });
   }
@@ -1681,7 +1786,7 @@ async function notifCliente(env, proyectoId, clienteId, tipo, titulo, mensaje) {
 }
 
 async function handleAdminPortal(request, env, payload, id, accion, method) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia gestiona el portal.", 403);
+  if (!permite(payload, "proyectos", "editar", "admin", "gerente")) return fail("No tienes permiso para gestionar el portal.", 403);
   const proy = await env.DB.prepare("SELECT * FROM proyectos WHERE id=? AND deleted_at IS NULL").bind(id).first();
   if (!proy) return fail("Proyecto no encontrado.", 404);
 
@@ -1829,9 +1934,9 @@ async function geocercaActiva(env) {
 
 async function handleEmpleados(request, env, payload, method, id) {
   if (method === "GET" && !id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+    if (!(permite(payload, "empleados", "ver", "admin", "gerente") || permite(payload, "cortes", "ver") || permite(payload, "proyectos", "editar"))) return fail("Sin permiso.", 403);
     const r = await env.DB.prepare(
-      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,ep.consentimiento_gps," +
+      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,(u.permisos IS NOT NULL) AS personalizado,ep.consentimiento_gps," +
       " (SELECT g.created_at FROM gps_checkins g WHERE g.usuario_id=u.id ORDER BY g.created_at DESC, g.id DESC LIMIT 1) AS ultimo_checkin," +
       " (SELECT g.tipo FROM gps_checkins g WHERE g.usuario_id=u.id ORDER BY g.created_at DESC, g.id DESC LIMIT 1) AS ultimo_tipo" +
       " FROM usuarios u LEFT JOIN empleados_perfil ep ON ep.usuario_id=u.id" +
@@ -1841,13 +1946,14 @@ async function handleEmpleados(request, env, payload, method, id) {
     return ok(r.results || []);
   }
   if (method === "GET" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+    if (!permite(payload, "empleados", "ver", "admin", "gerente")) return fail("Sin permiso.", 403);
     const e = await env.DB.prepare(
-      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,u.ultimo_acceso," +
+      "SELECT u.id,u.nombre,u.email,u.rol,u.cargo,u.area,u.telefono,u.activo,u.ultimo_acceso,u.permisos," +
       " ep.curp,ep.rfc,ep.fecha_nacimiento,ep.fecha_ingreso,ep.salario,ep.tipo_contrato,ep.consentimiento_gps" +
       " FROM usuarios u LEFT JOIN empleados_perfil ep ON ep.usuario_id=u.id WHERE u.id=? AND u.deleted_at IS NULL"
     ).bind(id).first();
     if (!e) return fail("Empleado no encontrado.", 404);
+    e.permisos = (e.rol !== "admin" && e.permisos) ? normalizarPermisos(e.permisos) : null;
     const ch = await env.DB.prepare(
       "SELECT id,tipo,lat,lon,precision_metros,created_at FROM gps_checkins WHERE usuario_id=? ORDER BY created_at DESC, id DESC LIMIT 30"
     ).bind(id).all();
@@ -1859,35 +1965,52 @@ async function handleEmpleados(request, env, payload, method, id) {
     if (!b.nombre || !b.email) return fail("Nombre y correo son obligatorios.");
     const existe = await env.DB.prepare("SELECT id, deleted_at FROM usuarios WHERE email=?").bind(b.email).first();
     if (existe && !existe.deleted_at) return fail("Ya existe un usuario con ese correo.");
-    const rol = (b.rol === "gerente" || b.rol === "empleado") ? b.rol : "empleado";
+    const rol = (b.rol === "admin" || b.rol === "gerente" || b.rol === "empleado") ? b.rol : "empleado";
+    const permJson = rol === "admin" ? null : JSON.stringify(normalizarPermisos(b.permisos) || plantillaPermisos(rol === "gerente" ? "gerente" : "asesor"));
     const pw = passwordTemporal();
     const ph = await hashPassword(pw);
     if (existe && existe.deleted_at) {
       const uid = existe.id;
       await env.DB.prepare(
-        "UPDATE usuarios SET nombre=?, password_hash=?, rol=?, cargo=?, area=?, telefono=?, activo=1, password_debe_cambiar=1, deleted_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
-      ).bind(b.nombre, ph, rol, b.cargo || null, b.area || null, b.telefono || null, uid).run();
+        "UPDATE usuarios SET nombre=?, password_hash=?, rol=?, permisos=?, cargo=?, area=?, telefono=?, activo=1, password_debe_cambiar=1, deleted_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+      ).bind(b.nombre, ph, rol, permJson, b.cargo || null, b.area || null, b.telefono || null, uid).run();
       await env.DB.prepare("INSERT OR IGNORE INTO empleados_perfil (usuario_id) VALUES (?)").bind(uid).run();
       await env.DB.prepare(
         "UPDATE empleados_perfil SET curp=?, rfc=?, fecha_ingreso=?, salario=?, tipo_contrato=?, consentimiento_gps=?, updated_at=CURRENT_TIMESTAMP WHERE usuario_id=?"
       ).bind(b.curp || null, b.rfc || null, b.fecha_ingreso || null, (b.salario != null && b.salario !== "") ? Number(b.salario) : null, b.tipo_contrato || null, b.consentimiento_gps ? 1 : 0, uid).run();
-      await audit(env, payload.sub, "reactivar", "empleados", uid, { email: b.email, rol }, request);
+      await audit(env, payload.sub, "reactivar", "empleados", uid, { email: b.email, rol, permisos: permJson }, request);
       return ok({ id: uid, email: b.email, password_temporal: pw, reactivado: true });
     }
     const res = await env.DB.prepare(
-      "INSERT INTO usuarios (nombre,email,password_hash,rol,cargo,area,telefono,password_debe_cambiar) VALUES (?,?,?,?,?,?,?,1)"
-    ).bind(b.nombre, b.email, ph, rol, b.cargo || null, b.area || null, b.telefono || null).run();
+      "INSERT INTO usuarios (nombre,email,password_hash,rol,permisos,cargo,area,telefono,password_debe_cambiar) VALUES (?,?,?,?,?,?,?,?,1)"
+    ).bind(b.nombre, b.email, ph, rol, permJson, b.cargo || null, b.area || null, b.telefono || null).run();
     const uid = res.meta.last_row_id;
     await env.DB.prepare(
       "INSERT INTO empleados_perfil (usuario_id,curp,rfc,fecha_ingreso,salario,tipo_contrato,consentimiento_gps) VALUES (?,?,?,?,?,?,?)"
     ).bind(uid, b.curp || null, b.rfc || null, b.fecha_ingreso || null, (b.salario != null && b.salario !== "") ? Number(b.salario) : null, b.tipo_contrato || null, b.consentimiento_gps ? 1 : 0).run();
-    await audit(env, payload.sub, "crear", "empleados", uid, { email: b.email, rol }, request);
+    await audit(env, payload.sub, "crear", "empleados", uid, { email: b.email, rol, permisos: permJson }, request);
     return ok({ id: uid, email: b.email, password_temporal: pw });
   }
   if (method === "PUT" && id) {
-    if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+    if (!permite(payload, "empleados", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
     const b = await request.json().catch(() => ({}));
-    const camposU = ["nombre", "cargo", "area", "telefono", "activo", "rol"];
+    const _esAdmin = hasRole(payload, "admin");
+    if (("rol" in b || "permisos" in b) && !_esAdmin) return fail("Solo administración cambia roles y permisos.", 403);
+    if (!_esAdmin && "activo" in b) return fail("Solo administración activa o desactiva usuarios.", 403);
+    if ("rol" in b) {
+      if (!["admin", "gerente", "empleado"].includes(b.rol)) return fail("Rol inválido.");
+      if (String(payload.sub) === String(id) && b.rol !== "admin") return fail("No puedes quitarte el rol de administrador.");
+    }
+    if (String(payload.sub) === String(id) && "activo" in b && !b.activo) return fail("No puedes desactivar tu propia cuenta.");
+    if ("permisos" in b) {
+      const _rolFinal = ("rol" in b) ? b.rol : ((await env.DB.prepare("SELECT rol FROM usuarios WHERE id=?").bind(id).first()) || {}).rol;
+      const _pn = (b.permisos === null || _rolFinal === "admin") ? null : normalizarPermisos(b.permisos);
+      if (b.permisos !== null && _rolFinal !== "admin" && !_pn) return fail("Permisos inválidos.");
+      b.permisos = _pn ? JSON.stringify(_pn) : null;
+    } else if ("rol" in b && b.rol === "admin") {
+      b.permisos = null;
+    }
+    const camposU = ["nombre", "cargo", "area", "telefono", "activo", "rol", "permisos"];
     const setsU = [], valsU = [];
     for (const c of camposU) if (c in b) { setsU.push(c + "=?"); valsU.push(c === "activo" ? (b[c] ? 1 : 0) : b[c]); }
     if (setsU.length) { valsU.push(id); await env.DB.prepare("UPDATE usuarios SET " + setsU.join(",") + ", updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(...valsU).run(); }
@@ -1947,7 +2070,7 @@ async function checkinEstado(env, payload) {
 }
 
 async function checkinsRecientes(env, payload) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  if (!permite(payload, "empleados", "ver", "admin", "gerente")) return fail("Sin permiso.", 403);
   const r = await env.DB.prepare(
     "SELECT g.id,g.usuario_id,g.tipo,g.lat,g.lon,g.precision_metros,g.created_at,u.nombre" +
     " FROM gps_checkins g LEFT JOIN usuarios u ON u.id=g.usuario_id" +
@@ -1957,7 +2080,7 @@ async function checkinsRecientes(env, payload) {
 }
 
 async function handleGeofencing(request, env, payload, method) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  if (!permite(payload, "empleados", method === "GET" ? "ver" : "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
   if (method === "GET") {
     const g = await geocercaActiva(env);
     return ok(g || null);
@@ -1982,7 +2105,7 @@ async function handleGeofencing(request, env, payload, method) {
 }
 
 async function alertasGeofencing(env, payload) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  if (!permite(payload, "empleados", "ver", "admin", "gerente")) return fail("Sin permiso.", 403);
   const r = await env.DB.prepare(
     "SELECT a.id,a.usuario_id,a.lat,a.lon,a.distancia_metros,a.revisada,a.created_at,u.nombre" +
     " FROM geofencing_alertas a LEFT JOIN usuarios u ON u.id=a.usuario_id" +
@@ -1992,7 +2115,7 @@ async function alertasGeofencing(env, payload) {
 }
 
 async function revisarAlerta(request, env, payload, id) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo admin o gerente.", 403);
+  if (!permite(payload, "empleados", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
   await env.DB.prepare("UPDATE geofencing_alertas SET revisada=1 WHERE id=?").bind(id).run();
   return ok({ id });
 }
@@ -2005,7 +2128,7 @@ async function fotoUrl(fotoId, secret) {
   return "/media/foto/" + fotoId + "?k=" + tk;
 }
 async function listarFotosProyecto(env, payload, proyectoId) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  if (!permite(payload, "proyectos", "ver", "admin", "gerente")) return fail("Sin permiso.", 403);
   const r = await env.DB.prepare("SELECT id,etapa,descripcion,created_at FROM proyecto_fotos WHERE proyecto_id=? ORDER BY created_at DESC, id DESC").bind(proyectoId).all();
   const secret = env.JWT_SECRET || "DEV_INSECURE_SECRET_CHANGE_ME";
   const out = [];
@@ -2013,7 +2136,7 @@ async function listarFotosProyecto(env, payload, proyectoId) {
   return ok(out);
 }
 async function subirFotoProyecto(request, env, payload, proyectoId) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  if (!permite(payload, "proyectos", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
   if (!env.FILES) return fail("Almacenamiento de fotos no configurado (falta el binding R2 'FILES').", 500);
   const proy = await env.DB.prepare("SELECT id FROM proyectos WHERE id=? AND deleted_at IS NULL").bind(proyectoId).first();
   if (!proy) return fail("Proyecto no encontrado.", 404);
@@ -2033,7 +2156,7 @@ async function subirFotoProyecto(request, env, payload, proyectoId) {
   return ok({ id: res.meta.last_row_id });
 }
 async function borrarFotoProyecto(request, env, payload, proyectoId, fotoId) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Sin permiso.", 403);
+  if (!permite(payload, "proyectos", "editar", "admin", "gerente")) return fail("Sin permiso.", 403);
   const f = await env.DB.prepare("SELECT url_r2 FROM proyecto_fotos WHERE id=? AND proyecto_id=?").bind(fotoId, proyectoId).first();
   if (!f) return fail("Foto no encontrada.", 404);
   if (env.FILES && f.url_r2) { try { await env.FILES.delete(f.url_r2); } catch (e) { /* noop */ } }
@@ -2094,7 +2217,7 @@ async function borrarArchivoCliente(request, env, payload, clienteId, archivoId)
   if (!c) return fail("Sin acceso a este lead.", 403);
   const f = await env.DB.prepare("SELECT id, usuario_id FROM cliente_archivos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(archivoId, clienteId).first();
   if (!f) return fail("Archivo no encontrado.", 404);
-  if (!hasRole(payload, "admin", "gerente") && String(f.usuario_id) !== String(payload.sub)) return fail("Solo quien subió el archivo, gerencia o administración pueden eliminarlo.", 403);
+  if (!permite(payload, "clientes", "eliminar", "admin", "gerente") && String(f.usuario_id) !== String(payload.sub)) return fail("Solo quien subió el archivo, gerencia o administración pueden eliminarlo.", 403);
   // Baja logica: el objeto permanece en R2 y el registro conserva su historial.
   await env.DB.prepare("UPDATE cliente_archivos SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(archivoId).run();
   await audit(env, payload.sub, "borrar_archivo", "cliente_archivos", archivoId, { cliente_id: clienteId }, request);
@@ -2205,7 +2328,7 @@ async function borrarPagoCliente(request, env, payload, clienteId, pagoId) {
   if (!c) return fail("Sin acceso a este lead.", 403);
   const p = await env.DB.prepare("SELECT id, usuario_id FROM cliente_pagos WHERE id=? AND cliente_id=? AND deleted_at IS NULL").bind(pagoId, clienteId).first();
   if (!p) return fail("Pago no encontrado.", 404);
-  if (!hasRole(payload, "admin", "gerente") && String(p.usuario_id) !== String(payload.sub)) return fail("Solo quien registro el pago, gerencia o administracion pueden eliminarlo.", 403);
+  if (!permite(payload, "clientes", "eliminar", "admin", "gerente") && String(p.usuario_id) !== String(payload.sub)) return fail("Solo quien registro el pago, gerencia o administracion pueden eliminarlo.", 403);
   await env.DB.prepare("UPDATE cliente_pagos SET deleted_at=CURRENT_TIMESTAMP WHERE id=?").bind(pagoId).run();
   const resumen = await sincronizarSaldo(env, clienteId);
   await audit(env, payload.sub, "borrar_pago", "cliente_pagos", pagoId, { cliente_id: clienteId }, request);
@@ -2430,7 +2553,7 @@ async function crmColsSave(env, lista) {
   await env.DB.prepare("INSERT INTO app_config (clave,valor,updated_at) VALUES ('crm_cols',?,CURRENT_TIMESTAMP) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor, updated_at=CURRENT_TIMESTAMP").bind(JSON.stringify(lista)).run();
 }
 async function handleCrmColumnas(request, env, payload) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administracion o gerencia puede cambiar las columnas.", 403);
+  if (!permite(payload, "clientes", "columnas", "admin", "gerente")) return fail("No tienes permiso para cambiar las columnas.", 403);
   const b = await request.json().catch(() => ({}));
   let lista = await crmColsList(env);
   if (b.quitar) {
@@ -2465,7 +2588,8 @@ async function handleConfig(request, env, payload, method) {
   const b = await request.json().catch(() => ({}));
   const _kcfg = Object.keys(b || {});
   const _soloTitulos = _kcfg.length > 0 && _kcfg.every((k) => k === "crm_titulos" || k === "crm_layout");
-  if (!hasRole(payload, "admin") && !(_soloTitulos && hasRole(payload, "gerente"))) return fail("Solo administración puede cambiar la configuración.", 403);
+  const _okCfg = payload._perm ? (permite(payload, "config", "editar") || (_soloTitulos && permite(payload, "clientes", "columnas"))) : (hasRole(payload, "admin") || (_soloTitulos && hasRole(payload, "gerente")));
+  if (!_okCfg) return fail("Solo administración puede cambiar la configuración.", 403);
   if ("logo_data" in b) {
     const ld = b.logo_data == null ? "" : String(b.logo_data);
     if (ld && !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+\/=]+$/.test(ld)) return fail("El logo debe ser una imagen PNG o JPG.");
@@ -2509,7 +2633,7 @@ function rangoFecha(prefix, desde, hasta) {
   return { where: cond.join(" AND "), args };
 }
 async function handleReportes(request, env, payload, url) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  if (!permite(payload, "reportes", "ver", "admin", "gerente")) return fail("No tienes permiso para Reportes.", 403);
   const desde = url.searchParams.get("desde") || null;
   const hasta = url.searchParams.get("hasta") || null;
   const fC = rangoFecha("", desde, hasta);
@@ -2551,7 +2675,7 @@ async function handleReportes(request, env, payload, url) {
 }
 
 async function handleReportesCrmOpciones(request, env, payload) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  if (!permite(payload, "reportes", "ver", "admin", "gerente")) return fail("No tienes permiso para Reportes.", 403);
   async function distintos(col) {
     const rows = (await env.DB.prepare("SELECT DISTINCT " + col + " AS v FROM clientes WHERE deleted_at IS NULL AND " + col + " IS NOT NULL AND TRIM(" + col + ")<>'' ORDER BY v COLLATE NOCASE").all()).results || [];
     return rows.map((r) => r.v);
@@ -2572,7 +2696,7 @@ async function handleReportesCrmOpciones(request, env, payload) {
 }
 
 async function handleReportesCrm(request, env, payload, url) {
-  if (!hasRole(payload, "admin", "gerente")) return fail("Solo administración o gerencia.", 403);
+  if (!permite(payload, "reportes", "ver", "admin", "gerente")) return fail("No tienes permiso para Reportes.", 403);
   const q = url.searchParams;
   const cond = ["deleted_at IS NULL"]; const args = [];
   const campoAllow = { created_at: "created_at", fecha_lead: "fecha_lead", fecha_contacto: "fecha_contacto" };
@@ -2651,6 +2775,7 @@ async function handleRequest(request, env) {
   await migrarV10(env);
   await migrarV11(env);
   await migrarV12(env);
+  await migrarV13(env);
 
   // ---- API ----
   if (path.startsWith("/api/")) {
@@ -2682,7 +2807,21 @@ async function handleRequest(request, env) {
     // ----- A partir de aquí: SISTEMA INTERNO. El cliente no entra. -----
     if (payload.rol === "cliente") return fail("Los clientes solo acceden al portal.", 403);
 
-    if (path === "/api/me") return ok({ id: payload.sub, nombre: payload.nombre, rol: payload.rol });
+    // Usuario vigente desde la base: bajas, cambios de rol y permisos aplican al instante.
+    let _uAct = null;
+    try { _uAct = await env.DB.prepare("SELECT rol, nombre, activo, deleted_at, permisos FROM usuarios WHERE id=?").bind(payload.sub).first(); }
+    catch (e) { _uAct = await env.DB.prepare("SELECT rol, nombre, activo, deleted_at FROM usuarios WHERE id=?").bind(payload.sub).first(); }
+    if (!_uAct || _uAct.deleted_at || !_uAct.activo) return fail("Tu acceso fue desactivado.", 401);
+    payload.rol = _uAct.rol;
+    payload.nombre = _uAct.nombre;
+    payload._perm = (_uAct.rol !== "admin" && _uAct.permisos) ? normalizarPermisos(_uAct.permisos) : null;
+    if (payload.rol === "cliente") return fail("Los clientes solo acceden al portal.", 403);
+    if (payload._perm) {
+      const _req = permisoRuta(path, method);
+      if (_req && !_req.some((x) => permite(payload, x[0], x[1]))) return fail("No tienes permiso para esta sección.", 403);
+    }
+
+    if (path === "/api/me") return ok({ id: payload.sub, nombre: payload.nombre, rol: payload.rol, permisos: payload._perm || null });
     if (path === "/api/auth/change-password" && method === "POST") return await handleChangePassword(request, env, payload);
     if (path === "/api/dashboard/stats") return await dashboardStats(env, payload);
     if (path === "/api/dashboard/charts") return await dashboardCharts(env, payload);
@@ -3089,6 +3228,109 @@ var ICONS={
 };
 function toast(t){var d=document.createElement('div');d.className='toast';d.textContent=t;document.body.appendChild(d);setTimeout(function(){d.remove();},2600);}
 
+var PERM_MODS=[
+  {id:'dashboard',l:'Dashboard',a:['ver']},
+  {id:'alertas',l:'Alertas de leads',a:['ver']},
+  {id:'clientes',l:'Clientes / CRM',a:['ver','editar','eliminar','columnas']},
+  {id:'cotizaciones',l:'Cotizaciones',a:['ver','editar','eliminar']},
+  {id:'inventario',l:'Inventario y proveedores',a:['ver','editar','eliminar']},
+  {id:'proyectos',l:'Proyectos y portal del cliente',a:['ver','editar']},
+  {id:'cortes',l:'Cortes',a:['ver','editar','eliminar']},
+  {id:'trazabilidad',l:'Trazabilidad',a:['ver']},
+  {id:'empleados',l:'Empleados y asistencia',a:['ver','editar']},
+  {id:'whatsapp',l:'WhatsApp',a:['ver','editar']},
+  {id:'reportes',l:'Reportes',a:['ver']},
+  {id:'config',l:'Configuración',a:['ver','editar']}
+];
+var PERM_COLS=['ver','editar','eliminar','columnas'];
+var PERM_COL_LBL={ver:'Ver',editar:'Crear / editar',eliminar:'Eliminar',columnas:'Ajustar columnas'};
+var ROL_LBL={admin:'Administrador',gerente:'Gerente',empleado:'Asesor'};
+function pu(mod,acc,roles){
+  if(!USER)return false;
+  if(USER.rol==='admin')return true;
+  if(USER.permisos&&USER.permisos.mods){var m=USER.permisos.mods[mod];return !!(m&&m[acc]);}
+  return !!(roles&&roles.indexOf(USER.rol)>=0);
+}
+function permPlantilla(t){
+  var mods={};
+  PERM_MODS.forEach(function(m){mods[m.id]={};m.a.forEach(function(a){mods[m.id][a]=false;});});
+  if(t==='gerente'){
+    PERM_MODS.forEach(function(m){m.a.forEach(function(a){mods[m.id][a]=true;});});
+    mods.config.editar=false;
+    return {mods:mods,alcance:'todos'};
+  }
+  mods.dashboard.ver=true;mods.alertas.ver=true;mods.clientes.ver=true;mods.clientes.editar=true;
+  mods.cotizaciones.ver=true;mods.cotizaciones.editar=true;mods.inventario.ver=true;
+  mods.proyectos.ver=true;mods.proyectos.editar=true;mods.whatsapp.ver=true;mods.whatsapp.editar=true;mods.config.ver=true;
+  return {mods:mods,alcance:'propios'};
+}
+function permCopia(p){
+  var o={mods:{},alcance:(p&&p.alcance==='todos')?'todos':'propios'};
+  PERM_MODS.forEach(function(m){o.mods[m.id]={};m.a.forEach(function(a){o.mods[m.id][a]=!!(p&&p.mods&&p.mods[m.id]&&p.mods[m.id][a]);});});
+  return o;
+}
+var PERM_EDIT=null,PERM_TOCADO=false,PERM_ESTANDAR=false;
+function permBloqueHTML(rol,esPropio){
+  var dis=esPropio?' disabled':'';
+  return '<div style="margin-top:1rem;border-top:1px solid var(--bd);padding-top:.8rem">'+
+    '<h4 class="serif" style="color:var(--gold);font-size:1.15rem;margin-bottom:.25rem">Accesos y permisos</h4>'+
+    '<p class="muted" style="font-size:.78rem;margin-bottom:.4rem">Elige un perfil base y ajusta qué puede ver y hacer en cada módulo.'+(esPropio?' No puedes cambiar tu propio perfil.':'')+'</p>'+
+    '<div class="g2"><div><label>Perfil</label><select id="pmPerfil" onchange="permAplicarPerfil()"'+dis+'>'+
+      '<option value="empleado"'+(rol==='empleado'?' selected':'')+'>Asesor</option>'+
+      '<option value="gerente"'+(rol==='gerente'?' selected':'')+'>Gerente</option>'+
+      '<option value="admin"'+(rol==='admin'?' selected':'')+'>Administrador (acceso total)</option></select></div>'+
+    '<div><label>Clientes que puede ver</label><select id="pmAlc" onchange="permAlcance()"><option value="propios">Solo su cartera</option><option value="todos">Todos los clientes</option></select></div></div>'+
+    '<div id="pmTabla" style="margin-top:.6rem"></div></div>';
+}
+function permIniciar(rol,permisos,nuevo){
+  PERM_ESTANDAR=(!permisos&&rol!=='admin'&&!nuevo);
+  PERM_EDIT=permisos?permCopia(permisos):permPlantilla(rol==='gerente'?'gerente':'empleado');
+  PERM_TOCADO=!!nuevo;
+  permPintar();
+}
+function permPintar(){
+  var box=document.getElementById('pmTabla');if(!box)return;
+  var alc=document.getElementById('pmAlc');
+  if(val('pmPerfil')==='admin'){
+    if(alc){alc.value='todos';alc.disabled=true;}
+    box.innerHTML='<div class="card muted" style="font-size:.82rem">El administrador ve y puede hacer todo, incluido crear usuarios y asignar permisos.</div>';
+    return;
+  }
+  if(alc){alc.disabled=false;alc.value=PERM_EDIT.alcance;}
+  var h='<div style="overflow-x:auto"><table style="font-size:.8rem"><thead><tr><th>Módulo</th>';
+  PERM_COLS.forEach(function(c){h+='<th style="text-align:center">'+PERM_COL_LBL[c]+'</th>';});
+  h+='</tr></thead><tbody>';
+  PERM_MODS.forEach(function(m,i){
+    h+='<tr><td>'+m.l+'</td>';
+    PERM_COLS.forEach(function(c,j){
+      if(m.a.indexOf(c)<0){h+='<td style="text-align:center" class="muted">-</td>';return;}
+      h+='<td style="text-align:center"><input type="checkbox" style="width:auto"'+(PERM_EDIT.mods[m.id][c]?' checked':'')+' onchange="permTog('+i+','+j+')"></td>';
+    });
+    h+='</tr>';
+  });
+  h+='</tbody></table></div>';
+  if(PERM_ESTANDAR&&!PERM_TOCADO)h+='<p class="muted" style="font-size:.76rem;margin-top:.4rem">Hoy usa los permisos estándar de su rol. Si cambias algo, quedarán guardados como permisos personalizados.</p>';
+  box.innerHTML=h;
+}
+function permTog(i,j){
+  var m=PERM_MODS[i],c=PERM_COLS[j];if(!m||!c||!PERM_EDIT)return;
+  var r=PERM_EDIT.mods[m.id];r[c]=!r[c];
+  if(c!=='ver'&&r[c])r.ver=true;
+  if(c==='ver'&&!r.ver){m.a.forEach(function(a){r[a]=false;});}
+  PERM_TOCADO=true;permPintar();
+}
+function permAlcance(){if(PERM_EDIT){PERM_EDIT.alcance=val('pmAlc')==='todos'?'todos':'propios';PERM_TOCADO=true;}}
+function permAplicarPerfil(){var p=val('pmPerfil');if(p!=='admin')PERM_EDIT=permPlantilla(p);PERM_TOCADO=true;permPintar();}
+function permVacio(){if(!PERM_EDIT)return true;var n=0;PERM_MODS.forEach(function(m){if(PERM_EDIT.mods[m.id].ver)n++;});return n===0;}
+function primerModulo(){var m=MENU.filter(function(x){return pu(x.id,'ver',x.roles);});return m.length?m[0].id:null;}
+var VISTA_ACT='dashboard';
+async function refrescarSesion(){
+  try{
+    var d=await api('/api/me');
+    if(d&&d.ok&&d.data){USER.rol=d.data.rol;USER.nombre=d.data.nombre;USER.permisos=d.data.permisos||null;try{localStorage.setItem('aslan_user',JSON.stringify(USER));}catch(e){}renderNav();setActive(VISTA_ACT);}
+  }catch(e){}
+}
+
 var MENU=[
   {id:'dashboard',label:'Dashboard',roles:['admin','gerente','empleado']},
   {id:'alertas',label:'Alertas de leads',roles:['admin','gerente','empleado']},
@@ -3105,16 +3347,24 @@ var MENU=[
 ];
 function renderNav(){
   var nav=document.getElementById('nav');nav.innerHTML='';
-  MENU.filter(function(m){return m.roles.indexOf(USER.rol)>=0;}).forEach(function(m){
+  MENU.filter(function(m){return pu(m.id,'ver',m.roles);}).forEach(function(m){
     var a=document.createElement('a');a.innerHTML=ic(ICONS[m.id]||'')+'<span>'+m.label+'</span>'+(m.id==='alertas'?'<span class="abadge" id="alertBadge" style="display:none"></span>':'');a.dataset.id=m.id;
     a.onclick=function(){go(m.id);};nav.appendChild(a);
   });
-  document.getElementById('userBox').innerHTML=USER.nombre+'<br><span style="color:var(--gold)">'+USER.rol+'</span> · <a onclick="logout()" style="cursor:pointer">salir</a><br><a href="/check-in" style="color:var(--gold2);font-size:.8rem">Registrar entrada / salida</a>';
+  document.getElementById('userBox').innerHTML=USER.nombre+'<br><span style="color:var(--gold)">'+(ROL_LBL[USER.rol]||USER.rol)+'</span> · <a onclick="logout()" style="cursor:pointer">salir</a><br><a href="/check-in" style="color:var(--gold2);font-size:.8rem">Registrar entrada / salida</a>';
 }
 function logout(){localStorage.clear();location.href='/login';}
 function setActive(id){var as=document.querySelectorAll('.nav a');as.forEach(function(a){a.classList.toggle('active',a.dataset.id===id);});}
 
 async function go(id){
+  var _mi=MENU.filter(function(x){return x.id===id;})[0];
+  if(_mi&&!pu(id,'ver',_mi.roles)){
+    var _p=primerModulo();
+    if(_p&&_p!==id)return go(_p);
+    document.getElementById('content').innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.3rem">Sin módulos asignados</h3><p class="muted" style="margin-top:.4rem">Tu usuario todavía no tiene permisos. Pide a administración que te asigne accesos.</p></div>';
+    return;
+  }
+  VISTA_ACT=id;
   MAT_CTRL=null;
   setActive(id);document.getElementById('side').classList.remove('open');
   document.getElementById('acciones').innerHTML='';
@@ -3145,7 +3395,7 @@ function estadoCorteSel(id,val){
   return '<select onchange="cambiarEstadoCorte('+id+',this.value)" style="font-size:.74rem;padding:.2rem .3rem">'+o+'</select>';
 }
 async function viewCortes(c){
-  document.getElementById('acciones').innerHTML='<button class="btn" onclick="nuevoCorte()">+ Nuevo corte</button> <button class="btn sec" onclick="irTraza()">Ver trazabilidad</button>';
+  document.getElementById('acciones').innerHTML=(pu('cortes','editar',['admin','gerente'])?'<button class="btn" onclick="nuevoCorte()">+ Nuevo corte</button> ':'')+(pu('trazabilidad','ver',['admin','gerente'])?'<button class="btn sec" onclick="irTraza()">Ver trazabilidad</button>':'');
   var d=await api('/api/cortes');if(!d||!d.ok)return;
   var nota='<p class="muted" style="font-size:.8rem;margin-bottom:.5rem">Cada corte liga un material de inventario con su cotización, cliente y cortador. Si marcas «descontar», genera la salida de inventario automáticamente.</p>';
   var h=nota+'<div class="card" style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Folio</th><th>Material</th><th>Cantidad</th><th>Medidas</th><th>Cotización</th><th>Cliente</th><th>Asesor</th><th>Cortador</th><th>Estado</th><th>Inv.</th></tr></thead><tbody>';
@@ -3453,7 +3703,7 @@ function tarjetaPassword(){
   return '<div class="card"><h3 style="color:var(--gold);font-size:1.3rem;margin-bottom:.6rem">Mi cuenta · cambiar contraseña</h3><div class="g2"><div><label>Contraseña actual</label><input id="pwActual" type="password"></div><div><label>Nueva contraseña</label><input id="pwNueva" type="password"></div></div><label>Repite la nueva contraseña</label><input id="pwRep" type="password"><div style="height:.6rem"></div><button class="btn" onclick="cambiarMiPassword()">Cambiar contraseña</button></div>';
 }
 async function viewConfig(c){
-  if(USER.rol!=='admin'){c.innerHTML='<div class="card muted" style="margin-bottom:1rem">Solo administración puede editar la configuración general. Aquí puedes cambiar tu contraseña.</div>'+tarjetaPassword();return;}
+  if(!pu('config','editar',['admin'])){c.innerHTML='<div class="card muted" style="margin-bottom:1rem">Solo administración puede editar la configuración general. Aquí puedes cambiar tu contraseña.</div>'+tarjetaPassword();return;}
   var d=await api('/api/config');var cfg=(d&&d.ok)?d.data:{};CFG=cfg;
   var sis=cfg.sistema||{};
   var h='';
@@ -3558,14 +3808,15 @@ function empEstadoBadge(tipo,checkin){
   return '<span class="pill" style="background:var(--inset);color:var(--txt2)">Salió</span>';
 }
 async function viewEmpleados(c){
-  var puede=(USER.rol==='admin'||USER.rol==='gerente');
+  var puede=pu('empleados','ver',['admin','gerente']);
   if(!puede){
     c.innerHTML='<div class="card"><h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.4rem">Mi asistencia</h3><p class="muted">La gestión de empleados es para administración o gerencia. Para registrar tu entrada o salida usa la pantalla de check-in.</p><p style="margin-top:.8rem"><a class="btn" href="/check-in">Abrir check-in</a></p></div>';
     return;
   }
   var acc='';
-  if(USER.rol==='admin')acc+='<button class="btn" onclick="nuevoEmpleado()">+ Nuevo empleado</button> ';
-  acc+='<button class="btn sec" onclick="configGeocerca()">Configurar geocerca</button> <a class="btn sec" href="/check-in" target="_blank">Abrir check-in</a>';
+  if(USER.rol==='admin')acc+='<button class="btn" onclick="nuevoEmpleado()">+ Nuevo usuario</button> ';
+  if(pu('empleados','editar',['admin','gerente']))acc+='<button class="btn sec" onclick="configGeocerca()">Configurar geocerca</button> ';
+  acc+='<a class="btn sec" href="/check-in" target="_blank">Abrir check-in</a>';
   document.getElementById('acciones').innerHTML=acc;
   var d=await api('/api/empleados');if(!d||!d.ok)return;
   var cksR=await api('/api/checkins'),cks=(cksR&&cksR.ok)?cksR.data:[];
@@ -3585,11 +3836,11 @@ async function viewEmpleados(c){
   h+='<div class="card" style="overflow-x:auto"><table><thead><tr><th>Empleado</th><th>Rol / Cargo</th><th>Estado hoy</th><th>Último registro</th><th>GPS</th><th>Acciones</th></tr></thead><tbody>';
   d.data.forEach(function(e){
     h+='<tr><td><strong>'+e.nombre+'</strong><br><span class="muted" style="font-size:.76rem">'+(e.email||'')+'</span></td>'+
-      '<td>'+e.rol+(e.cargo?('<br><span class="muted" style="font-size:.76rem">'+e.cargo+'</span>'):'')+'</td>'+
+      '<td>'+(ROL_LBL[e.rol]||e.rol)+(e.personalizado&&e.rol!=='admin'?' <span class="pill" style="background:var(--inset);color:var(--gold)">Permisos a medida</span>':'')+(e.cargo?('<br><span class="muted" style="font-size:.76rem">'+e.cargo+'</span>'):'')+'</td>'+
       '<td>'+empEstadoBadge(e.ultimo_tipo,e.ultimo_checkin)+'</td>'+
       '<td class="muted" style="white-space:nowrap;font-size:.82rem">'+fmtFechaHora(e.ultimo_checkin)+'</td>'+
       '<td>'+(e.consentimiento_gps?'<span style="font-size:.78rem;color:var(--ok)">Sí</span>':'<span class="muted" style="font-size:.78rem">No</span>')+'</td>'+
-      '<td style="white-space:nowrap"><button class="btn sec" style="padding:.25rem .55rem" onclick="editarEmpleado('+e.id+')">Editar</button></td></tr>';
+      '<td style="white-space:nowrap">'+(pu('empleados','editar',['admin','gerente'])?'<button class="btn sec" style="padding:.25rem .55rem" onclick="editarEmpleado('+e.id+')">'+(USER.rol==='admin'?'Editar y permisos':'Editar')+'</button>':'')+'</td></tr>';
   });
   if(!d.data.length)h+='<tr><td colspan="6" class="muted">Sin empleados.</td></tr>';
   h+='</tbody></table></div>';
@@ -3613,18 +3864,21 @@ function initEmpMap(cks,geo){
   setTimeout(function(){try{EMP_MAP.invalidateSize();}catch(e){}},60);
 }
 function nuevoEmpleado(){
-  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.6rem">Nuevo empleado</h3>'+
+  if(USER.rol!=='admin'){toast('Solo administración da de alta usuarios');return;}
+  openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.6rem">Nuevo usuario</h3>'+
     '<label>Nombre completo</label><input id="neNom">'+
     '<label>Correo</label><input id="neMail" type="email" placeholder="nombre@marmolesaslan.com">'+
-    '<label>Rol</label><select id="neRol"><option value="empleado">Empleado</option><option value="gerente">Gerente</option></select>'+
     '<div class="g2"><div><label>Cargo</label><input id="neCargo"></div><div><label>Área</label><input id="neArea"></div></div>'+
     '<label>Teléfono</label><input id="neTel">'+
     '<label style="text-transform:none;display:flex;align-items:center;gap:.5rem;margin-top:.7rem"><input type="checkbox" id="neGps" style="width:auto"> El empleado dio consentimiento de ubicación GPS</label>'+
+    permBloqueHTML('empleado',false)+
     '<div style="display:flex;gap:.5rem;margin-top:.9rem"><button class="btn" onclick="guardarEmpleado()">Crear acceso</button><button class="btn sec" onclick="closeModal()">Cancelar</button></div>');
+  permIniciar('empleado',null,true);
 }
 async function guardarEmpleado(){
-  var b={nombre:val('neNom'),email:val('neMail'),rol:val('neRol'),cargo:val('neCargo'),area:val('neArea'),telefono:val('neTel'),consentimiento_gps:document.getElementById('neGps').checked};
+  var b={nombre:val('neNom'),email:val('neMail'),rol:val('pmPerfil')||'empleado',cargo:val('neCargo'),area:val('neArea'),telefono:val('neTel'),consentimiento_gps:document.getElementById('neGps').checked};
   if(!b.nombre||!b.email){toast('Falta nombre o correo');return;}
+  if(b.rol!=='admin'){if(permVacio()){toast('Marca al menos un módulo que pueda ver');return;}b.permisos=permCopia(PERM_EDIT);}
   var d=await api('/api/empleados',{method:'POST',body:JSON.stringify(b)});
   if(!d)return;
   if(!d.ok){toast(d.error||'No se pudo crear');return;}
@@ -3699,14 +3953,21 @@ async function editarEmpleado(id){
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">'+escAttr(e.nombre)+'</h3>'+
     '<div class="g2"><div><label>Cargo</label><input id="edCargo" value="'+escAttr(v(e.cargo))+'"></div><div><label>Área</label><input id="edArea" value="'+escAttr(v(e.area))+'"></div></div>'+
     '<label>Teléfono</label><input id="edTel" value="'+escAttr(v(e.telefono))+'">'+
-    '<div class="g2"><div><label>Rol</label><select id="edRol"><option value="empleado"'+(e.rol==='empleado'?' selected':'')+'>Empleado</option><option value="gerente"'+(e.rol==='gerente'?' selected':'')+'>Gerente</option><option value="admin"'+(e.rol==='admin'?' selected':'')+'>Admin</option></select></div><div><label>Estado</label><select id="edAct"><option value="1"'+(e.activo?' selected':'')+'>Activo</option><option value="0"'+(!e.activo?' selected':'')+'>Inactivo</option></select></div></div>'+
+    (USER.rol==='admin'?('<label>Estado</label><select id="edAct"'+(USER.id===id?' disabled':'')+'><option value="1"'+(e.activo?' selected':'')+'>Activo</option><option value="0"'+(!e.activo?' selected':'')+'>Inactivo (no puede iniciar sesión)</option></select>'):'')+
     '<div class="g2"><div><label>CURP</label><input id="edCurp" value="'+escAttr(v(e.curp))+'"></div><div><label>RFC</label><input id="edRfc" value="'+escAttr(v(e.rfc))+'"></div></div>'+
     '<div class="g2"><div><label>Fecha de ingreso</label><input id="edIng" type="date" value="'+escAttr(v(e.fecha_ingreso))+'"></div><div><label>Tipo de contrato</label><input id="edCon" value="'+escAttr(v(e.tipo_contrato))+'"></div></div>'+
     '<label style="text-transform:none;display:flex;align-items:center;gap:.5rem;margin-top:.7rem"><input type="checkbox" id="edGps" style="width:auto"'+(e.consentimiento_gps?' checked':'')+'> Consentimiento de ubicación GPS</label>'+
+    (USER.rol==='admin'?permBloqueHTML(e.rol,USER.id===id):'')+
     '<div style="display:flex;gap:.5rem;margin-top:.9rem;flex-wrap:wrap"><button class="btn" onclick="guardarEmpleadoEdit('+id+')">Guardar</button><button class="btn sec" onclick="closeModal()">Cancelar</button>'+((USER.rol==='admin'&&USER.id!==id)?'<button class="btn" style="background:#7a1f1f;border-color:#7a1f1f;color:#fff;margin-left:auto" onclick="eliminarEmpleado('+id+')">Eliminar empleado</button>':'')+'</div>');
+  if(USER.rol==='admin')permIniciar(e.rol,e.permisos,false);
 }
 async function guardarEmpleadoEdit(id){
-  var b={cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),rol:val('edRol'),activo:val('edAct')==='1',curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
+  var b={cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
+  if(USER.rol==='admin'){
+    if(USER.id!==id){b.activo=val('edAct')==='1';b.rol=val('pmPerfil')||'empleado';}
+    var _rf=(USER.id===id)?'admin':b.rol;
+    if(PERM_TOCADO&&_rf!=='admin'){if(permVacio()){toast('Marca al menos un módulo que pueda ver');return;}b.permisos=permCopia(PERM_EDIT);}
+  }
   var d=await api('/api/empleados/'+id,{method:'PUT',body:JSON.stringify(b)});
   if(d&&d.ok){closeModal();toast('Guardado');go('empleados');}else if(d){toast(d.error||'Error');}
 }
@@ -3955,7 +4216,7 @@ async function pintarAlertasDash(){
   ALERTA_ROWS=d.data;
   var r=calcAlertas(ALERTA_ROWS);
   actualizarBadgeAlertas(r);
-  var todos=r.fechas.concat(r.seg,r.sinresp,r.noviable);
+  var todos=r.fechas.concat(r.seg,r.sinresp,r.noviable||[]);
   todos.sort(function(x,y){return (x.nivel===y.nivel)?0:(x.nivel==='alarma'?-1:1);});
   var h='<div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap"><h3 class="serif" style="color:var(--gold);font-size:1.15rem">Alertas de leads (CRM)</h3><button class="btn sec" style="padding:.3rem .7rem;font-size:.74rem" onclick="irAlertas()">Ver todas</button></div>';
   h+='<div style="display:flex;gap:1.4rem;margin:.5rem 0 .7rem;font-size:.85rem;flex-wrap:wrap"><span><strong style="color:#d9534f;font-size:1.05rem">'+r.alarmas+'</strong> <span class="muted">alarmas</span></span><span><strong style="color:#c4983a;font-size:1.05rem">'+r.avisos+'</strong> <span class="muted">avisos</span></span><span><strong style="font-size:1.05rem">'+(r.alarmas+r.avisos)+'</strong> <span class="muted">por gestionar</span></span></div>';
@@ -4140,7 +4401,7 @@ function cargarTitulosCRM(){
   if(!layVisibles())CRM_LAY.forEach(function(x){x.v=1;});
   CRM_TIT=CRM_LAY.map(function(x){return x.t;});
 }
-function puedeTitulosCRM(){return USER&&(USER.rol==='admin'||USER.rol==='gerente');}
+function puedeTitulosCRM(){return pu('clientes','columnas',['admin','gerente']);}
 function thsCRM(){
   var ed=puedeTitulosCRM(),h='',ord=layOrden(),ult=-1;
   for(var p=0;p<ord.length;p++)if(CRM_LAY[ord[p]].f===1)ult=p;
@@ -4252,7 +4513,7 @@ async function colEliminar(i){
   gestionColumnasCRM();
   toast('Columna eliminada');
 }
-function puedeBorrarCRM(){return typeof USER!=='undefined'&&USER&&(USER.rol==='admin'||USER.rol==='gerente');}
+function puedeBorrarCRM(){return typeof USER!=='undefined'&&pu('clientes','eliminar',['admin','gerente']);}
 function crmAccBtns(r){
   return '<button class="btn" style="padding:.25rem .5rem;font-size:.72rem" onclick="abrirFicha('+r.id+')" title="Ficha 360 del cliente">Ficha</button> '+
     '<button class="btn sec" style="padding:.25rem .5rem;font-size:.72rem" onclick="verCotizacionesCliente('+r.id+')" title="Ver cotizaciones ligadas a este cliente">Cot. '+(r.num_cotizaciones||0)+'</button> '+
@@ -5078,7 +5339,7 @@ function fPagosHtml(){
      '<div><button class="btn" onclick="agregarPagoFicha()">Registrar pago</button></div></div>';
   if(!pg.length){ h+='<p class="muted" style="font-size:.83rem">Sin pagos registrados todavia.</p>'; }
   else{
-    var puedeTodo=(USER.rol==='admin'||USER.rol==='gerente'),acum=0;
+    var puedeTodo=pu('clientes','eliminar',['admin','gerente']),acum=0;
     h+='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Fecha</th><th>Tipo</th><th>Metodo</th><th>Referencia</th><th style="text-align:right">Monto</th><th>Nota</th><th>Capturo</th><th>Comprobante</th><th></th></tr></thead><tbody>';
     pg.forEach(function(p){
       acum+=Number(p.monto)||0;
@@ -5174,7 +5435,7 @@ async function cargarArchivosFicha(){
   if(!d||!d.ok){box.innerHTML='<p class="muted" style="font-size:.83rem">'+((d&&d.error)||'No se pudieron cargar los archivos.')+'</p>';return;}
   var lista=d.data||[];FICHA.archivos=lista;
   if(!lista.length){box.innerHTML='<p class="muted" style="font-size:.83rem">Sin archivos todavía.</p>';return;}
-  var puedeTodo=(USER.rol==='admin'||USER.rol==='gerente');
+  var puedeTodo=pu('clientes','eliminar',['admin','gerente']);
   var h='<div style="overflow-x:auto"><table style="font-size:.82rem"><thead><tr><th>Archivo</th><th>Categoría</th><th>Tamaño</th><th>Subió</th><th>Fecha</th><th></th></tr></thead><tbody>';
   lista.forEach(function(a){
     var mio=String(a.usuario_id)===String(USER.id);
@@ -5208,7 +5469,7 @@ var INV_PROD=[];
 var INV_PUEDE_EDITAR=false;
 var MAT_CTRL=null;
 async function viewInventario(c){
-  INV_PUEDE_EDITAR=(USER.rol==='admin'||USER.rol==='gerente');
+  INV_PUEDE_EDITAR=pu('inventario','editar',['admin','gerente']);
   var acc='';
   if(INV_PUEDE_EDITAR)acc+='<button class="btn" onclick="nuevoProducto()">+ Nuevo producto</button> ';
   acc+='<button class="btn sec" onclick="viewAlertasStock()">Alertas de stock</button> <button class="btn sec" onclick="viewMovimientos()">Movimientos</button> <button class="btn sec" onclick="viewProveedores()">Proveedores</button> <button class="btn sec" onclick="exportarInventarioCSV()">Exportar CSV</button>';
@@ -5361,7 +5622,7 @@ async function abrirMaterialControl(clave){
   document.getElementById('acciones').innerHTML='';
   document.getElementById('titulo').textContent='Inventario';
   var c=document.getElementById('content');c.innerHTML='Cargando material…';
-  INV_PUEDE_EDITAR=(USER.rol==='admin'||USER.rol==='gerente');
+  INV_PUEDE_EDITAR=pu('inventario','editar',['admin','gerente']);
   var d=await api('/api/productos');
   if(!d||!d.ok){c.innerHTML='<a class="back" onclick="irInv()">&larr; Inventario</a><div class="card"><p class="muted">No se pudo cargar el inventario.</p></div>';return;}
   INV_PROD=d.data;
@@ -5402,7 +5663,7 @@ async function viewAlertasStock(){
   h+='</tbody></table></div>';c.innerHTML=h;
 }
 async function viewProveedores(){
-  document.getElementById('acciones').innerHTML=(USER.rol==='admin'||USER.rol==='gerente'?'<button class="btn" onclick="nuevoProveedor()">+ Nuevo proveedor</button> ':'');
+  document.getElementById('acciones').innerHTML=(pu('inventario','editar',['admin','gerente'])?'<button class="btn" onclick="nuevoProveedor()">+ Nuevo proveedor</button> ':'');
   document.getElementById('titulo').textContent='Proveedores';
   var c=document.getElementById('content');var d=await api('/api/proveedores');if(!d||!d.ok)return;
   var h='<button class="back" onclick="go(\\'inventario\\')">‹ Volver al catálogo</button><div class="card" style="overflow-x:auto"><table><thead><tr><th>Nombre</th><th>País</th><th>Contacto</th><th>Teléfono</th><th>Email</th><th>Entrega (días)</th></tr></thead><tbody>';
@@ -5450,7 +5711,7 @@ async function abrirProyecto(id){
   var d=await api('/api/admin/proyectos/'+id+'/portal');
   if(!d||!d.ok){c.innerHTML='<div class="card">'+((d&&d.error)||'Error')+'<br><span class="back" onclick="go(\\'proyectos\\')">‹ Volver</span></div>';return;}
   var p=d.data.proyecto, cli=d.data.cliente||{}, acc=d.data.acceso||{};
-  var puede=(USER.rol==='admin'||USER.rol==='gerente');
+  var puede=pu('proyectos','editar',['admin','gerente']);
   var h='<span class="back" onclick="go(\\'proyectos\\')">‹ Volver a proyectos</span>';
   h+='<div class="hd" style="margin-top:.4rem"><h2 style="font-size:1.6rem">'+(p.folio||'')+'</h2></div>';
   h+='<p class="muted" style="margin-top:-.6rem;margin-bottom:1rem">'+(p.descripcion||'')+' · Cliente: '+(cli.nombre||'—')+(cli.empresa?(' ('+cli.empresa+')'):'')+'</p>';
@@ -5872,7 +6133,7 @@ refrescarBadgeAlertas();
 document.addEventListener('keydown',xlsKey);document.addEventListener('mouseover',function(e){var t=e.target;var p=(t&&t.closest)?t.closest('.xls'):null;if(p)XLS_HOVER=p;});
 if(USER.debe_cambiar){toast('Recuerda cambiar tu contraseña en Configuración');}
 var _mat=null;try{_mat=sessionStorage.getItem('aslan_mat');if(_mat)sessionStorage.removeItem('aslan_mat');}catch(e){}
-if(_mat){abrirMaterialControl(_mat);}else{go('dashboard');}
+refrescarSesion().then(function(){if(_mat){abrirMaterialControl(_mat);}else{go('dashboard');}});
 </script>${PWEYE}</body></html>`;
 }
 
