@@ -1997,6 +1997,7 @@ async function handleEmpleados(request, env, payload, method, id) {
     const _esAdmin = hasRole(payload, "admin");
     if (("rol" in b || "permisos" in b) && !_esAdmin) return fail("Solo administración cambia roles y permisos.", 403);
     if (!_esAdmin && "activo" in b) return fail("Solo administración activa o desactiva usuarios.", 403);
+    if ("nombre" in b) { b.nombre = String(b.nombre || "").trim(); if (!b.nombre) return fail("El nombre no puede quedar vacío."); }
     if ("rol" in b) {
       if (!["admin", "gerente", "empleado"].includes(b.rol)) return fail("Rol inválido.");
       if (String(payload.sub) === String(id) && b.rol !== "admin") return fail("No puedes quitarte el rol de administrador.");
@@ -3951,6 +3952,8 @@ async function editarEmpleado(id){
   var e=d.data.empleado;EMP_SEL_NOMBRE=e.nombre;
   function v(x){return (x===null||x===undefined)?'':x;}
   openModal('<h3 class="serif" style="color:var(--gold);font-size:1.4rem;margin-bottom:.5rem">'+escAttr(e.nombre)+'</h3>'+
+    '<label>Nombre</label><input id="edNombre" value="'+escAttr(v(e.nombre))+'">'+
+    '<p class="muted" style="font-size:.78rem;margin:.2rem 0 .4rem">En la lista de asesores aparece la primera palabra del nombre.</p>'+
     '<div class="g2"><div><label>Cargo</label><input id="edCargo" value="'+escAttr(v(e.cargo))+'"></div><div><label>Área</label><input id="edArea" value="'+escAttr(v(e.area))+'"></div></div>'+
     '<label>Teléfono</label><input id="edTel" value="'+escAttr(v(e.telefono))+'">'+
     (USER.rol==='admin'?('<label>Estado</label><select id="edAct"'+(USER.id===id?' disabled':'')+'><option value="1"'+(e.activo?' selected':'')+'>Activo</option><option value="0"'+(!e.activo?' selected':'')+'>Inactivo (no puede iniciar sesión)</option></select>'):'')+
@@ -3962,7 +3965,9 @@ async function editarEmpleado(id){
   if(USER.rol==='admin')permIniciar(e.rol,e.permisos,false);
 }
 async function guardarEmpleadoEdit(id){
-  var b={cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
+  var nom=(val('edNombre')||'').trim();
+  if(!nom){toast('El nombre no puede quedar vacío');return;}
+  var b={nombre:nom,cargo:val('edCargo'),area:val('edArea'),telefono:val('edTel'),curp:val('edCurp'),rfc:val('edRfc'),fecha_ingreso:val('edIng'),tipo_contrato:val('edCon'),consentimiento_gps:document.getElementById('edGps').checked};
   if(USER.rol==='admin'){
     if(USER.id!==id){b.activo=val('edAct')==='1';b.rol=val('pmPerfil')||'empleado';}
     var _rf=(USER.id===id)?'admin':b.rol;
